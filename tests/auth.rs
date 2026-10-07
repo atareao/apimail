@@ -16,6 +16,12 @@ const API_KEY: &str = "test-secret-key";
 fn config() -> Config {
     Config::from_lookup(|key| match key {
         "APIMAIL_API_KEY" => Some(API_KEY.to_string()),
+        "APIMAIL_IMAP_HOST" => Some("imap.example.com".to_string()),
+        "APIMAIL_IMAP_USER" => Some("imap-user".to_string()),
+        "APIMAIL_IMAP_PASSWORD" => Some("imap-pass".to_string()),
+        "APIMAIL_SMTP_HOST" => Some("smtp.example.com".to_string()),
+        "APIMAIL_SMTP_USER" => Some("smtp-user".to_string()),
+        "APIMAIL_SMTP_PASSWORD" => Some("smtp-pass".to_string()),
         _ => None,
     })
     .expect("valid test config")

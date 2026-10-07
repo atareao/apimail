@@ -4,8 +4,9 @@
 
 ## Estado actual (verificado)
 - `Cargo.toml` (Rust **edition 2024**) ya tiene las dependencias base: `axum`, `tokio`, `serde`/`serde_json`, `tracing`/`tracing-subscriber`, `thiserror`; dev: `tower`, `http-body-util`.
-- API esqueleto implementada en estructura **lib + bin**: `src/lib.rs` (`pub use Config`, `build_router`), `src/config.rs`, `src/http.rs`, `src/main.rs`; tests en `tests/`.
-- Existe `openspec/` (schema `spec-driven`). No hay `README`, CI ni `frontend/`.
+- API implementada en estructura **lib + bin**: `src/lib.rs` (`Config`, `MailAccount`, `build_router`), `src/config.rs`, `src/http.rs`, `src/main.rs`; tests en `tests/` (`health.rs`, `auth.rs`, `account.rs`, `startup.rs`).
+- Autenticación por **API key** (`APIMAIL_API_KEY`, fail-closed) y **cuenta IMAP/SMTP** configurada por entorno (fail-closed) con endpoint `GET /api/account`.
+- Existe `openspec/` (schema `spec-driven`), `README.md`, `PLAN.md`, gitflow + CI/CD (`.github/workflows/`). No hay `frontend/`.
 
 ## Qué se está construyendo
 API HTTP con **Axum** que expone un CRUD sobre una cuenta de correo:
@@ -14,7 +15,7 @@ API HTTP con **Axum** que expone un CRUD sobre una cuenta de correo:
 - **Parseo MIME (`mail-parser`)**: extraer texto plano, HTML y adjuntos.
 - **Búsqueda avanzada**: criterios estándar de IMAP (remitente, fecha, asunto, flags).
 - **Tiempo real**: extensión `IDLE`; al llegar un correo, hacer `POST` del mensaje completo + metadatos a un **endpoint configurable (webhook)**.
-- Hoy implementado: arranque configurable (`APIMAIL_HOST`/`APIMAIL_PORT`) y `GET /api/health`.
+- Hoy implementado: arranque configurable, `GET /api/health`, autenticación (`api-auth`) y configuración de la cuenta IMAP/SMTP (`mail-account`, incluye `GET /api/account`). Falta la conexión real a IMAP/SMTP, MIME e IDLE.
 
 ## Flujo SDD + TDD (obligatorio)
 Antes de escribir/editar código, `just check-spec` debe confirmar un change proposal aprobado en `openspec/changes/<feature>/`. Si no existe, detente y pide aprobación; no escribas código. Tras aprobar la spec: **RED → GREEN → REFACTOR**, verificando por CLI (`just test`, `just clippy`, `just fmt`). Nunca asumas que los tests compilan o pasan sin ejecutarlos.

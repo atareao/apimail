@@ -9,10 +9,11 @@ leer, buscar, mover o copiar mensajes, gestionar banderas (`\Seen`, `\Flagged`,
 saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 `IDLE` de IMAP con notificación a un endpoint configurable (webhook).
 
-> Estado actual: esqueleto de la API con **autenticación**. Ya funcionan el
-> arranque configurable por variables de entorno, el endpoint de salud público
-> `GET /api/health` y la autenticación por API key. Las operaciones IMAP/SMTP
-> están en desarrollo.
+> Estado actual: esqueleto de la API con **autenticación** y **cuenta de correo
+> configurada**. Ya funcionan el arranque configurable por variables de entorno,
+> el endpoint de salud público `GET /api/health`, la autenticación por API key y
+> la inspección de la cuenta con `GET /api/account`. La conexión real a IMAP/SMTP
+> está en desarrollo.
 
 ## Requisitos
 
@@ -39,25 +40,63 @@ cargo build --release
 cargo run
 ```
 
-El servidor se configura mediante variables de entorno:
+El servidor se configura mediante variables de entorno.
 
-| Variable           | Descripción                                   | Valor por defecto   |
-| ------------------ | --------------------------------------------- | ------------------- |
-| `APIMAIL_HOST`     | Dirección de escucha                          | `0.0.0.0`           |
-| `APIMAIL_PORT`     | Puerto de escucha (`u16`)                     | `3000`              |
-| `APIMAIL_API_KEY`  | API key exigida para autenticar las peticiones | — (**obligatoria**) |
+### Servidor HTTP
+
+| Variable           | Descripción                                     | Valor por defecto   |
+| ------------------ | ----------------------------------------------- | ------------------- |
+| `APIMAIL_HOST`     | Dirección de escucha                            | `0.0.0.0`           |
+| `APIMAIL_PORT`     | Puerto de escucha (`u16`)                       | `3000`              |
+| `APIMAIL_API_KEY`  | API key exigida para autenticar las peticiones  | — (**obligatoria**) |
+
+### Cuenta de correo
+
+Cada endpoint (IMAP y SMTP) requiere **host, usuario y secreto**. El puerto y el
+modo TLS son opcionales.
+
+| Variable                    | Descripción                             | Valor por defecto            |
+| --------------------------- | --------------------------------------- | ---------------------------- |
+| `APIMAIL_IMAP_HOST`         | Servidor IMAP                           | — (**obligatoria**)          |
+| `APIMAIL_IMAP_USER`         | Usuario IMAP                            | — (**obligatoria**)          |
+| `APIMAIL_IMAP_PASSWORD`     | Secreto IMAP (nunca se registra)        | — (**obligatoria**)          |
+| `APIMAIL_IMAP_PORT`         | Puerto IMAP                             | según TLS (ver abajo)        |
+| `APIMAIL_IMAP_TLS`          | Modo TLS (`implicit`/`starttls`/`none`) | `implicit`                   |
+| `APIMAIL_SMTP_HOST`         | Servidor SMTP                           | — (**obligatoria**)          |
+| `APIMAIL_SMTP_USER`         | Usuario SMTP                            | — (**obligatoria**)          |
+| `APIMAIL_SMTP_PASSWORD`     | Secreto SMTP (nunca se registra)        | — (**obligatoria**)          |
+| `APIMAIL_SMTP_PORT`         | Puerto SMTP                             | según TLS (ver abajo)        |
+| `APIMAIL_SMTP_TLS`          | Modo TLS (`implicit`/`starttls`/`none`) | `implicit`                   |
+
+Puertos por defecto **derivados del modo TLS** (si no se fija `..._PORT`):
+
+| Modo TLS   | IMAP  | SMTP  |
+| ---------- | ----- | ----- |
+| `implicit` | `993` | `465` |
+| `starttls` | `143` | `587` |
+| `none`     | `143` | `587` |
 
 Ejemplo:
 
 ```bash
-APIMAIL_API_KEY=una-clave-secreta APIMAIL_HOST=127.0.0.1 APIMAIL_PORT=8080 cargo run
+export APIMAIL_API_KEY=una-clave-secreta
+export APIMAIL_HOST=127.0.0.1 APIMAIL_PORT=8080
+export APIMAIL_IMAP_HOST=imap.example.com APIMAIL_IMAP_USER=me@example.com APIMAIL_IMAP_PASSWORD=secret
+export APIMAIL_SMTP_HOST=smtp.example.com APIMAIL_SMTP_USER=me@example.com APIMAIL_SMTP_PASSWORD=secret
+cargo run
 ```
 
-El arranque es **fail-closed**: si `APIMAIL_API_KEY` falta o está vacía, el
-servicio **no arranca** (error descriptivo y código de salida distinto de cero)
-en lugar de quedar expuesto sin protección. Del mismo modo, si `APIMAIL_PORT` no
-es un `u16` válido el arranque falla, sin *fallback* silencioso al valor por
-defecto.
+El arranque es **fail-closed**: si `APIMAIL_API_KEY` falta o está vacía, o si
+falta (o está en blanco) cualquiera de los valores obligatorios de la cuenta
+(`..._HOST`, `..._USER`, `..._PASSWORD`), el servicio **no arranca** (error
+descriptivo que nombra la variable y código de salida distinto de cero) en lugar
+de quedar expuesto o a medias. Del mismo modo, un `APIMAIL_PORT` que no sea un
+`u16`, un `..._PORT` de correo fuera de `1..=65535` o un `..._TLS` desconocido
+provocan un error de arranque, sin *fallback* silencioso.
+
+> El modo TLS `none` se acepta (útil para servidores de prueba locales como
+> MailHog o GreenMail) pero registra un **aviso**: las credenciales viajarían en
+> claro.
 
 ## Autenticación
 
@@ -130,6 +169,27 @@ API key y devuelve `200 OK` con:
 {
   "authenticated": true
 }
+```
+
+### Cuenta de correo (protegido)
+
+```http
+GET /api/account
+```
+
+Devuelve **solo el host y el puerto** de los endpoints IMAP y SMTP (nunca el
+usuario ni el secreto). Requiere la API key:
+
+```json
+{
+  "imap": { "host": "imap.example.com", "port": 993 },
+  "smtp": { "host": "smtp.example.com", "port": 465 }
+}
+```
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/account
 ```
 
 ## Licencia
