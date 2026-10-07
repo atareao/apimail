@@ -2,6 +2,12 @@
 name = "apimail"
 version = "0.1.0"
 edition = "2024"
+description = "API HTTP en Rust (Axum) para gestionar una cuenta de correo vía IMAP y SMTP"
+license = "MIT"
+repository = "https://github.com/atareao/apimail"
+readme = "README.md"
+keywords = ["email", "imap", "smtp", "axum", "api"]
+categories = ["web-programming::http-server", "email"]
 
 [dependencies]
 axum = "0.8.9"
