@@ -9,9 +9,10 @@ leer, buscar, mover o copiar mensajes, gestionar banderas (`\Seen`, `\Flagged`,
 saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 `IDLE` de IMAP con notificación a un endpoint configurable (webhook).
 
-> Estado actual: esqueleto de la API. Ya funcionan el arranque configurable por
-> variables de entorno y el endpoint de salud `GET /api/health`. Las operaciones
-> IMAP/SMTP están en desarrollo.
+> Estado actual: esqueleto de la API con **autenticación**. Ya funcionan el
+> arranque configurable por variables de entorno, el endpoint de salud público
+> `GET /api/health` y la autenticación por API key. Las operaciones IMAP/SMTP
+> están en desarrollo.
 
 ## Requisitos
 
@@ -40,22 +41,63 @@ cargo run
 
 El servidor se configura mediante variables de entorno:
 
-| Variable        | Descripción                | Valor por defecto |
-| --------------- | -------------------------- | ----------------- |
-| `APIMAIL_HOST`  | Dirección de escucha       | `0.0.0.0`         |
-| `APIMAIL_PORT`  | Puerto de escucha (`u16`)  | `3000`            |
+| Variable           | Descripción                                   | Valor por defecto   |
+| ------------------ | --------------------------------------------- | ------------------- |
+| `APIMAIL_HOST`     | Dirección de escucha                          | `0.0.0.0`           |
+| `APIMAIL_PORT`     | Puerto de escucha (`u16`)                     | `3000`              |
+| `APIMAIL_API_KEY`  | API key exigida para autenticar las peticiones | — (**obligatoria**) |
 
 Ejemplo:
 
 ```bash
-APIMAIL_HOST=127.0.0.1 APIMAIL_PORT=8080 cargo run
+APIMAIL_API_KEY=una-clave-secreta APIMAIL_HOST=127.0.0.1 APIMAIL_PORT=8080 cargo run
 ```
 
-Si `APIMAIL_PORT` no es un `u16` válido, el arranque falla con un error
-descriptivo y un código de salida distinto de cero (no hay *fallback*
-silencioso al valor por defecto).
+El arranque es **fail-closed**: si `APIMAIL_API_KEY` falta o está vacía, el
+servicio **no arranca** (error descriptivo y código de salida distinto de cero)
+en lugar de quedar expuesto sin protección. Del mismo modo, si `APIMAIL_PORT` no
+es un `u16` válido el arranque falla, sin *fallback* silencioso al valor por
+defecto.
 
-## Endpoint de salud
+## Autenticación
+
+Todas las rutas quedan protegidas **salvo** `GET /api/health`. Las peticiones
+deben presentar la API key en la cabecera `Authorization` con el esquema
+`Bearer`:
+
+```http
+Authorization: Bearer <APIMAIL_API_KEY>
+```
+
+El esquema `Bearer` no distingue mayúsculas/minúsculas. La clave se compara en
+**tiempo constante** (a partir de su digest SHA-256, de tamaño fijo), de modo que
+no se filtra información por temporización.
+
+Si la cabecera falta, usa otro esquema o la clave es incorrecta, la respuesta es
+`401 Unauthorized` con cuerpo `application/json` y la cabecera
+`WWW-Authenticate: Bearer`:
+
+```json
+{
+  "error": "unauthorized",
+  "message": "missing or invalid API key"
+}
+```
+
+Ejemplo con `curl`:
+
+```bash
+# Ruta protegida con clave válida → 200
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/whoami
+
+# Sin cabecera → 401
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/whoami
+```
+
+## Endpoints
+
+### Salud (público)
 
 ```http
 GET /api/health
@@ -71,10 +113,23 @@ Respuesta `200 OK` con `Content-Type: application/json`:
 }
 ```
 
-Ejemplo con `curl`:
-
 ```bash
 curl -fsS http://127.0.0.1:3000/api/health
+```
+
+### Identidad autenticada (protegido)
+
+```http
+GET /api/whoami
+```
+
+Ruta de andamiaje que confirma que la autenticación ha tenido éxito. Requiere la
+API key y devuelve `200 OK` con:
+
+```json
+{
+  "authenticated": true
+}
 ```
 
 ## Licencia
