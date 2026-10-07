@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-07
+goal: Esqueleto de API Axum (lib+bin) con endpoint /health y configuración, como
+  base para el CRUD IMAP/SMTP
