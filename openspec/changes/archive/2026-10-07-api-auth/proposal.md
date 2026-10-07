@@ -40,7 +40,8 @@ variante de la API key.
 
 ## Impact
 
-- `Cargo.toml`: añadir `subtle` (comparación en tiempo constante).
+- `Cargo.toml`: añadir `subtle` (comparación en tiempo constante) y `sha2`
+  (digest SHA-256 de tamaño fijo para comparar sin filtrar la longitud de la clave).
 - `src/config.rs`: `Config.api_key`, `ConfigError::MissingApiKey` y su validación.
 - `src/http.rs`: `AppState` con la clave, middleware `require_api_key`, handler
   `whoami`, y `build_router(state)`.

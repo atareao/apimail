@@ -5,11 +5,23 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use apimail::build_router;
+use apimail::{AppState, Config, build_router};
+
+const API_KEY: &str = "test-secret-key";
+
+/// Builds the router with a known API key; `/api/health` stays public.
+fn app() -> axum::Router {
+    let config = Config::from_lookup(|key| match key {
+        "APIMAIL_API_KEY" => Some(API_KEY.to_string()),
+        _ => None,
+    })
+    .expect("valid test config");
+    build_router(AppState::from_config(&config))
+}
 
 #[tokio::test]
 async fn health_returns_200_json() {
-    let app = build_router();
+    let app = app();
 
     let response = app
         .oneshot(
@@ -45,7 +57,7 @@ async fn health_returns_200_json() {
 
 #[tokio::test]
 async fn unknown_route_returns_404() {
-    let app = build_router();
+    let app = app();
 
     let response = app
         .oneshot(
@@ -62,7 +74,7 @@ async fn unknown_route_returns_404() {
 
 #[tokio::test]
 async fn wrong_method_returns_405() {
-    let app = build_router();
+    let app = app();
 
     let response = app
         .oneshot(

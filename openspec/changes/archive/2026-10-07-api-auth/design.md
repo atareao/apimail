@@ -31,10 +31,14 @@ el `Router` vía `tower::ServiceExt::oneshot`, sin abrir sockets.
 - ***Fail-closed*: `APIMAIL_API_KEY` obligatoria y no vacía.** Si falta, el
   arranque falla. Un valor por defecto o un modo "sin auth" convertirían el
   olvido de configuración en una API pública.
-- **Comparación en tiempo constante** con el crate `subtle`
-  (`ConstantTimeEq`). Es barato y evita filtrar por temporización. La `length`
-  se normaliza comparando siempre cadenas del mismo tamaño lógico mediante el
-  propio `subtle` sobre los bytes.
+- **Comparación en tiempo constante de tamaño fijo** con el crate `subtle`
+  (`ConstantTimeEq`). En `AppState::from_config` se precalcula el **digest
+  SHA-256** (`sha2`) de la clave esperada y se guarda como `[u8; 32]`; el
+  middleware hashea el token entrante y compara ambos digests, **siempre de 32
+  bytes**, con `ct_eq`. Al ser ambos operandos de longitud fija, el
+  *short-circuit por longitud* de `subtle` (`if len != _rhs.len()`) nunca se
+  dispara y no se filtra la longitud del secreto; el único coste variable es
+  hashear el token, cuya longitud controla el atacante.
 - **Middleware por capa** (`axum::middleware::from_fn_with_state`) montado con
   `route_layer` sobre el sub-router protegido. Así el `404` de rutas
   desconocidas y el `405` de métodos incorrectos se mantienen intactos, y las

@@ -3,7 +3,7 @@
 
 use std::process::ExitCode;
 
-use apimail::{Config, build_router};
+use apimail::{AppState, Config, build_router};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -38,9 +38,10 @@ async fn main() -> ExitCode {
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| format!("{}:{}", config.host, config.port));
+    let state = AppState::from_config(&config);
     tracing::info!("apimail listening on {local_addr}");
 
-    if let Err(error) = axum::serve(listener, build_router()).await {
+    if let Err(error) = axum::serve(listener, build_router(state)).await {
         tracing::error!("server error: {error}");
         return ExitCode::FAILURE;
     }
