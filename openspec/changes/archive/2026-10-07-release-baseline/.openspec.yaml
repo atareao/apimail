@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-07
+goal: Bajar la versión base a 0.0.0 para que la primera release sea v0.1.0
+skip_specs: true
