@@ -36,6 +36,11 @@
 //! - `GET /api/whoami` is a protected scaffolding route. On success it returns
 //!   HTTP `200`, `Content-Type: application/json` and the body
 //!   `{"authenticated":true}`.
+//! - `GET /api/account` is a protected route that reports only the non-sensitive
+//!   part of the configured mail account. On success it returns HTTP `200`,
+//!   `Content-Type: application/json` and the body
+//!   `{"imap":{"host":"...","port":993},"smtp":{"host":"...","port":465}}`.
+//!   Neither the username nor the password is ever included.
 //! - Any missing header, non-`Bearer` scheme or wrong token is rejected with
 //!   HTTP `401`, `Content-Type: application/json`, the body
 //!   `{"error":"unauthorized","message":"..."}` and the challenge header
@@ -75,6 +80,8 @@ pub struct AppState {
     pub version: &'static str,
     /// SHA-256 digest of the expected API key.
     api_key_hash: [u8; 32],
+    /// Non-sensitive view of the configured mail account (host and port only).
+    account: AccountView,
 }
 
 impl std::fmt::Debug for AppState {
@@ -83,6 +90,7 @@ impl std::fmt::Debug for AppState {
             .field("name", &self.name)
             .field("version", &self.version)
             .field("api_key_hash", &"***")
+            .field("account", &self.account)
             .finish()
     }
 }
@@ -103,8 +111,38 @@ impl AppState {
             name: APP_NAME,
             version: APP_VERSION,
             api_key_hash: Sha256::digest(config.api_key.as_bytes()).into(),
+            account: AccountView {
+                imap: EndpointView {
+                    host: config.account.imap.host.clone(),
+                    port: config.account.imap.port,
+                },
+                smtp: EndpointView {
+                    host: config.account.smtp.host.clone(),
+                    port: config.account.smtp.port,
+                },
+            },
         }
     }
+}
+
+/// Public view of a single mail endpoint: host and port only.
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointView {
+    /// Server host name or address.
+    pub host: String,
+    /// Server port.
+    pub port: u16,
+}
+
+/// Public view of the mail account, exposed by `GET /api/account`.
+///
+/// It intentionally carries neither the username nor the password.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountView {
+    /// Incoming (IMAP) endpoint.
+    pub imap: EndpointView,
+    /// Outgoing (SMTP) endpoint.
+    pub smtp: EndpointView,
 }
 
 /// JSON payload returned by `GET /api/health`.
@@ -171,6 +209,10 @@ async fn whoami() -> Json<WhoamiResponse> {
     })
 }
 
+async fn account(State(state): State<AppState>) -> Response {
+    Json(&state.account).into_response()
+}
+
 /// Authorization middleware: rejects requests without a valid `Bearer` API key.
 async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if is_authorized(&request, &state.api_key_hash) {
@@ -223,9 +265,13 @@ fn bearer_token(value: &str) -> Option<&str> {
 /// `tower::ServiceExt::oneshot` without binding a socket. `GET /api/health`
 /// stays public; every other route sits behind [`require_api_key`].
 pub fn build_router(state: AppState) -> Router {
-    let protected = Router::new().route("/api/whoami", get(whoami)).route_layer(
-        middleware::from_fn_with_state(state.clone(), require_api_key),
-    );
+    let protected = Router::new()
+        .route("/api/whoami", get(whoami))
+        .route("/api/account", get(account))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
 
     Router::new()
         .route("/api/health", get(health))
