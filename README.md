@@ -14,9 +14,10 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > el endpoint de salud público `GET /api/health`, la autenticación por API key y
 > la inspección de la cuenta con `GET /api/account`. **Ya se puede enviar correo**
 > con `POST /api/messages`. La **conexión de lectura a IMAP** ya está disponible
-> mediante `GET /api/imap/status`, y ya se pueden **listar y seleccionar buzones**
-> con `GET /api/mailboxes` y `POST /api/mailboxes/select`. El resto de
-> operaciones de lectura (búsqueda, banderas, `IDLE`) siguen en desarrollo.
+> mediante `GET /api/imap/status`, se pueden **listar y seleccionar buzones**
+> con `GET /api/mailboxes` y `POST /api/mailboxes/select`, y **leer y buscar
+> mensajes** con `GET /api/messages` y `GET /api/messages/{uid}`. El resto de
+> operaciones de lectura (banderas, `IDLE`) siguen en desarrollo.
 
 ## Requisitos
 
@@ -343,6 +344,133 @@ Códigos de error (mismo modelo `{"error":...,"message":...}`):
 
 > Igual que `GET /api/imap/status`, ambas rutas reutilizan la sesión IMAP
 > perezosa: no abren una conexión nueva mientras haya una viva.
+
+### Lectura de mensajes (protegido)
+
+#### Listar y buscar mensajes
+
+```http
+GET /api/messages?mailbox=INBOX
+```
+
+Selecciona el buzón indicado y devuelve los mensajes que cumplen los criterios
+de búsqueda, **paginados** y **ordenados por `UID` descendente** (los más
+recientes primero). Requiere la API key y **nunca** expone credenciales.
+
+Parámetros de consulta:
+
+| Parámetro | Descripción                                                                 | Por defecto |
+| --------- | --------------------------------------------------------------------------- | ----------- |
+| `mailbox` | Buzón a inspeccionar (**obligatorio**, no vacío)                            | —           |
+| `from`    | Filtro `FROM` (remitente)                                                   | —           |
+| `to`      | Filtro `TO` (destinatario)                                                  | —           |
+| `subject` | Filtro `SUBJECT` (asunto)                                                   | —           |
+| `text`    | Filtro `BODY` (contenido)                                                   | —           |
+| `since`   | Mensajes recibidos en/después de `YYYY-MM-DD` (`SINCE`)                     | —           |
+| `before`  | Mensajes recibidos antes de `YYYY-MM-DD` (`BEFORE`)                         | —           |
+| `seen`    | `true` (`SEEN`) o `false` (`UNSEEN`)                                        | —           |
+| `unseen`  | Alias de `seen`: `unseen=true` equivale a `seen=false` y viceversa          | —           |
+| `flagged` | `true` (`FLAGGED`) o `false` (`UNFLAGGED`)                                  | —           |
+| `limit`   | Tamaño de página (`1`..`200`)                                               | `50`        |
+| `offset`  | Desplazamiento (`>= 0`)                                                     | `0`         |
+
+Respuesta `200 OK` con `Content-Type: application/json`:
+
+```json
+{
+  "mailbox": "INBOX",
+  "total": 123,
+  "limit": 50,
+  "offset": 0,
+  "messages": [
+    {
+      "uid": 42,
+      "seq": 42,
+      "flags": ["\\Seen"],
+      "size": 2048,
+      "internal_date": "2026-10-08T12:00:00+00:00",
+      "envelope": {
+        "from": [{ "name": "Alice", "address": "alice@example.com" }],
+        "to": [{ "name": null, "address": "bob@example.com" }],
+        "cc": [],
+        "subject": "hi",
+        "date": "Wed, 08 Oct 2026 11:00:00 +0000",
+        "message_id": "<id@example.com>"
+      }
+    }
+  ]
+}
+```
+
+`total` cuenta **todos** los mensajes que cumplen la búsqueda; `messages` recoge
+solo la ventana solicitada. `size`, `internal_date`, `envelope` y sus campos son
+`null` cuando el servidor no los reporta.
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages?mailbox=INBOX&subject=Hola&limit=20&offset=0"
+```
+
+Códigos de error (modelo `{"error":...,"message":...}`):
+
+- `400` (`invalid_request`) — `mailbox` ausente o en blanco, fecha que no es
+  `YYYY-MM-DD`, booleano que no es `true`/`false`, `limit`/`offset` fuera de
+  rango, `seen` y `unseen` contradictorios, o un carácter de control
+  (`CR`/`LF`/`NUL`) en cualquier valor.
+- `404` (`mailbox_not_found`) — el servidor responde `NO`: el buzón no existe.
+- `503` (`imap_unavailable`) — el servidor o la sesión no están disponibles.
+- `401` (`unauthorized`) — sin API key válida.
+
+#### Descargar un mensaje
+
+```http
+GET /api/messages/{uid}?mailbox=INBOX
+```
+
+Selecciona el buzón y descarga el mensaje `uid` indicado. Requiere la API key.
+
+| Parámetro | Descripción                                                             | Por defecto |
+| --------- | ---------------------------------------------------------------------- | ----------- |
+| `mailbox` | Buzón que contiene el mensaje (**obligatorio**, no vacío)              | —           |
+| `format`  | `summary`, `headers` o `full`                                          | `summary`   |
+
+Respuesta `200 OK` con `Content-Type: application/json`:
+
+- `summary` — metadatos y envelope (mismos campos que un elemento de `messages`)
+  más `"format":"summary"`.
+- `headers` — igual que `summary`, más `"format":"headers"` y `headers_base64`,
+  que es el **bloque crudo de cabeceras** codificado en base64.
+- `full` — igual que `summary`, más `"format":"full"` y `raw_base64`, que es el
+  **mensaje RFC822 completo** codificado en base64.
+
+El contenido MIME crudo no es necesariamente UTF-8, por eso las cabeceras y el
+mensaje completo se transportan en **base64** (un JSON válido debe ser UTF-8).
+
+```bash
+# Metadatos (por defecto)
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages/42?mailbox=INBOX"
+
+# Mensaje completo en base64
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages/42?mailbox=INBOX&format=full"
+```
+
+Códigos de error (modelo `{"error":...,"message":...}`):
+
+- `400` (`invalid_request`) — `uid` no numérico o `0`, `mailbox` ausente o en
+  blanco, o `format` distinto de `summary`/`headers`/`full`.
+- `404` (`mailbox_not_found`) — el servidor responde `NO`: el buzón no existe.
+- `404` (`message_not_found`) — el `uid` indicado no existe en el buzón.
+- `503` (`imap_unavailable`) — el servidor o la sesión no están disponibles.
+- `401` (`unauthorized`) — sin API key válida.
+
+> **Seguridad:** las dos rutas de lectura piden los cuerpos con `BODY.PEEK[...]`,
+> de modo que **leer un mensaje nunca fija la bandera `\Seen`**. Además, tanto
+> `GET /api/messages` como `GET /api/messages/{uid}` reutilizan la sesión IMAP
+> perezosa (solo una conexión mientras esté viva) y los valores de búsqueda se
+> citan y escapan, rechazando `CR`/`LF`/`NUL`, para que ninguna petición pueda
+> inyectar comandos IMAP.
 
 ### Envío de correo (protegido)
 
