@@ -179,13 +179,57 @@
 //! The query string is parsed with [`RawQuery`] + `serde_urlencoded` (not
 //! `Query<T>`) so every rejection is the shared JSON envelope rather than axum's
 //! plain-text one.
+//!
+//! # Message mutation contract
+//!
+//! `PATCH /api/messages/{uid}/flags`, `POST /api/messages/{uid}/move`,
+//! `POST /api/messages/{uid}/copy` and `DELETE /api/messages/{uid}` are protected
+//! by [`require_api_key`]. All four select the mailbox named by the required
+//! `mailbox` query parameter and act on the single message identified by the
+//! numeric `uid` in the path. On success they return HTTP `200` and
+//! `Content-Type: application/json`:
+//!
+//! ```json
+//! {"mailbox":"INBOX","uid":42,"flags":["\\Seen"]}              // PATCH .../flags
+//! {"mailbox":"INBOX","uid":42,"to":"Archive","status":"moved"} // POST .../move
+//! {"mailbox":"INBOX","uid":42,"to":"Archive","status":"copied"}// POST .../copy
+//! {"mailbox":"INBOX","uid":42,"status":"deleted"}              // DELETE
+//! ```
+//!
+//! `PATCH .../flags` accepts `{"add":["\\Seen","\\Flagged"],"remove":["\\Deleted"]}`
+//! (both fields optional; at least one non-empty). Every flag is parsed
+//! case-insensitively against a fixed allowlist (`\Seen`, `\Answered`,
+//! `\Flagged`, `\Draft`, `\Deleted`), canonicalised and deduplicated, and the
+//! same flag may not appear in both `add` and `remove`. The resulting `flags`
+//! are read back with a `UID FETCH`. `move`/`copy` accept `{"to":"Archive"}`
+//! (required, non-blank, without control characters); `move` uses `UID MOVE`
+//! when the server announces it, otherwise emulates it with `UID COPY` +
+//! `UID STORE +FLAGS.SILENT (\Deleted)` + `UID EXPUNGE` when `UIDPLUS` is
+//! announced. `DELETE` requires `UIDPLUS` and never falls back to a global
+//! `EXPUNGE`.
+//!
+//! Failures use the shared `{"error":...,"message":...}` envelope:
+//!
+//! - `400` (`invalid_request`) — a non-numeric or zero `uid`, a missing/blank
+//!   `mailbox` or `to`, a control character in any value, an unknown or
+//!   contradictory flag, an empty flag update, or a malformed JSON body.
+//! - `404` (`mailbox_not_found`) — the server answered `NO` for the mailbox.
+//! - `404` (`message_not_found`) — the requested `uid` does not exist.
+//! - `501` (`capability_not_supported`) — the server does not announce the
+//!   extension the operation needs (`MOVE`/`UIDPLUS`).
+//! - `503` (`imap_unavailable`) — the session or server is unavailable.
+//! - `401` (`unauthorized`) — missing or invalid API key.
+//!
+//! Validation happens at the HTTP boundary before any command is sent; the
+//! `STORE` query is built only from the allowlist and the `UID` set is rendered
+//! from a numeric `u32`, so no request can inject IMAP commands.
 
 use axum::body::{Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -198,7 +242,8 @@ use crate::Config;
 use crate::config::TlsMode;
 use crate::imap::{
     Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
-    MailboxStatus, Message, MessageEnvelope, SearchCriteria, SearchDate, TokioImapConnector,
+    MailboxStatus, Message, MessageEnvelope, SearchCriteria, SearchDate, SystemFlag,
+    TokioImapConnector,
 };
 use crate::smtp::{
     MailSender, MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage, SmtpError,
@@ -907,6 +952,140 @@ impl FetchMessageQuery {
     }
 }
 
+/// Query string shared by the flag, move, copy and delete routes.
+#[derive(Debug, Default, Deserialize)]
+struct MailboxQuery {
+    /// Mailbox to act on (required).
+    mailbox: Option<String>,
+}
+
+/// `PATCH /api/messages/{uid}/flags` request body.
+///
+/// Both fields are optional and default to empty; the handler then requires at
+/// least one of them to be non-empty.
+#[derive(Debug, Default, Deserialize)]
+struct FlagUpdateDto {
+    /// Flags to add.
+    #[serde(default)]
+    add: Vec<String>,
+    /// Flags to remove.
+    #[serde(default)]
+    remove: Vec<String>,
+}
+
+impl FlagUpdateDto {
+    /// Validates the request into allowlisted domain flags.
+    ///
+    /// Each value goes through [`SystemFlag::parse`] (case-insensitive) and is
+    /// canonicalised and deduplicated, preserving order. At least one of `add`
+    /// or `remove` must be non-empty, and no flag may appear in both.
+    fn into_flags(self) -> Result<(Vec<SystemFlag>, Vec<SystemFlag>), MessageError> {
+        let add = parse_flags(self.add)?;
+        let remove = parse_flags(self.remove)?;
+        if add.is_empty() && remove.is_empty() {
+            return Err(MessageError::InvalidRequest(
+                "at least one of `add` or `remove` must be non-empty".to_string(),
+            ));
+        }
+        if add.iter().any(|flag| remove.contains(flag)) {
+            return Err(MessageError::InvalidRequest(
+                "the same flag cannot be added and removed".to_string(),
+            ));
+        }
+        Ok((add, remove))
+    }
+}
+
+/// `POST /api/messages/{uid}/move` and `.../copy` request body.
+#[derive(Debug, Deserialize)]
+struct MoveCopyDto {
+    /// Destination mailbox.
+    to: String,
+}
+
+/// Parses and canonicalises a list of flag names against the allowlist.
+///
+/// The unknown-flag message is fixed and never echoes the supplied value.
+fn parse_flags(values: Vec<String>) -> Result<Vec<SystemFlag>, MessageError> {
+    let mut flags: Vec<SystemFlag> = Vec::with_capacity(values.len());
+    for value in values {
+        let flag = SystemFlag::parse(&value).map_err(|_| {
+            MessageError::InvalidRequest("a flag is not a known system flag".to_string())
+        })?;
+        if !flags.contains(&flag) {
+            flags.push(flag);
+        }
+    }
+    Ok(flags)
+}
+
+/// Parses a strictly positive numeric `uid` from the path.
+fn parse_uid(uid: &str) -> Result<u32, MessageError> {
+    let uid: u32 = uid.parse().map_err(|_| {
+        MessageError::InvalidRequest("`uid` must be a numeric identifier".to_string())
+    })?;
+    if uid == 0 {
+        return Err(MessageError::InvalidRequest(
+            "`uid` must be a positive integer".to_string(),
+        ));
+    }
+    Ok(uid)
+}
+
+/// Validates a non-blank destination mailbox.
+///
+/// `CR`, `LF` and `NUL` are rejected at the boundary (defence in depth); the
+/// value is then trimmed and must not be empty.
+fn parse_destination(value: String) -> Result<String, MessageError> {
+    if has_control_characters(&value) {
+        return Err(MessageError::InvalidRequest(
+            "`to` contains a forbidden control character".to_string(),
+        ));
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(MessageError::InvalidRequest(
+            "`to` must not be empty".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// JSON payload returned by a successful `PATCH /api/messages/{uid}/flags`.
+#[derive(Debug, Serialize)]
+struct FlagUpdateResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Unique identifier within the mailbox.
+    uid: u32,
+    /// Resulting flags in IMAP style (`\Seen`, …).
+    flags: Vec<String>,
+}
+
+/// JSON payload returned by a successful move or copy.
+#[derive(Debug, Serialize)]
+struct MoveCopyResponse {
+    /// Selected (source) mailbox name.
+    mailbox: String,
+    /// Unique identifier within the source mailbox.
+    uid: u32,
+    /// Destination mailbox name.
+    to: String,
+    /// `moved` for a move, `copied` for a copy.
+    status: &'static str,
+}
+
+/// JSON payload returned by a successful `DELETE /api/messages/{uid}`.
+#[derive(Debug, Serialize)]
+struct DeleteResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Unique identifier within the mailbox.
+    uid: u32,
+    /// Always `deleted`.
+    status: &'static str,
+}
+
 /// Decodes a raw query string into `T`, mapping a failure to `invalid_request`.
 fn parse_raw_query<T>(raw: Option<String>) -> Result<T, MessageError>
 where
@@ -928,6 +1107,8 @@ enum MessageError {
     MailboxNotFound,
     /// The requested message does not exist (`404`).
     MessageNotFound,
+    /// The server does not announce the extension the operation needs (`501`).
+    CapabilityNotSupported(String),
     /// The IMAP session or server is unavailable (`503`).
     Unavailable(String),
 }
@@ -946,6 +1127,11 @@ impl IntoResponse for MessageError {
                 "message_not_found",
                 "message not found".to_string(),
             ),
+            Self::CapabilityNotSupported(message) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "capability_not_supported",
+                message,
+            ),
             Self::Unavailable(message) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "imap_unavailable", message)
             }
@@ -956,13 +1142,18 @@ impl IntoResponse for MessageError {
 
 /// Maps an [`ImapError`] to the message routes' failure model.
 ///
-/// Missing mailboxes and messages become `404`; every other failure becomes `503`
-/// carrying the stable, credential-free [`ImapError::public_message`].
+/// Missing mailboxes and messages become `404`, a missing extension becomes
+/// `501` and every other failure becomes `503`, always carrying the stable,
+/// credential-free [`ImapError::public_message`].
 impl From<ImapError> for MessageError {
     fn from(error: ImapError) -> Self {
-        match error {
+        match &error {
             ImapError::MailboxNotFound => Self::MailboxNotFound,
             ImapError::MessageNotFound => Self::MessageNotFound,
+            ImapError::InvalidFlags => Self::InvalidRequest("invalid flags".to_string()),
+            ImapError::CapabilityNotSupported => {
+                Self::CapabilityNotSupported(error.public_message().to_string())
+            }
             other => Self::Unavailable(other.public_message().to_string()),
         }
     }
@@ -1269,6 +1460,122 @@ async fn fetch_message(
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
+/// `PATCH /api/messages/{uid}/flags` handler: applies flag additions/removals to
+/// a single message and returns its resulting flags.
+///
+/// The `uid` path parameter and the `mailbox` query parameter are validated
+/// first (shared JSON `400` envelope). The body is read as raw bytes and parsed
+/// here so a malformed payload or an unknown flag is a `400` rather than axum's
+/// plain-text rejection; validation rejects an empty or contradictory update
+/// **before** any IMAP command is sent.
+async fn update_flags(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Result<Response, MessageError> {
+    let uid = parse_uid(&uid)?;
+    let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
+
+    // A fixed message: the serde error could echo part of the attacker-supplied
+    // payload, so it must not be reflected back to the client.
+    let dto: FlagUpdateDto = serde_json::from_slice(&body)
+        .map_err(|_| MessageError::InvalidRequest("invalid JSON body".to_string()))?;
+    let (add, remove) = dto.into_flags()?;
+
+    let flags = state.imap.update_flags(&mailbox, uid, add, remove).await?;
+    Ok((
+        StatusCode::OK,
+        Json(FlagUpdateResponse {
+            mailbox,
+            uid,
+            flags,
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /api/messages/{uid}/move` handler: moves a single message to another
+/// mailbox.
+async fn move_message(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Result<Response, MessageError> {
+    let uid = parse_uid(&uid)?;
+    let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
+    let to = parse_body_destination(&body)?;
+
+    state.imap.move_message(&mailbox, uid, &to).await?;
+    Ok((
+        StatusCode::OK,
+        Json(MoveCopyResponse {
+            mailbox,
+            uid,
+            to,
+            status: "moved",
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /api/messages/{uid}/copy` handler: copies a single message to another
+/// mailbox.
+async fn copy_message(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Result<Response, MessageError> {
+    let uid = parse_uid(&uid)?;
+    let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
+    let to = parse_body_destination(&body)?;
+
+    state.imap.copy_message(&mailbox, uid, &to).await?;
+    Ok((
+        StatusCode::OK,
+        Json(MoveCopyResponse {
+            mailbox,
+            uid,
+            to,
+            status: "copied",
+        }),
+    )
+        .into_response())
+}
+
+/// `DELETE /api/messages/{uid}` handler: deletes a single message.
+async fn delete_message(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, MessageError> {
+    let uid = parse_uid(&uid)?;
+    let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
+
+    state.imap.delete_message(&mailbox, uid).await?;
+    Ok((
+        StatusCode::OK,
+        Json(DeleteResponse {
+            mailbox,
+            uid,
+            status: "deleted",
+        }),
+    )
+        .into_response())
+}
+
+/// Parses the required `to` field of a move/copy body and validates it.
+///
+/// A malformed body or a missing/blank/control-character `to` becomes a `400`
+/// with a fixed message that never echoes the payload.
+fn parse_body_destination(body: &[u8]) -> Result<String, MessageError> {
+    let dto: MoveCopyDto = serde_json::from_slice(body)
+        .map_err(|_| MessageError::InvalidRequest("invalid JSON body".to_string()))?;
+    parse_destination(dto.to)
+}
+
 /// `POST /api/messages` handler: reads the body, validates it, then sends it.
 ///
 /// The route disables axum's `DefaultBodyLimit`; the body is read here with
@@ -1357,7 +1664,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/imap/status", get(imap_status))
         .route("/api/mailboxes", get(list_mailboxes))
         .route("/api/mailboxes/select", post(select_mailbox))
-        .route("/api/messages/{uid}", get(fetch_message))
+        .route(
+            "/api/messages/{uid}",
+            get(fetch_message).delete(delete_message),
+        )
+        .route("/api/messages/{uid}/flags", patch(update_flags))
+        .route("/api/messages/{uid}/move", post(move_message))
+        .route("/api/messages/{uid}/copy", post(copy_message))
         // The GET listing and the POST sending share the path; the send handler
         // enforces its own body limit (and its JSON `413` envelope), so axum's
         // default rejection must not pre-empt it.

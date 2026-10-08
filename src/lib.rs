@@ -8,8 +8,9 @@ pub mod smtp;
 pub use config::{AccountError, Config, ConfigError, MailAccount, MailEndpoint, TlsMode};
 pub use http::{AppState, AppStateError, build_router};
 pub use imap::{
-    Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, ImapSession,
-    ImapStream, MailboxInfo, MailboxStatus, Message, MessageEnvelope, MessagePage, QueryError,
-    SearchCriteria, SearchDate, SendFuture, TokioImapConnector,
+    Address, Backoff, Capabilities, ConnectionManager, FetchFormat, FlagError, FlagQuery,
+    ImapConnector, ImapError, ImapSession, ImapStream, MailboxInfo, MailboxStatus, Message,
+    MessageEnvelope, MessagePage, QueryError, SearchCriteria, SearchDate, SendFuture, SystemFlag,
+    TokioImapConnector,
 };
 pub use smtp::{MailSender, MessageError, OutgoingAttachment, OutgoingMessage, SmtpError};
