@@ -108,6 +108,37 @@ pub enum SmtpError {
     Delivery(String),
 }
 
+impl SmtpError {
+    /// Stable, external-facing message that never carries third-party details.
+    ///
+    /// The HTTP layer uses this instead of [`Display`](std::fmt::Display) so no
+    /// error text coming from `lettre`, rustls or the SMTP server itself (which
+    /// may embed rejection banners, host names or addresses) ever reaches a
+    /// client. Variants are grouped by failure family, keeping the response
+    /// stable across versions of the underlying crates.
+    pub fn public_message(&self) -> &'static str {
+        match self {
+            Self::Message(_) => "the message could not be validated",
+            Self::Transport(_) => "failed to create the SMTP transport",
+            Self::Delivery(_) => "SMTP delivery failed",
+        }
+    }
+
+    /// Static label identifying the failure kind, for **logs only**.
+    ///
+    /// Unlike [`public_message`](Self::public_message) this is intended for
+    /// tracing, where a compact, machine-filterable tag is more useful than the
+    /// full [`Display`](std::fmt::Display) text. It is deliberately static and
+    /// carries no server data.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Message(_) => "message",
+            Self::Transport(_) => "transport",
+            Self::Delivery(_) => "delivery",
+        }
+    }
+}
+
 /// Boxed future returned by [`MailSender::send`].
 ///
 /// A named alias keeps the trait object-safe without repeating the (otherwise
@@ -469,4 +500,53 @@ mod tests {
             "{rendered}"
         );
     }
+
+    #[test]
+    fn public_message_and_kind_map_every_variant_without_leaking_details() {
+        // Third-party text (host + banner) that the raw `Display` may carry but
+        // `public_message` must never expose.
+        let message = SmtpError::Message(MessageError::InvalidAddress {
+            field: "to",
+            value: "leaked@internal.example".to_string(),
+        });
+        let delivery = SmtpError::Delivery("smtp.internal.example said: 550 rejected".to_string());
+
+        for (error, public, kind) in [
+            (&message, "the message could not be validated", "message"),
+            (&delivery, "SMTP delivery failed", "delivery"),
+        ] {
+            assert_eq!(error.public_message(), public, "{error:?}");
+            assert_eq!(error.kind(), kind, "{error:?}");
+            assert!(
+                !error.public_message().contains("internal.example"),
+                "the public message leaked a host name: {}",
+                error.public_message()
+            );
+            assert!(
+                !error.public_message().contains("550 rejected"),
+                "the public message leaked a server banner: {}",
+                error.public_message()
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_display_carries_the_raw_text_but_public_message_does_not() {
+        // Guards the contract: the diagnostic `Display` keeps the upstream text
+        // (so the leak is real if it were ever used for an HTTP body), while
+        // `public_message` is the sanitised, external face.
+        let delivery = SmtpError::Delivery("smtp.internal.example said: 550 rejected".to_string());
+        assert!(
+            delivery.to_string().contains("smtp.internal.example"),
+            "the Display is expected to keep the raw upstream text: {delivery}"
+        );
+        assert_eq!(delivery.public_message(), "SMTP delivery failed");
+        assert!(!delivery.public_message().contains("internal.example"));
+    }
+
+    // `SmtpError::Transport(lettre::transport::smtp::Error)` is intentionally not
+    // covered here: `lettre`'s SMTP error constructors are `pub(crate)`, so it
+    // cannot be built from an integration/unit test. Its mapping is still
+    // exhaustively matched in `public_message`/`kind`, so a future lettre change
+    // can only fail at compile time.
 }
