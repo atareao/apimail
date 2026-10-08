@@ -14,8 +14,9 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > el endpoint de salud público `GET /api/health`, la autenticación por API key y
 > la inspección de la cuenta con `GET /api/account`. **Ya se puede enviar correo**
 > con `POST /api/messages`. La **conexión de lectura a IMAP** ya está disponible
-> mediante `GET /api/imap/status`. El resto de operaciones de lectura (búsqueda,
-> banderas, `IDLE`) siguen en desarrollo.
+> mediante `GET /api/imap/status`, y ya se pueden **listar y seleccionar buzones**
+> con `GET /api/mailboxes` y `POST /api/mailboxes/select`. El resto de
+> operaciones de lectura (búsqueda, banderas, `IDLE`) siguen en desarrollo.
 
 ## Requisitos
 
@@ -260,6 +261,88 @@ credenciales ni trazas).
 curl -fsS -H "Authorization: Bearer una-clave-secreta" \
   http://127.0.0.1:3000/api/imap/status
 ```
+
+### Buzones (protegido)
+
+#### Listar buzones
+
+```http
+GET /api/mailboxes
+```
+
+Lista los buzones de la cuenta (`LIST`). Requiere la API key y **nunca** expone
+credenciales. Respuesta `200 OK` con `Content-Type: application/json`:
+
+```json
+{
+  "mailboxes": [
+    { "name": "INBOX", "delimiter": "/", "attributes": ["\\HasNoChildren"] },
+    { "name": "Sent", "delimiter": "/", "attributes": ["\\Sent"] }
+  ]
+}
+```
+
+`delimiter` es `null` cuando el servidor no define jerarquía y `attributes`
+recoge los atributos del buzón en estilo IMAP (`\NoSelect`, `\HasNoChildren`,
+`\Sent`…).
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/mailboxes
+```
+
+Si el servidor o la sesión no están disponibles, la respuesta es
+`503 Service Unavailable` con el modelo de error habitual
+(`{"error":"imap_unavailable","message":"..."}`).
+
+#### Seleccionar un buzón
+
+```http
+POST /api/mailboxes/select
+```
+
+Selecciona el buzón indicado (`SELECT`) y lo deja como buzón activo para las
+operaciones siguientes. Requiere la API key y un cuerpo `application/json`:
+
+```json
+{ "mailbox": "INBOX" }
+```
+
+Respuesta `200 OK` con `Content-Type: application/json`:
+
+```json
+{
+  "mailbox": "INBOX",
+  "exists": 42,
+  "recent": 0,
+  "unseen": 3,
+  "uid_validity": 7,
+  "uid_next": 100,
+  "flags": ["\\Seen", "\\Flagged"]
+}
+```
+
+`unseen`, `uid_validity` y `uid_next` son `null` cuando el servidor omite el
+valor.
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"mailbox":"INBOX"}' \
+  http://127.0.0.1:3000/api/mailboxes/select
+```
+
+Códigos de error (mismo modelo `{"error":...,"message":...}`):
+
+- `400` (`invalid_request`) — cuerpo JSON malformado o `mailbox` ausente o en
+  blanco.
+- `404` (`mailbox_not_found`) — el servidor responde `NO`: el buzón no existe.
+- `503` (`imap_unavailable`) — el servidor o la sesión no están disponibles; el
+  mensaje es estable y no filtra credenciales.
+- `401` (`unauthorized`) — sin API key válida.
+
+> Igual que `GET /api/imap/status`, ambas rutas reutilizan la sesión IMAP
+> perezosa: no abren una conexión nueva mientras haya una viva.
 
 ### Envío de correo (protegido)
 
