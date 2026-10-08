@@ -16,6 +16,12 @@ use apimail::{AppState, Config, build_router};
 
 const API_KEY: &str = "test-send-key";
 const SMTP_USER: &str = "smtp-user@test.example";
+/// Third-party text (a host plus a server banner) that the failing fake reports
+/// as the SMTP error. It must never reach the client, so the `502` tests pin its
+/// absence explicitly.
+const SMTP_SENTINEL: &str = "smtp.internal.example said: 550 rejected";
+/// Stable, server-independent message the `502` body must carry (design.md).
+const SMTP_PUBLIC_MESSAGE: &str = "SMTP delivery failed";
 
 /// A [`MailSender`] that records every message it is asked to send and can be
 /// configured to fail, all without touching the network.
@@ -49,7 +55,7 @@ impl MailSender for FakeMailer {
         Box::pin(async move {
             sent.lock().expect("mailer lock poisoned").push(message);
             if fail {
-                Err(SmtpError::Delivery("simulated SMTP failure".to_string()))
+                Err(SmtpError::Delivery(SMTP_SENTINEL.to_string()))
             } else {
                 Ok(())
             }
@@ -360,7 +366,22 @@ async fn smtp_failure_is_502() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let json = body_json(response).await;
     assert_eq!(json["error"], "smtp_error");
-    assert!(json["message"].is_string());
+    assert_eq!(json["message"], SMTP_PUBLIC_MESSAGE);
+    let message = json["message"]
+        .as_str()
+        .expect("message should be a string");
+    assert!(
+        !message.contains("smtp.internal.example"),
+        "the 502 leaked a host name: {message}"
+    );
+    assert!(
+        !message.contains("550 rejected"),
+        "the 502 leaked the server banner: {message}"
+    );
+    assert!(
+        !message.contains(SMTP_SENTINEL),
+        "the 502 leaked the raw upstream error: {message}"
+    );
 }
 
 #[tokio::test]

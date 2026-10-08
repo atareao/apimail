@@ -1294,7 +1294,7 @@ async fn send_message(
         .mailer
         .send(message)
         .await
-        .map_err(|error| SendError::Smtp(error.to_string()))?;
+        .map_err(|error| SendError::Smtp(error.public_message().to_string()))?;
 
     Ok((StatusCode::OK, Json(SentResponse { status: "sent" })).into_response())
 }
