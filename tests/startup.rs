@@ -121,6 +121,28 @@ fn invalid_mail_port_exits_non_zero() {
     );
 }
 
+/// A non-numeric attachment limit must make the process exit non-zero with a
+/// descriptive message naming the offending variable.
+#[test]
+fn invalid_max_attachment_bytes_exits_non_zero() {
+    let output = configured_command()
+        .env("APIMAIL_MAX_ATTACHMENT_BYTES", "abc")
+        .output()
+        .expect("failed to spawn apimail binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit, got {:?}",
+        output.status
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("APIMAIL_MAX_ATTACHMENT_BYTES"),
+        "stderr should mention APIMAIL_MAX_ATTACHMENT_BYTES, got: {stderr:?}"
+    );
+}
+
 /// An unsupported TLS mode must make the process exit non-zero with a
 /// descriptive message.
 #[test]

@@ -22,7 +22,7 @@ fn app() -> axum::Router {
         _ => None,
     })
     .expect("valid test config");
-    build_router(AppState::from_config(&config))
+    build_router(AppState::from_config(&config).expect("valid app state"))
 }
 
 #[tokio::test]

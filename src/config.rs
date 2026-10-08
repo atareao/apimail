@@ -4,6 +4,11 @@
 pub const DEFAULT_HOST: &str = "0.0.0.0";
 /// Default bind port when `APIMAIL_PORT` is unset.
 pub const DEFAULT_PORT: u16 = 3000;
+/// Environment variable holding the maximum total attachment size, in bytes.
+pub const MAX_ATTACHMENT_BYTES_VAR: &str = "APIMAIL_MAX_ATTACHMENT_BYTES";
+/// Default maximum total attachment size (10 MiB) when
+/// `APIMAIL_MAX_ATTACHMENT_BYTES` is unset.
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 /// TLS mode negotiated with a mail endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +217,8 @@ pub struct Config {
     pub api_key: String,
     /// Mail account the service operates on.
     pub account: MailAccount,
+    /// Maximum total size, in bytes, of the decoded attachments of a message.
+    pub max_attachment_bytes: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -237,6 +244,14 @@ pub enum ConfigError {
     /// `APIMAIL_API_KEY` was absent or empty.
     #[error("missing APIMAIL_API_KEY: a non-empty API key is required to start the service")]
     MissingApiKey,
+    /// `APIMAIL_MAX_ATTACHMENT_BYTES` was present but not a positive integer.
+    #[error(
+        "invalid APIMAIL_MAX_ATTACHMENT_BYTES value `{value}`: expected a positive number of bytes"
+    )]
+    InvalidMaxAttachmentBytes {
+        /// The offending raw value.
+        value: String,
+    },
     /// The mail account could not be loaded.
     #[error(transparent)]
     Account(#[from] AccountError),
@@ -259,9 +274,10 @@ impl Config {
     /// its value, if present. This keeps the parsing/validation logic testable
     /// without touching the process environment.
     ///
-    /// Validation runs in the order host → port → api key → mail account, so an
-    /// invalid server port is reported before any missing API key or account
-    /// value.
+    /// Validation runs in the order host → port → api key → mail account →
+    /// attachment limit, so an invalid server port is reported before any
+    /// missing API key or account value, and an invalid attachment limit is
+    /// reported last.
     pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -278,11 +294,24 @@ impl Config {
             _ => return Err(ConfigError::MissingApiKey),
         };
         let account = MailAccount::from_lookup(&lookup)?;
+        let max_attachment_bytes = match lookup(MAX_ATTACHMENT_BYTES_VAR) {
+            Some(raw) => {
+                let parsed = raw
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidMaxAttachmentBytes { value: raw.clone() })?;
+                if parsed == 0 {
+                    return Err(ConfigError::InvalidMaxAttachmentBytes { value: raw });
+                }
+                parsed
+            }
+            None => DEFAULT_MAX_ATTACHMENT_BYTES,
+        };
         Ok(Self {
             host,
             port,
             api_key,
             account,
+            max_attachment_bytes,
         })
     }
 }
@@ -682,5 +711,55 @@ mod tests {
             !rendered.contains("smtp-secret"),
             "Config Debug leaked the SMTP password: {rendered}"
         );
+    }
+
+    #[test]
+    fn max_attachment_defaults_to_ten_mib_when_absent() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(config.max_attachment_bytes, DEFAULT_MAX_ATTACHMENT_BYTES);
+        assert_eq!(DEFAULT_MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_attachment_uses_configured_value() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(MAX_ATTACHMENT_BYTES_VAR, "2048")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.max_attachment_bytes, 2048);
+    }
+
+    #[test]
+    fn max_attachment_zero_is_an_error() {
+        let err = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(MAX_ATTACHMENT_BYTES_VAR, "0")]),
+        ))
+        .expect_err("zero limit must fail");
+        match err {
+            ConfigError::InvalidMaxAttachmentBytes { value } => assert_eq!(value, "0"),
+            other => panic!("expected InvalidMaxAttachmentBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_attachment_non_numeric_is_an_error() {
+        let err = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(MAX_ATTACHMENT_BYTES_VAR, "abc")]),
+        ))
+        .expect_err("non-numeric limit must fail");
+        assert!(
+            err.to_string().contains(MAX_ATTACHMENT_BYTES_VAR),
+            "the error message must name the offending variable: {err}"
+        );
+        match err {
+            ConfigError::InvalidMaxAttachmentBytes { value } => assert_eq!(value, "abc"),
+            other => panic!("expected InvalidMaxAttachmentBytes, got {other:?}"),
+        }
     }
 }

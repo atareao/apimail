@@ -29,7 +29,7 @@ fn config() -> Config {
 
 /// Builds the router with a known API key, exercising the protected middleware.
 fn app() -> Router {
-    build_router(AppState::from_config(&config()))
+    build_router(AppState::from_config(&config()).expect("valid app state"))
 }
 
 /// Sends a `GET /api/whoami` request with an optional `Authorization` header.
@@ -173,7 +173,10 @@ async fn whoami_with_non_ascii_header_returns_401() {
 
 #[test]
 fn app_state_debug_does_not_leak_api_key() {
-    let debug = format!("{:?}", AppState::from_config(&config()));
+    let debug = format!(
+        "{:?}",
+        AppState::from_config(&config()).expect("valid app state")
+    );
     assert!(
         !debug.contains(API_KEY),
         "Debug output must not leak the API key: {debug}"
