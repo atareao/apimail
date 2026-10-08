@@ -13,8 +13,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use apimail::imap::{
-    FetchFormat, ImapConnector, ImapError, ImapSession, Message, SearchCriteria,
-    SendFuture as ImapSendFuture,
+    Capabilities, FetchFormat, FlagQuery, ImapConnector, ImapError, ImapSession, Message,
+    SearchCriteria, SendFuture as ImapSendFuture,
 };
 use apimail::smtp::{MailSender, OutgoingMessage, SendFuture as MailSendFuture};
 use apimail::{AppState, Config, MailboxInfo, MailboxStatus, build_router};
@@ -100,6 +100,30 @@ impl ImapSession for FakeSession {
         _format: FetchFormat,
     ) -> ImapSendFuture<'_, Result<Vec<Message>, ImapError>> {
         Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn store(&mut self, _uid: u32, _query: FlagQuery) -> ImapSendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn copy(&mut self, _uid: u32, _mailbox: String) -> ImapSendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn move_message(
+        &mut self,
+        _uid: u32,
+        _mailbox: String,
+    ) -> ImapSendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn uid_expunge(&mut self, _uid: u32) -> ImapSendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn capabilities(&mut self) -> ImapSendFuture<'_, Result<Capabilities, ImapError>> {
+        Box::pin(async move { Ok(Capabilities::default()) })
     }
 }
 

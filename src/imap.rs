@@ -63,6 +63,12 @@ pub enum ImapError {
     /// The requested message does not exist in the selected mailbox.
     #[error("message not found")]
     MessageNotFound,
+    /// The server does not announce the IMAP extension the operation needs.
+    #[error("the server does not support this operation")]
+    CapabilityNotSupported,
+    /// The supplied flag update is not a valid allowlisted request.
+    #[error("invalid flags")]
+    InvalidFlags,
     /// The connection ended before a usable state was reached.
     #[error("IMAP server unavailable: {0}")]
     Unavailable(String),
@@ -96,6 +102,8 @@ impl ImapError {
             Self::Login(_) | Self::Imap(_) => "IMAP authentication or command failed",
             Self::MailboxNotFound => "mailbox not found",
             Self::MessageNotFound => "message not found",
+            Self::CapabilityNotSupported => "the server does not support this operation",
+            Self::InvalidFlags => "invalid flags",
             Self::Io(_) => "IMAP I/O error",
         }
     }
@@ -112,6 +120,8 @@ impl ImapError {
             Self::Login(_) => "login",
             Self::MailboxNotFound => "not_found",
             Self::MessageNotFound => "not_found",
+            Self::CapabilityNotSupported => "unsupported",
+            Self::InvalidFlags => "invalid_flags",
             Self::Unavailable(_) => "unavailable",
             Self::Timeout(_) => "timeout",
             Self::Imap(_) => "imap",
@@ -137,11 +147,26 @@ impl ImapError {
             | Self::Unavailable(_)
             | Self::Io(_) => true,
             Self::Login(_) | Self::MailboxNotFound | Self::MessageNotFound => false,
+            Self::CapabilityNotSupported => false,
+            Self::InvalidFlags => false,
             Self::Imap(inner) => matches!(
                 inner,
                 async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost
             ),
         }
+    }
+}
+
+/// Maps a flag-validation failure to its own logical IMAP failure.
+///
+/// A [`FlagError`] means the caller composed an invalid update (for example an
+/// empty one). It is a **logical** error, not a transport failure, so it maps to
+/// [`ImapError::InvalidFlags`] — `is_connection()` stays `false` and a live
+/// session is kept. The fixed, credential-free message carries no `FlagError`
+/// text.
+impl From<FlagError> for ImapError {
+    fn from(_error: FlagError) -> Self {
+        Self::InvalidFlags
     }
 }
 
@@ -460,6 +485,124 @@ fn flag_label(flag: &Flag<'_>) -> String {
     }
 }
 
+/// A system flag from the closed allowlist the API accepts.
+///
+/// Only these five flags may ever reach a `UID STORE` query; the parser is
+/// case-insensitive but the `\` prefix is mandatory, and [`to_imap`] renders the
+/// canonical capitalised IMAP spelling.
+///
+/// [`to_imap`]: SystemFlag::to_imap
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemFlag {
+    /// `\Seen`.
+    Seen,
+    /// `\Answered`.
+    Answered,
+    /// `\Flagged`.
+    Flagged,
+    /// `\Draft`.
+    Draft,
+    /// `\Deleted`.
+    Deleted,
+}
+
+impl SystemFlag {
+    /// Parses a standard flag name, case-insensitively and requiring a leading
+    /// backslash.
+    pub fn parse(value: &str) -> Result<Self, FlagError> {
+        let Some(name) = value.strip_prefix('\\') else {
+            return Err(FlagError::Unknown);
+        };
+        if name.eq_ignore_ascii_case("seen") {
+            Ok(Self::Seen)
+        } else if name.eq_ignore_ascii_case("answered") {
+            Ok(Self::Answered)
+        } else if name.eq_ignore_ascii_case("flagged") {
+            Ok(Self::Flagged)
+        } else if name.eq_ignore_ascii_case("draft") {
+            Ok(Self::Draft)
+        } else if name.eq_ignore_ascii_case("deleted") {
+            Ok(Self::Deleted)
+        } else {
+            Err(FlagError::Unknown)
+        }
+    }
+
+    /// The canonical IMAP spelling (for example `\Seen`).
+    pub fn to_imap(&self) -> &'static str {
+        match self {
+            Self::Seen => "\\Seen",
+            Self::Answered => "\\Answered",
+            Self::Flagged => "\\Flagged",
+            Self::Draft => "\\Draft",
+            Self::Deleted => "\\Deleted",
+        }
+    }
+}
+
+/// Errors produced while parsing or composing a flag update.
+#[derive(Debug, thiserror::Error)]
+pub enum FlagError {
+    /// The supplied value is not a known system flag.
+    #[error("unknown flag")]
+    Unknown,
+    /// Both the additions and the removals were empty.
+    #[error("empty flag update")]
+    Empty,
+}
+
+/// A validated `STORE` query composed **only** from the [`SystemFlag`] allowlist
+/// and the fixed `.SILENT` items.
+///
+/// [`new`](FlagQuery::new) is the only constructor, so arbitrary user text can
+/// never reach the interpolated `UID STORE` query. The rendered form is, for
+/// example, `+FLAGS.SILENT (\Seen \Flagged) -FLAGS.SILENT (\Deleted)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagQuery(String);
+
+impl FlagQuery {
+    /// Builds a `STORE` query from the flags to add and remove.
+    ///
+    /// At least one of `add`/`remove` must be non-empty; the flags are rendered
+    /// in the given order, with the fixed `+FLAGS.SILENT`/`-FLAGS.SILENT` items.
+    pub fn new(add: &[SystemFlag], remove: &[SystemFlag]) -> Result<Self, FlagError> {
+        if add.is_empty() && remove.is_empty() {
+            return Err(FlagError::Empty);
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !add.is_empty() {
+            parts.push(format!("+FLAGS.SILENT ({})", render_flags(add)));
+        }
+        if !remove.is_empty() {
+            parts.push(format!("-FLAGS.SILENT ({})", render_flags(remove)));
+        }
+        Ok(Self(parts.join(" ")))
+    }
+
+    /// The validated query string, ready to interpolate into `UID STORE`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Renders a space-separated list of canonical IMAP flag names.
+fn render_flags(flags: &[SystemFlag]) -> String {
+    flags
+        .iter()
+        .map(SystemFlag::to_imap)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The IMAP extensions the flag commands depend on, as announced by `CAPABILITY`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The server announces the `MOVE` extension (RFC 6851).
+    pub has_move: bool,
+    /// The server announces the `UIDPLUS` extension (RFC 4315).
+    pub has_uidplus: bool,
+}
+
 /// Decodes raw envelope bytes with a lossy UTF-8 conversion.
 ///
 /// The server's envelope fields are opaque byte strings; a lossy conversion keeps
@@ -604,6 +747,24 @@ pub trait ImapSession: Send {
         uids: Vec<u32>,
         format: FetchFormat,
     ) -> SendFuture<'_, Result<Vec<Message>, ImapError>>;
+
+    /// Applies a validated flag `query` to the single message `uid` with
+    /// `UID STORE`, draining the response stream so the command completes.
+    fn store(&mut self, uid: u32, query: FlagQuery) -> SendFuture<'_, Result<(), ImapError>>;
+
+    /// Copies the single message `uid` to `mailbox` with `UID COPY`.
+    fn copy(&mut self, uid: u32, mailbox: String) -> SendFuture<'_, Result<(), ImapError>>;
+
+    /// Moves the single message `uid` to `mailbox` with `UID MOVE`.
+    fn move_message(&mut self, uid: u32, mailbox: String) -> SendFuture<'_, Result<(), ImapError>>;
+
+    /// Purges only the `\Deleted` message `uid` with `UID EXPUNGE`, draining the
+    /// response stream so the command completes.
+    fn uid_expunge(&mut self, uid: u32) -> SendFuture<'_, Result<(), ImapError>>;
+
+    /// Queries the server capabilities with `CAPABILITY`, mapping the extensions
+    /// the flag commands depend on.
+    fn capabilities(&mut self) -> SendFuture<'_, Result<Capabilities, ImapError>>;
 }
 
 /// A factory able to open a fresh authenticated IMAP session.
@@ -917,6 +1078,61 @@ impl ImapSession for SessionHandle {
                 .collect())
         })
     }
+
+    fn store(&mut self, uid: u32, query: FlagQuery) -> SendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move {
+            let stream = self
+                .session
+                .uid_store(uid.to_string(), query.as_str())
+                .await
+                .map_err(ImapError::from)?;
+            // `.SILENT` usually yields no FETCH, but the stream must be driven to
+            // completion for the command to finish.
+            let _: Vec<Fetch> = stream.try_collect().await?;
+            Ok(())
+        })
+    }
+
+    fn copy(&mut self, uid: u32, mailbox: String) -> SendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move {
+            self.session
+                .uid_copy(uid.to_string(), mailbox)
+                .await
+                .map_err(ImapError::from)
+        })
+    }
+
+    fn move_message(&mut self, uid: u32, mailbox: String) -> SendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move {
+            self.session
+                .uid_mv(uid.to_string(), mailbox)
+                .await
+                .map_err(ImapError::from)
+        })
+    }
+
+    fn uid_expunge(&mut self, uid: u32) -> SendFuture<'_, Result<(), ImapError>> {
+        Box::pin(async move {
+            let stream = self
+                .session
+                .uid_expunge(uid.to_string())
+                .await
+                .map_err(ImapError::from)?;
+            // The stream carries the expunged UIDs and must be drained.
+            let _: Vec<u32> = stream.try_collect().await?;
+            Ok(())
+        })
+    }
+
+    fn capabilities(&mut self) -> SendFuture<'_, Result<Capabilities, ImapError>> {
+        Box::pin(async move {
+            let capabilities = self.session.capabilities().await.map_err(ImapError::from)?;
+            Ok(Capabilities {
+                has_move: capabilities.has_str("MOVE"),
+                has_uidplus: capabilities.has_str("UIDPLUS"),
+            })
+        })
+    }
 }
 
 /// Retry policy with bounded exponential backoff.
@@ -1172,6 +1388,127 @@ impl ConnectionManager {
         })
         .await
     }
+
+    /// Applies `add`/`remove` flags to the single message `uid` and returns the
+    /// resulting flags.
+    ///
+    /// Composes `SELECT`, an existence check, the allowlisted `UID STORE` and a
+    /// summary `UID FETCH` on a single live session. A `uid` that is absent from
+    /// the mailbox is reported as [`ImapError::MessageNotFound`] **before** any
+    /// `STORE` is sent (consistently with the other mutation operations).
+    pub async fn update_flags(
+        &self,
+        mailbox: &str,
+        uid: u32,
+        add: Vec<SystemFlag>,
+        remove: Vec<SystemFlag>,
+    ) -> Result<Vec<String>, ImapError> {
+        let mailbox = mailbox.to_string();
+        self.run_once(move |session| {
+            Box::pin(async move {
+                let query = FlagQuery::new(&add, &remove)?;
+                session.select(mailbox).await?;
+                ensure_message_exists(session, uid).await?;
+                session.store(uid, query).await?;
+                let mut messages = session.fetch(vec![uid], FetchFormat::Summary).await?;
+                messages
+                    .pop()
+                    .map(|message| message.flags)
+                    .ok_or(ImapError::MessageNotFound)
+            })
+        })
+        .await
+    }
+
+    /// Copies the single message `uid` from `mailbox` to `to`.
+    ///
+    /// `UID COPY` is part of IMAP4rev1, so no capability is required. The message
+    /// is checked for existence before the copy; a missing one is reported as
+    /// [`ImapError::MessageNotFound`].
+    pub async fn copy_message(&self, mailbox: &str, uid: u32, to: &str) -> Result<(), ImapError> {
+        let mailbox = mailbox.to_string();
+        let to = to.to_string();
+        self.run_once(move |session| {
+            Box::pin(async move {
+                session.select(mailbox).await?;
+                ensure_message_exists(session, uid).await?;
+                session.copy(uid, to).await
+            })
+        })
+        .await
+    }
+
+    /// Moves the single message `uid` from `mailbox` to `to`.
+    ///
+    /// Uses `UID MOVE` when the server announces `MOVE`; otherwise, when it
+    /// announces `UIDPLUS`, emulates the move with `UID COPY`, then
+    /// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` (copying before
+    /// deleting so mail is never lost). When neither capability is announced the
+    /// operation fails with [`ImapError::CapabilityNotSupported`] and sends no
+    /// command. The message's existence is checked **before** the capability
+    /// test, so a missing `uid` is reported as [`ImapError::MessageNotFound`].
+    pub async fn move_message(&self, mailbox: &str, uid: u32, to: &str) -> Result<(), ImapError> {
+        let mailbox = mailbox.to_string();
+        let to = to.to_string();
+        self.run_once(move |session| {
+            Box::pin(async move {
+                session.select(mailbox).await?;
+                ensure_message_exists(session, uid).await?;
+                let capabilities = session.capabilities().await?;
+                if capabilities.has_move {
+                    session.move_message(uid, to).await
+                } else if capabilities.has_uidplus {
+                    session.copy(uid, to).await?;
+                    let query = FlagQuery::new(&[SystemFlag::Deleted], &[])?;
+                    session.store(uid, query).await?;
+                    session.uid_expunge(uid).await
+                } else {
+                    Err(ImapError::CapabilityNotSupported)
+                }
+            })
+        })
+        .await
+    }
+
+    /// Deletes the single message `uid` from `mailbox`.
+    ///
+    /// Requires the server to announce `UIDPLUS` so `UID EXPUNGE` can target only
+    /// that message; without it the operation fails with
+    /// [`ImapError::CapabilityNotSupported`] and **never** falls back to a global
+    /// `EXPUNGE`. The message's existence is checked **before** the capability
+    /// test, so a missing `uid` is reported as [`ImapError::MessageNotFound`].
+    /// The message is marked `\Deleted` and then expunged.
+    pub async fn delete_message(&self, mailbox: &str, uid: u32) -> Result<(), ImapError> {
+        let mailbox = mailbox.to_string();
+        self.run_once(move |session| {
+            Box::pin(async move {
+                session.select(mailbox).await?;
+                ensure_message_exists(session, uid).await?;
+                let capabilities = session.capabilities().await?;
+                if !capabilities.has_uidplus {
+                    return Err(ImapError::CapabilityNotSupported);
+                }
+                let query = FlagQuery::new(&[SystemFlag::Deleted], &[])?;
+                session.store(uid, query).await?;
+                session.uid_expunge(uid).await
+            })
+        })
+        .await
+    }
+}
+
+/// Fails with [`ImapError::MessageNotFound`] when `uid` is absent from the
+/// selected mailbox, using a summary `UID FETCH`.
+async fn ensure_message_exists(
+    session: &mut Box<dyn ImapSession>,
+    uid: u32,
+) -> Result<(), ImapError> {
+    let messages = session.fetch(vec![uid], FetchFormat::Summary).await?;
+    if messages.is_empty() {
+        Err(ImapError::MessageNotFound)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1212,6 +1549,10 @@ mod tests {
         messages: Vec<Message>,
         /// UID sets received by `fetch`, in call order.
         fetch_uids: Arc<Mutex<Vec<Vec<u32>>>>,
+        /// Capabilities reported by `capabilities`.
+        capabilities: Capabilities,
+        /// Every mutating command received, in call order, as rendered strings.
+        ops: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeSession {
@@ -1224,6 +1565,8 @@ mod tests {
                 uids: Vec::new(),
                 messages: Vec::new(),
                 fetch_uids: Arc::new(Mutex::new(Vec::new())),
+                capabilities: Capabilities::default(),
+                ops: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1236,6 +1579,8 @@ mod tests {
                 uids: Vec::new(),
                 messages: Vec::new(),
                 fetch_uids: Arc::new(Mutex::new(Vec::new())),
+                capabilities: Capabilities::default(),
+                ops: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1254,6 +1599,12 @@ mod tests {
         /// Shares the UID-set log so a test can assert the fetched window.
         fn with_fetch_uids_log(mut self, log: Arc<Mutex<Vec<Vec<u32>>>>) -> Self {
             self.fetch_uids = log;
+            self
+        }
+
+        /// Sets the capabilities reported by `capabilities`.
+        fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+            self.capabilities = capabilities;
             self
         }
 
@@ -1388,6 +1739,47 @@ mod tests {
                 .collect();
             Box::pin(async move { Ok(messages) })
         }
+
+        fn store(&mut self, uid: u32, query: FlagQuery) -> SendFuture<'_, Result<(), ImapError>> {
+            self.ops
+                .lock()
+                .expect("ops log poisoned")
+                .push(format!("store {uid} {}", query.as_str()));
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn copy(&mut self, uid: u32, mailbox: String) -> SendFuture<'_, Result<(), ImapError>> {
+            self.ops
+                .lock()
+                .expect("ops log poisoned")
+                .push(format!("copy {uid} {mailbox}"));
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn move_message(
+            &mut self,
+            uid: u32,
+            mailbox: String,
+        ) -> SendFuture<'_, Result<(), ImapError>> {
+            self.ops
+                .lock()
+                .expect("ops log poisoned")
+                .push(format!("move {uid} {mailbox}"));
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn uid_expunge(&mut self, uid: u32) -> SendFuture<'_, Result<(), ImapError>> {
+            self.ops
+                .lock()
+                .expect("ops log poisoned")
+                .push(format!("expunge {uid}"));
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn capabilities(&mut self) -> SendFuture<'_, Result<Capabilities, ImapError>> {
+            let capabilities = self.capabilities;
+            Box::pin(async move { Ok(capabilities) })
+        }
     }
 
     /// A scripted outcome for a single `connect` call.
@@ -1514,6 +1906,9 @@ mod tests {
             "socket 10.0.0.5",
         ));
         let not_found = ImapError::MailboxNotFound;
+        let message_not_found = ImapError::MessageNotFound;
+        let unsupported = ImapError::CapabilityNotSupported;
+        let invalid_flags = ImapError::InvalidFlags;
 
         for (error, message, kind) in [
             (&tcp, "could not connect to the IMAP server", "tcp"),
@@ -1529,6 +1924,13 @@ mod tests {
             (&login, "IMAP authentication or command failed", "login"),
             (&io, "IMAP I/O error", "io"),
             (&not_found, "mailbox not found", "not_found"),
+            (&message_not_found, "message not found", "not_found"),
+            (
+                &unsupported,
+                "the server does not support this operation",
+                "unsupported",
+            ),
+            (&invalid_flags, "invalid flags", "invalid_flags"),
         ] {
             assert_eq!(error.public_message(), message, "{error:?}");
             assert_eq!(error.kind(), kind, "{error:?}");
@@ -1865,6 +2267,9 @@ mod tests {
         let logical = [
             ImapError::Login("nope".to_string()),
             ImapError::MailboxNotFound,
+            ImapError::MessageNotFound,
+            ImapError::CapabilityNotSupported,
+            ImapError::InvalidFlags,
             ImapError::Imap(async_imap::error::Error::No("no".to_string())),
             ImapError::Imap(async_imap::error::Error::Bad("bad".to_string())),
         ];
@@ -2161,5 +2566,352 @@ mod tests {
         );
         assert_eq!(error.public_message(), "message not found");
         assert_eq!(error.kind(), "not_found");
+    }
+
+    // --- Flag domain additions (imap-flags) ---
+
+    #[test]
+    fn system_flag_parse_is_case_insensitive_and_requires_a_backslash() {
+        for (value, expected) in [
+            ("\\Seen", SystemFlag::Seen),
+            ("\\seen", SystemFlag::Seen),
+            ("\\ANSWERED", SystemFlag::Answered),
+            ("\\Flagged", SystemFlag::Flagged),
+            ("\\draft", SystemFlag::Draft),
+            ("\\Deleted", SystemFlag::Deleted),
+        ] {
+            assert_eq!(
+                SystemFlag::parse(value).expect("a known flag must parse"),
+                expected,
+                "`{value}`"
+            );
+        }
+
+        for invalid in [
+            "Seen",
+            "\\Unknown",
+            "\\Seen ",
+            " \\Seen",
+            "",
+            "\\",
+            "\\seen\\",
+            "\\Seen\\Seen",
+        ] {
+            assert!(
+                SystemFlag::parse(invalid).is_err(),
+                "`{invalid}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn system_flag_to_imap_is_the_canonical_form() {
+        assert_eq!(SystemFlag::Seen.to_imap(), "\\Seen");
+        assert_eq!(SystemFlag::Answered.to_imap(), "\\Answered");
+        assert_eq!(SystemFlag::Flagged.to_imap(), "\\Flagged");
+        assert_eq!(SystemFlag::Draft.to_imap(), "\\Draft");
+        assert_eq!(SystemFlag::Deleted.to_imap(), "\\Deleted");
+    }
+
+    #[test]
+    fn flag_query_requires_at_least_one_flag() {
+        assert!(matches!(FlagQuery::new(&[], &[]), Err(FlagError::Empty)));
+    }
+
+    #[test]
+    fn flag_query_composes_fixed_items_and_allowlisted_flags_only() {
+        let query = FlagQuery::new(
+            &[SystemFlag::Seen, SystemFlag::Flagged],
+            &[SystemFlag::Deleted],
+        )
+        .expect("a non-empty query must build");
+        assert_eq!(
+            query.as_str(),
+            "+FLAGS.SILENT (\\Seen \\Flagged) -FLAGS.SILENT (\\Deleted)"
+        );
+
+        assert_eq!(
+            FlagQuery::new(&[SystemFlag::Seen], &[])
+                .expect("an add-only query must build")
+                .as_str(),
+            "+FLAGS.SILENT (\\Seen)"
+        );
+        assert_eq!(
+            FlagQuery::new(&[], &[SystemFlag::Deleted])
+                .expect("a remove-only query must build")
+                .as_str(),
+            "-FLAGS.SILENT (\\Deleted)"
+        );
+    }
+
+    #[test]
+    fn capability_error_is_unsupported_and_not_a_connection_error() {
+        let error = ImapError::CapabilityNotSupported;
+        assert_eq!(
+            error.public_message(),
+            "the server does not support this operation"
+        );
+        assert_eq!(error.kind(), "unsupported");
+        assert!(!error.is_connection());
+    }
+
+    #[test]
+    fn flag_error_maps_to_invalid_flags_without_leaking_internal_detail() {
+        let error: ImapError = FlagError::Empty.into();
+        assert!(matches!(&error, ImapError::InvalidFlags), "{error:?}");
+        assert_eq!(error.public_message(), "invalid flags");
+        assert_eq!(error.kind(), "invalid_flags");
+        assert!(
+            !error.is_connection(),
+            "a validation failure must not discard a live session"
+        );
+        assert!(
+            !error.public_message().contains("empty flag update"),
+            "the mapped error leaked the internal FlagError text: {}",
+            error.public_message()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_flags_stores_then_returns_the_resulting_flags() {
+        let session = FakeSession::healthy().with_messages(vec![Message {
+            flags: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+            ..message(42)
+        }]);
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        let flags = manager
+            .update_flags(
+                "INBOX",
+                42,
+                vec![SystemFlag::Seen, SystemFlag::Flagged],
+                Vec::new(),
+            )
+            .await
+            .expect("the update must succeed");
+
+        assert_eq!(flags, vec!["\\Seen".to_string(), "\\Flagged".to_string()]);
+        assert_eq!(
+            ops.lock().expect("ops log poisoned").as_slice(),
+            ["store 42 +FLAGS.SILENT (\\Seen \\Flagged)"],
+            "the STORE query must carry only fixed items and allowlisted flags"
+        );
+        assert_eq!(connector.connects(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_flags_missing_message_is_not_found() {
+        let session = FakeSession::healthy();
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .update_flags("INBOX", 42, vec![SystemFlag::Seen], Vec::new())
+            .await
+            .expect_err("a missing message must fail");
+        assert!(matches!(error, ImapError::MessageNotFound), "{error:?}");
+        assert!(
+            ops.lock().expect("ops log poisoned").is_empty(),
+            "no STORE may be sent for a missing message"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_message_checks_existence_then_copies() {
+        let session = FakeSession::healthy().with_messages(vec![message(42)]);
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        manager
+            .copy_message("INBOX", 42, "Archive")
+            .await
+            .expect("the copy must succeed");
+
+        assert_eq!(
+            ops.lock().expect("ops log poisoned").as_slice(),
+            ["copy 42 Archive"]
+        );
+        assert_eq!(connector.connects(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_message_missing_message_is_not_found_and_sends_nothing() {
+        let session = FakeSession::healthy();
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .copy_message("INBOX", 42, "Archive")
+            .await
+            .expect_err("a missing message must fail");
+        assert!(matches!(error, ImapError::MessageNotFound), "{error:?}");
+        assert!(
+            ops.lock().expect("ops log poisoned").is_empty(),
+            "no COPY must be sent for a missing message"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_message_uses_move_when_supported() {
+        let session = FakeSession::healthy()
+            .with_messages(vec![message(42)])
+            .with_capabilities(Capabilities {
+                has_move: true,
+                has_uidplus: false,
+            });
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        manager
+            .move_message("INBOX", 42, "Archive")
+            .await
+            .expect("the move must succeed");
+
+        assert_eq!(
+            ops.lock().expect("ops log poisoned").as_slice(),
+            ["move 42 Archive"],
+            "a server announcing MOVE must receive a single UID MOVE"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_message_emulates_with_copy_store_expunge_when_only_uidplus() {
+        let session = FakeSession::healthy()
+            .with_messages(vec![message(42)])
+            .with_capabilities(Capabilities {
+                has_move: false,
+                has_uidplus: true,
+            });
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        manager
+            .move_message("INBOX", 42, "Archive")
+            .await
+            .expect("the emulated move must succeed");
+
+        assert_eq!(
+            ops.lock().expect("ops log poisoned").as_slice(),
+            [
+                "copy 42 Archive",
+                "store 42 +FLAGS.SILENT (\\Deleted)",
+                "expunge 42"
+            ],
+            "the emulation must copy first, then mark, then expunge"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_message_without_capabilities_is_unsupported_and_sends_nothing() {
+        let session = FakeSession::healthy().with_messages(vec![message(42)]);
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .move_message("INBOX", 42, "Archive")
+            .await
+            .expect_err("an unsupported move must fail");
+        assert!(
+            matches!(error, ImapError::CapabilityNotSupported),
+            "{error:?}"
+        );
+        assert!(
+            ops.lock().expect("ops log poisoned").is_empty(),
+            "nothing must be sent when neither MOVE nor UIDPLUS is announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_message_missing_message_is_not_found_and_sends_nothing() {
+        let session = FakeSession::healthy().with_capabilities(Capabilities {
+            has_move: true,
+            has_uidplus: false,
+        });
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .move_message("INBOX", 42, "Archive")
+            .await
+            .expect_err("a missing message must fail");
+        assert!(matches!(error, ImapError::MessageNotFound), "{error:?}");
+        assert!(
+            ops.lock().expect("ops log poisoned").is_empty(),
+            "no MOVE must be sent for a missing message"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_message_requires_uidplus_and_sends_nothing_when_absent() {
+        let session = FakeSession::healthy().with_messages(vec![message(42)]);
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .delete_message("INBOX", 42)
+            .await
+            .expect_err("deletion without UIDPLUS must fail");
+        assert!(
+            matches!(error, ImapError::CapabilityNotSupported),
+            "{error:?}"
+        );
+        assert!(
+            ops.lock().expect("ops log poisoned").is_empty(),
+            "no EXPUNGE (global or targeted) must be sent without UIDPLUS"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_message_marks_deleted_then_uid_expunges() {
+        let session = FakeSession::healthy()
+            .with_messages(vec![message(42)])
+            .with_capabilities(Capabilities {
+                has_move: false,
+                has_uidplus: true,
+            });
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        manager
+            .delete_message("INBOX", 42)
+            .await
+            .expect("the deletion must succeed");
+
+        assert_eq!(
+            ops.lock().expect("ops log poisoned").as_slice(),
+            ["store 42 +FLAGS.SILENT (\\Deleted)", "expunge 42"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_message_missing_message_is_not_found_and_sends_nothing() {
+        let session = FakeSession::healthy().with_capabilities(Capabilities {
+            has_move: false,
+            has_uidplus: true,
+        });
+        let ops = Arc::clone(&session.ops);
+        let connector = FakeConnector::scripted([Outcome::Session(session)]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .delete_message("INBOX", 42)
+            .await
+            .expect_err("a missing message must fail");
+        assert!(matches!(error, ImapError::MessageNotFound), "{error:?}");
+        assert!(
+            ops.lock().expect("ops log poisoned").is_empty(),
+            "a missing message must not be marked or expunged"
+        );
     }
 }
