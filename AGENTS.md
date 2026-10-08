@@ -15,7 +15,7 @@ API HTTP con **Axum** que expone un CRUD sobre una cuenta de correo:
 - **Parseo MIME (`mail-parser`)**: extraer texto plano, HTML y adjuntos.
 - **Búsqueda avanzada**: criterios estándar de IMAP (remitente, fecha, asunto, flags).
 - **Tiempo real**: extensión `IDLE`; al llegar un correo, hacer `POST` del mensaje completo + metadatos a un **endpoint configurable (webhook)**.
-- Hoy implementado: arranque configurable, `GET /api/health`, autenticación (`api-auth`) y configuración de la cuenta IMAP/SMTP (`mail-account`, incluye `GET /api/account`). Falta la conexión real a IMAP/SMTP, MIME e IDLE.
+- Hoy implementado: arranque configurable, `GET /api/health`, autenticación (`api-auth`), configuración de la cuenta IMAP/SMTP (`mail-account`, incluye `GET /api/account`) y **envío saliente** (`smtp-send`, `POST /api/messages`). Falta la conexión de lectura IMAP, el parseo MIME y la IDLE/webhook.
 
 ## Flujo SDD + TDD (obligatorio)
 Antes de escribir/editar código, `just check-spec` debe confirmar un change proposal aprobado en `openspec/changes/<feature>/`. Si no existe, detente y pide aprobación; no escribas código. Tras aprobar la spec: **RED → GREEN → REFACTOR**, verificando por CLI (`just test`, `just clippy`, `just fmt`). Nunca asumas que los tests compilan o pasan sin ejecutarlos.

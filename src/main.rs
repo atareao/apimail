@@ -38,7 +38,13 @@ async fn main() -> ExitCode {
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| format!("{}:{}", config.host, config.port));
-    let state = AppState::from_config(&config);
+    let state = match AppState::from_config(&config) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::error!("failed to initialise the mail sender: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     tracing::info!("apimail listening on {local_addr}");
 
     if let Err(error) = axum::serve(listener, build_router(state)).await {

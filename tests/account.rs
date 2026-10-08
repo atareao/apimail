@@ -37,7 +37,7 @@ fn config() -> Config {
 
 /// Builds the router with a known API key and mail account.
 fn app() -> Router {
-    build_router(AppState::from_config(&config()))
+    build_router(AppState::from_config(&config()).expect("valid app state"))
 }
 
 /// Sends a `GET /api/account` request with an optional `Authorization` header.
