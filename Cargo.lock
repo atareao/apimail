@@ -20,6 +20,7 @@ dependencies = [
  "lettre",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "subtle",
  "thiserror 2.0.21",

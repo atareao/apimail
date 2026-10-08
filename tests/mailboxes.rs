@@ -12,7 +12,10 @@ use axum::response::Response;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use apimail::imap::{ImapConnector, ImapError, ImapSession, SendFuture as ImapSendFuture};
+use apimail::imap::{
+    FetchFormat, ImapConnector, ImapError, ImapSession, Message, SearchCriteria,
+    SendFuture as ImapSendFuture,
+};
 use apimail::smtp::{MailSender, OutgoingMessage, SendFuture as MailSendFuture};
 use apimail::{AppState, Config, MailboxInfo, MailboxStatus, build_router};
 
@@ -82,6 +85,21 @@ impl ImapSession for FakeSession {
                 SelectResponse::NotFound => Err(ImapError::MailboxNotFound),
             }
         })
+    }
+
+    fn search(
+        &mut self,
+        _criteria: SearchCriteria,
+    ) -> ImapSendFuture<'_, Result<Vec<u32>, ImapError>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn fetch(
+        &mut self,
+        _uids: Vec<u32>,
+        _format: FetchFormat,
+    ) -> ImapSendFuture<'_, Result<Vec<Message>, ImapError>> {
+        Box::pin(async move { Ok(Vec::new()) })
     }
 }
 

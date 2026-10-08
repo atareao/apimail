@@ -137,9 +137,51 @@
 //!   message is the stable [`ImapError::public_message`] and never
 //!   [`Display`](std::fmt::Display) text from a third party.
 //! - `401` (`unauthorized`) — missing or invalid API key.
+//!
+//! # Message reading contract
+//!
+//! `GET /api/messages` and `GET /api/messages/{uid}` are protected by
+//! [`require_api_key`]. Both select the mailbox named by the required `mailbox`
+//! query parameter and never expose a credential; bodies are fetched with
+//! `BODY.PEEK`, so reading never sets `\Seen`.
+//!
+//! `GET /api/messages` accepts the standard `SEARCH` filters `from`, `to`,
+//! `subject`, `text`, `since`/`before` (`YYYY-MM-DD`), `seen`/`flagged`
+//! (`true`/`false`) and `unseen` (the alias of `seen`: `unseen=true` means
+//! `seen=false`), plus `limit` (`1..=200`, default `50`) and `offset` (default
+//! `0`). On success it returns HTTP `200`, `Content-Type: application/json` and:
+//!
+//! ```json
+//! {"mailbox":"INBOX","total":123,"limit":50,"offset":0,
+//!  "messages":[{"uid":42,"seq":42,"flags":["\\Seen"],"size":2048,
+//!    "internal_date":"2026-10-08T12:00:00+00:00",
+//!    "envelope":{"from":[{"name":"Alice","address":"alice@example.com"}],
+//!      "to":[{"name":null,"address":"bob@example.com"}],"cc":[],
+//!      "subject":"hi","date":"...","message_id":"<...>"}}]}
+//! ```
+//!
+//! `GET /api/messages/{uid}` takes the numeric `uid` in the path and an optional
+//! `format` of `summary` (default), `headers` or `full`. On success it returns
+//! HTTP `200`, `Content-Type: application/json` and the message metadata plus
+//! `"format"`; `headers` adds `headers_base64` (the raw header block) and `full`
+//! adds `raw_base64` (the full RFC822 source), both base64 because raw MIME is
+//! not necessarily UTF-8. Failures use the shared `{"error":...,"message":...}`
+//! envelope:
+//!
+//! - `400` (`invalid_request`) — missing/blank `mailbox`, a control character in
+//!   any value, an invalid date, boolean, `limit`/`offset`, `format` or `uid`, or
+//!   contradictory `seen`/`unseen`.
+//! - `404` (`mailbox_not_found`) — the server answered `NO` for the mailbox.
+//! - `404` (`message_not_found`) — the requested `uid` does not exist.
+//! - `503` (`imap_unavailable`) — the session or server is unavailable.
+//! - `401` (`unauthorized`) — missing or invalid API key.
+//!
+//! The query string is parsed with [`RawQuery`] + `serde_urlencoded` (not
+//! `Query<T>`) so every rejection is the shared JSON envelope rather than axum's
+//! plain-text one.
 
 use axum::body::{Bytes, to_bytes};
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -155,11 +197,12 @@ use subtle::ConstantTimeEq;
 use crate::Config;
 use crate::config::TlsMode;
 use crate::imap::{
-    Backoff, ConnectionManager, ImapConnector, ImapError, MailboxInfo, MailboxStatus,
-    TokioImapConnector,
+    Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
+    MailboxStatus, Message, MessageEnvelope, SearchCriteria, SearchDate, TokioImapConnector,
 };
 use crate::smtp::{
-    MailSender, MessageError, OutgoingAttachment, OutgoingMessage, SmtpError, SmtpSender,
+    MailSender, MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage, SmtpError,
+    SmtpSender,
 };
 
 /// Application name, resolved from `Cargo.toml`.
@@ -495,6 +538,436 @@ impl From<ImapError> for MailboxError {
     }
 }
 
+/// One address in a message envelope.
+#[derive(Debug, Serialize)]
+struct AddressDto {
+    /// Display name, or `null`.
+    name: Option<String>,
+    /// `mailbox@host`, or `null`.
+    address: Option<String>,
+}
+
+impl From<&Address> for AddressDto {
+    fn from(address: &Address) -> Self {
+        Self {
+            name: address.name.clone(),
+            address: address.address.clone(),
+        }
+    }
+}
+
+/// A message envelope in the message responses.
+#[derive(Debug, Serialize)]
+struct EnvelopeDto {
+    /// `From` addresses.
+    from: Vec<AddressDto>,
+    /// `To` addresses.
+    to: Vec<AddressDto>,
+    /// `Cc` addresses.
+    cc: Vec<AddressDto>,
+    /// Raw `Subject` header.
+    subject: Option<String>,
+    /// Raw `Date` header.
+    date: Option<String>,
+    /// `Message-ID`.
+    message_id: Option<String>,
+}
+
+impl From<&MessageEnvelope> for EnvelopeDto {
+    fn from(envelope: &MessageEnvelope) -> Self {
+        Self {
+            from: envelope.from.iter().map(AddressDto::from).collect(),
+            to: envelope.to.iter().map(AddressDto::from).collect(),
+            cc: envelope.cc.iter().map(AddressDto::from).collect(),
+            subject: envelope.subject.clone(),
+            date: envelope.date.clone(),
+            message_id: envelope.message_id.clone(),
+        }
+    }
+}
+
+/// The metadata shared by the listing and the single-message responses.
+#[derive(Debug, Serialize)]
+struct MessageDto {
+    /// Unique identifier within the mailbox.
+    uid: u32,
+    /// Sequence number within the mailbox.
+    seq: u32,
+    /// Flags in IMAP style (`\Seen`, …).
+    flags: Vec<String>,
+    /// `RFC822.SIZE`, if reported.
+    size: Option<u32>,
+    /// `INTERNALDATE` in RFC 3339 form, if reported.
+    internal_date: Option<String>,
+    /// Parsed envelope, if reported.
+    envelope: Option<EnvelopeDto>,
+}
+
+impl From<&Message> for MessageDto {
+    fn from(message: &Message) -> Self {
+        Self {
+            uid: message.uid,
+            seq: message.seq,
+            flags: message.flags.clone(),
+            size: message.size,
+            internal_date: message.internal_date.clone(),
+            envelope: message.envelope.as_ref().map(EnvelopeDto::from),
+        }
+    }
+}
+
+/// JSON payload returned by a successful `GET /api/messages`.
+#[derive(Debug, Serialize)]
+struct MessageListResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Total number of messages matching the search.
+    total: u32,
+    /// Applied page size.
+    limit: u32,
+    /// Applied page offset.
+    offset: u32,
+    /// The messages in this page.
+    messages: Vec<MessageDto>,
+}
+
+/// JSON payload returned by a successful `GET /api/messages/{uid}`.
+///
+/// The `headers_base64` and `raw_base64` fields are present only for the matching
+/// `format`, hence the conditional serialization.
+#[derive(Debug, Serialize)]
+struct MessageDetailResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Unique identifier within the mailbox.
+    uid: u32,
+    /// Sequence number within the mailbox.
+    seq: u32,
+    /// Flags in IMAP style (`\Seen`, …).
+    flags: Vec<String>,
+    /// `RFC822.SIZE`, if reported.
+    size: Option<u32>,
+    /// `INTERNALDATE` in RFC 3339 form, if reported.
+    internal_date: Option<String>,
+    /// Parsed envelope, if reported.
+    envelope: Option<EnvelopeDto>,
+    /// Requested format label: `summary`, `headers` or `full`.
+    format: &'static str,
+    /// Raw header block, base64-encoded (only for `format=headers`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers_base64: Option<String>,
+    /// Full RFC822 source, base64-encoded (only for `format=full`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_base64: Option<String>,
+}
+
+impl MessageDetailResponse {
+    /// Builds the response from the fetched message and the requested format.
+    ///
+    /// The raw bytes come from the domain message (`headers`/`body`); the fake
+    /// sessions in tests populate them directly.
+    fn new(mailbox: String, message: Message, format: FetchFormat) -> Self {
+        let metadata = MessageDto::from(&message);
+        let (format_label, headers_base64, raw_base64) = match format {
+            FetchFormat::Summary => ("summary", None, None),
+            FetchFormat::Headers => (
+                "headers",
+                message
+                    .headers
+                    .as_deref()
+                    .map(|bytes| STANDARD.encode(bytes)),
+                None,
+            ),
+            FetchFormat::Full => (
+                "full",
+                None,
+                message.body.as_deref().map(|bytes| STANDARD.encode(bytes)),
+            ),
+        };
+        Self {
+            mailbox,
+            uid: metadata.uid,
+            seq: metadata.seq,
+            flags: metadata.flags,
+            size: metadata.size,
+            internal_date: metadata.internal_date,
+            envelope: metadata.envelope,
+            format: format_label,
+            headers_base64,
+            raw_base64,
+        }
+    }
+}
+
+/// Query string of `GET /api/messages`, decoded loosely into optional strings.
+///
+/// Kept as `Option<String>` for every field so the handler can validate each
+/// value itself and answer with the shared JSON `400` envelope instead of axum's
+/// plain-text rejection.
+#[derive(Debug, Default, Deserialize)]
+struct ListMessagesQuery {
+    /// Mailbox to search (required).
+    mailbox: Option<String>,
+    /// `FROM` filter.
+    from: Option<String>,
+    /// `TO` filter.
+    to: Option<String>,
+    /// `SUBJECT` filter.
+    subject: Option<String>,
+    /// `BODY` filter.
+    text: Option<String>,
+    /// `SINCE` date filter (`YYYY-MM-DD`).
+    since: Option<String>,
+    /// `BEFORE` date filter (`YYYY-MM-DD`).
+    before: Option<String>,
+    /// `SEEN`/`UNSEEN` filter.
+    seen: Option<String>,
+    /// `FLAGGED`/`UNFLAGGED` filter.
+    flagged: Option<String>,
+    /// Alias of `seen` (`unseen=true` means `seen=false`).
+    unseen: Option<String>,
+    /// Page size (`1..=200`, default `50`).
+    limit: Option<String>,
+    /// Page offset (default `0`).
+    offset: Option<String>,
+}
+
+/// Query string of `GET /api/messages/{uid}`.
+#[derive(Debug, Default, Deserialize)]
+struct FetchMessageQuery {
+    /// Mailbox to select (required).
+    mailbox: Option<String>,
+    /// Requested format: `summary` (default), `headers` or `full`.
+    format: Option<String>,
+}
+
+/// Whether `value` carries a character that could break an IMAP command line.
+///
+/// The IMAP command strings are built by quoting, but rejecting `CR`, `LF` and
+/// `NUL` at the boundary is the documented defence in depth.
+fn has_control_characters(value: &str) -> bool {
+    value.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
+}
+
+/// Parses a strict `true`/`false` boolean.
+fn parse_strict_bool(value: &str, field: &str) -> Result<bool, MessageError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(MessageError::InvalidRequest(format!(
+            "`{field}` must be `true` or `false`"
+        ))),
+    }
+}
+
+/// Parses and validates a non-blank mailbox name.
+fn parse_mailbox(value: Option<String>) -> Result<String, MessageError> {
+    let value = value.ok_or_else(|| {
+        MessageError::InvalidRequest("`mailbox` query parameter is required".to_string())
+    })?;
+    if has_control_characters(&value) {
+        return Err(MessageError::InvalidRequest(
+            "`mailbox` contains a forbidden control character".to_string(),
+        ));
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(MessageError::InvalidRequest(
+            "`mailbox` must not be empty".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validates an optional free-text filter against control characters.
+fn parse_text_filter(value: Option<String>, field: &str) -> Result<Option<String>, MessageError> {
+    match value {
+        Some(value) if has_control_characters(&value) => Err(MessageError::InvalidRequest(
+            format!("`{field}` contains a forbidden control character"),
+        )),
+        other => Ok(other),
+    }
+}
+
+/// Validates and parses an optional date filter.
+fn parse_date_filter(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<SearchDate>, MessageError> {
+    match value {
+        Some(value) => SearchDate::parse(&value)
+            .map(Some)
+            .map_err(|_| MessageError::InvalidRequest(format!("`{field}` must be `YYYY-MM-DD`"))),
+        None => Ok(None),
+    }
+}
+
+/// Resolves the `seen` filter, folding the `unseen` alias in.
+///
+/// `unseen=true` is `seen=false` and vice versa. When both are supplied they must
+/// agree, otherwise the request is rejected.
+fn parse_seen_filter(
+    seen: Option<String>,
+    unseen: Option<String>,
+) -> Result<Option<bool>, MessageError> {
+    match (seen, unseen) {
+        (Some(seen), Some(unseen)) => {
+            let seen = parse_strict_bool(&seen, "seen")?;
+            let unseen = parse_strict_bool(&unseen, "unseen")?;
+            if seen == unseen {
+                return Err(MessageError::InvalidRequest(
+                    "`seen` and `unseen` disagree".to_string(),
+                ));
+            }
+            Ok(Some(seen))
+        }
+        (Some(seen), None) => Ok(Some(parse_strict_bool(&seen, "seen")?)),
+        (None, Some(unseen)) => Ok(Some(!parse_strict_bool(&unseen, "unseen")?)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Parses an optional `u32` bounded above.
+fn parse_bounded_u32(
+    value: Option<String>,
+    field: &str,
+    default: u32,
+    max: u32,
+) -> Result<u32, MessageError> {
+    match value {
+        Some(value) => {
+            let parsed: u32 = value.parse().map_err(|_| {
+                MessageError::InvalidRequest(format!("`{field}` must be an integer"))
+            })?;
+            if parsed < 1 || parsed > max {
+                return Err(MessageError::InvalidRequest(format!(
+                    "`{field}` must be between 1 and {max}"
+                )));
+            }
+            Ok(parsed)
+        }
+        None => Ok(default),
+    }
+}
+
+/// Parses an optional non-negative `u32`.
+fn parse_optional_u32(
+    value: Option<String>,
+    field: &str,
+    default: u32,
+) -> Result<u32, MessageError> {
+    match value {
+        Some(value) => value.parse().map_err(|_| {
+            MessageError::InvalidRequest(format!("`{field}` must be a non-negative integer"))
+        }),
+        None => Ok(default),
+    }
+}
+
+impl ListMessagesQuery {
+    /// Validates the query and converts it into the domain pieces.
+    fn into_query(self) -> Result<(String, SearchCriteria, u32, u32), MessageError> {
+        let mailbox = parse_mailbox(self.mailbox)?;
+
+        let criteria = SearchCriteria {
+            from: parse_text_filter(self.from, "from")?,
+            to: parse_text_filter(self.to, "to")?,
+            subject: parse_text_filter(self.subject, "subject")?,
+            text: parse_text_filter(self.text, "text")?,
+            since: parse_date_filter(self.since, "since")?,
+            before: parse_date_filter(self.before, "before")?,
+            seen: parse_seen_filter(self.seen, self.unseen)?,
+            flagged: match self.flagged {
+                Some(value) => Some(parse_strict_bool(&value, "flagged")?),
+                None => None,
+            },
+        };
+
+        let limit = parse_bounded_u32(self.limit, "limit", 50, 200)?;
+        let offset = parse_optional_u32(self.offset, "offset", 0)?;
+        Ok((mailbox, criteria, limit, offset))
+    }
+}
+
+impl FetchMessageQuery {
+    /// Validates the query, resolving the mailbox and the requested format.
+    fn into_query(self) -> Result<(String, FetchFormat), MessageError> {
+        let mailbox = parse_mailbox(self.mailbox)?;
+        let format = match self.format.as_deref() {
+            None | Some("summary") => FetchFormat::Summary,
+            Some("headers") => FetchFormat::Headers,
+            Some("full") => FetchFormat::Full,
+            Some(_) => {
+                return Err(MessageError::InvalidRequest(
+                    "`format` must be `summary`, `headers` or `full`".to_string(),
+                ));
+            }
+        };
+        Ok((mailbox, format))
+    }
+}
+
+/// Decodes a raw query string into `T`, mapping a failure to `invalid_request`.
+fn parse_raw_query<T>(raw: Option<String>) -> Result<T, MessageError>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    match raw {
+        Some(raw) => serde_urlencoded::from_str(&raw)
+            .map_err(|_| MessageError::InvalidRequest("invalid query string".to_string())),
+        None => Ok(T::default()),
+    }
+}
+
+/// Failure modes of the message routes, mapped to the documented statuses.
+#[derive(Debug)]
+enum MessageError {
+    /// The request is malformed (`400`).
+    InvalidRequest(String),
+    /// The server answered `NO`: the mailbox does not exist (`404`).
+    MailboxNotFound,
+    /// The requested message does not exist (`404`).
+    MessageNotFound,
+    /// The IMAP session or server is unavailable (`503`).
+    Unavailable(String),
+}
+
+impl IntoResponse for MessageError {
+    fn into_response(self) -> Response {
+        let (status, error, message) = match self {
+            Self::InvalidRequest(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
+            Self::MailboxNotFound => (
+                StatusCode::NOT_FOUND,
+                "mailbox_not_found",
+                "mailbox not found".to_string(),
+            ),
+            Self::MessageNotFound => (
+                StatusCode::NOT_FOUND,
+                "message_not_found",
+                "message not found".to_string(),
+            ),
+            Self::Unavailable(message) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "imap_unavailable", message)
+            }
+        };
+        (status, Json(ErrorResponse { error, message })).into_response()
+    }
+}
+
+/// Maps an [`ImapError`] to the message routes' failure model.
+///
+/// Missing mailboxes and messages become `404`; every other failure becomes `503`
+/// carrying the stable, credential-free [`ImapError::public_message`].
+impl From<ImapError> for MessageError {
+    fn from(error: ImapError) -> Self {
+        match error {
+            ImapError::MailboxNotFound => Self::MailboxNotFound,
+            ImapError::MessageNotFound => Self::MessageNotFound,
+            other => Self::Unavailable(other.public_message().to_string()),
+        }
+    }
+}
+
 /// One attachment of the `POST /api/messages` request body.
 #[derive(Debug, Deserialize)]
 struct AttachmentDto {
@@ -546,9 +1019,9 @@ impl SendMessageDto {
         self,
         default_from: &str,
         limit: usize,
-    ) -> Result<OutgoingMessage, MessageError> {
+    ) -> Result<OutgoingMessage, SmtpMessageError> {
         if self.to.is_empty() {
-            return Err(MessageError::MissingRecipient);
+            return Err(SmtpMessageError::MissingRecipient);
         }
 
         let mut total = 0usize;
@@ -556,7 +1029,7 @@ impl SendMessageDto {
         for attachment in self.attachments {
             let data = STANDARD
                 .decode(attachment.data_base64.as_bytes())
-                .map_err(|_| MessageError::InvalidBase64 {
+                .map_err(|_| SmtpMessageError::InvalidBase64 {
                     filename: attachment.filename.clone(),
                 })?;
             total = total.saturating_add(data.len());
@@ -567,7 +1040,7 @@ impl SendMessageDto {
             });
         }
         if total > limit {
-            return Err(MessageError::TooLarge { total, limit });
+            return Err(SmtpMessageError::TooLarge { total, limit });
         }
 
         Ok(OutgoingMessage {
@@ -619,10 +1092,10 @@ impl IntoResponse for SendError {
 
 /// Single point of truth mapping a validation failure to its HTTP status: an
 /// oversized attachment is `413`, anything else is a `400`.
-impl From<MessageError> for SendError {
-    fn from(error: MessageError) -> Self {
+impl From<SmtpMessageError> for SendError {
+    fn from(error: SmtpMessageError) -> Self {
         match error {
-            MessageError::TooLarge { .. } => Self::PayloadTooLarge(error.to_string()),
+            SmtpMessageError::TooLarge { .. } => Self::PayloadTooLarge(error.to_string()),
             other => Self::InvalidRequest(other.to_string()),
         }
     }
@@ -741,6 +1214,61 @@ async fn select_mailbox(
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
+/// `GET /api/messages` handler: searches a mailbox and returns one page.
+///
+/// The query string is decoded with [`RawQuery`] + `serde_urlencoded` so every
+/// rejection is the shared JSON `400` envelope; the mailbox is selected, the
+/// search is run and only the requested window is fetched, all on the same live
+/// session.
+async fn list_messages(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, MessageError> {
+    let query: ListMessagesQuery = parse_raw_query(raw)?;
+    let (mailbox, criteria, limit, offset) = query.into_query()?;
+
+    let page = state
+        .imap
+        .list_messages(&mailbox, criteria, limit, offset)
+        .await?;
+
+    let response = MessageListResponse {
+        mailbox,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        messages: page.messages.iter().map(MessageDto::from).collect(),
+    };
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// `GET /api/messages/{uid}` handler: fetches a single message.
+///
+/// The `uid` is extracted as a string and parsed here so a non-numeric value is
+/// answered with the shared JSON `400` instead of axum's plain-text rejection.
+async fn fetch_message(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, MessageError> {
+    let uid: u32 = uid.parse().map_err(|_| {
+        MessageError::InvalidRequest("`uid` must be a numeric identifier".to_string())
+    })?;
+    if uid == 0 {
+        // UID 0 is not a valid IMAP message identifier.
+        return Err(MessageError::InvalidRequest(
+            "`uid` must be a positive integer".to_string(),
+        ));
+    }
+
+    let query: FetchMessageQuery = parse_raw_query(raw)?;
+    let (mailbox, format) = query.into_query()?;
+
+    let message = state.imap.fetch_message(&mailbox, uid, format).await?;
+    let response = MessageDetailResponse::new(mailbox, message, format);
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
 /// `POST /api/messages` handler: reads the body, validates it, then sends it.
 ///
 /// The route disables axum's `DefaultBodyLimit`; the body is read here with
@@ -829,11 +1357,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/imap/status", get(imap_status))
         .route("/api/mailboxes", get(list_mailboxes))
         .route("/api/mailboxes/select", post(select_mailbox))
-        // The handler enforces its own body limit (and its JSON `413` envelope),
-        // so axum's default rejection must not pre-empt it.
+        .route("/api/messages/{uid}", get(fetch_message))
+        // The GET listing and the POST sending share the path; the send handler
+        // enforces its own body limit (and its JSON `413` envelope), so axum's
+        // default rejection must not pre-empt it.
         .route(
             "/api/messages",
-            post(send_message).layer(DefaultBodyLimit::disable()),
+            get(list_messages)
+                .post(send_message)
+                .layer(DefaultBodyLimit::disable()),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
