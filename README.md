@@ -12,8 +12,8 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > Estado actual: esqueleto de la API con **autenticación** y **cuenta de correo
 > configurada**. Ya funcionan el arranque configurable por variables de entorno,
 > el endpoint de salud público `GET /api/health`, la autenticación por API key y
-> la inspección de la cuenta con `GET /api/account`. La conexión real a IMAP/SMTP
-> está en desarrollo.
+> la inspección de la cuenta con `GET /api/account`. **Ya se puede enviar correo**
+> con `POST /api/messages`. La conexión de lectura a IMAP está en desarrollo.
 
 ## Requisitos
 
@@ -67,6 +67,12 @@ modo TLS son opcionales.
 | `APIMAIL_SMTP_PASSWORD`     | Secreto SMTP (nunca se registra)        | — (**obligatoria**)          |
 | `APIMAIL_SMTP_PORT`         | Puerto SMTP                             | según TLS (ver abajo)        |
 | `APIMAIL_SMTP_TLS`          | Modo TLS (`implicit`/`starttls`/`none`) | `implicit`                   |
+
+### Envío
+
+| Variable                        | Descripción                                     | Valor por defecto    |
+| ------------------------------- | ----------------------------------------------- | -------------------- |
+| `APIMAIL_MAX_ATTACHMENT_BYTES`  | Tamaño máximo total de los adjuntos (en bytes)  | `10485760` (10 MiB)  |
 
 Puertos por defecto **derivados del modo TLS** (si no se fija `..._PORT`):
 
@@ -190,6 +196,50 @@ usuario ni el secreto). Requiere la API key:
 ```bash
 curl -fsS -H "Authorization: Bearer una-clave-secreta" \
   http://127.0.0.1:3000/api/account
+```
+
+### Envío de correo (protegido)
+
+```http
+POST /api/messages
+```
+
+Envía un correo a través del SMTP configurado. Requiere la API key.
+
+```json
+{
+  "from": "Yo <me@example.com>",
+  "to": ["dest@example.com"],
+  "cc": [],
+  "bcc": [],
+  "subject": "Hola",
+  "text": "cuerpo en texto",
+  "html": "<p>cuerpo en HTML</p>",
+  "attachments": [
+    { "filename": "nota.txt", "content_type": "text/plain", "data_base64": "aGVsbGE=" }
+  ]
+}
+```
+
+- `to` es obligatorio (al menos una dirección); el resto de campos son opcionales.
+- Los adjuntos van en **base64** y su tamaño total ya decodificado no puede
+  superar `APIMAIL_MAX_ATTACHMENT_BYTES`.
+- Si se omite `from`, se usa el usuario SMTP configurado (`APIMAIL_SMTP_USER`).
+
+Respuesta `200 OK` con `Content-Type: application/json`:
+
+```json
+{ "status": "sent" }
+```
+
+Códigos de error: `400` (petición inválida), `413` (adjuntos demasiado grandes),
+`502` (fallo del servidor SMTP) y `401` (sin API key).
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"to":["dest@example.com"],"subject":"Hola","text":"cuerpo"}' \
+  http://127.0.0.1:3000/api/messages
 ```
 
 ## Licencia
