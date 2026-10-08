@@ -16,8 +16,11 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > con `POST /api/messages`. La **conexión de lectura a IMAP** ya está disponible
 > mediante `GET /api/imap/status`, se pueden **listar y seleccionar buzones**
 > con `GET /api/mailboxes` y `POST /api/mailboxes/select`, y **leer y buscar
-> mensajes** con `GET /api/messages` y `GET /api/messages/{uid}`. El resto de
-> operaciones de lectura (banderas, `IDLE`) siguen en desarrollo.
+> mensajes** con `GET /api/messages` y `GET /api/messages/{uid}`. También se
+> pueden **actualizar banderas, mover, copiar y borrar** mensajes con
+> `PATCH /api/messages/{uid}/flags`, `POST /api/messages/{uid}/move`,
+> `POST /api/messages/{uid}/copy` y `DELETE /api/messages/{uid}`. Sigue en
+> desarrollo la operación `IDLE`/webhook.
 
 ## Requisitos
 
@@ -471,6 +474,118 @@ Códigos de error (modelo `{"error":...,"message":...}`):
 > perezosa (solo una conexión mientras esté viva) y los valores de búsqueda se
 > citan y escapan, rechazando `CR`/`LF`/`NUL`, para que ninguna petición pueda
 > inyectar comandos IMAP.
+
+### Banderas, mover, copiar y borrar (protegido)
+
+Estas cuatro rutas actúan sobre **un único mensaje** identificado por su `uid`
+en la ruta; el buzón se pasa siempre como query `?mailbox=INBOX`. Requieren la
+API key, reutilizan la sesión IMAP perezosa y **nunca** exponen credenciales.
+
+#### Actualizar banderas
+
+```http
+PATCH /api/messages/{uid}/flags?mailbox=INBOX
+```
+
+Añade y/o quita banderas de un mensaje con `UID STORE`. El cuerpo es
+`application/json` con `add` y/o `remove` (al menos uno no vacío):
+
+```json
+{ "add": ["\\Seen", "\\Flagged"], "remove": ["\\Deleted"] }
+```
+
+Banderas permitidas (allowlist; se aceptan sin distinguir mayúsculas/minúsculas):
+`\Seen`, `\Answered`, `\Flagged`, `\Draft`, `\Deleted`. Cualquier otro valor, un
+cuerpo sin banderas o una bandera presente a la vez en `add` y `remove` son
+`400`.
+
+Respuesta `200 OK` con `Content-Type: application/json`, con las banderas
+resultantes tras el `STORE`:
+
+```json
+{ "mailbox": "INBOX", "uid": 42, "flags": ["\\Seen", "\\Flagged"] }
+```
+
+```bash
+curl -fsS -X PATCH -H "Authorization: Bearer una-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"add":["\\Seen","\\Flagged"]}' \
+  "http://127.0.0.1:3000/api/messages/42/flags?mailbox=INBOX"
+```
+
+#### Mover y copiar
+
+```http
+POST /api/messages/{uid}/move?mailbox=INBOX
+POST /api/messages/{uid}/copy?mailbox=INBOX
+```
+
+Mueven o copian el mensaje `uid` al buzón destino indicado con
+`{"to":"Archive"}` (`to` obligatorio, no vacío y sin caracteres de control):
+
+```json
+{ "to": "Archive" }
+```
+
+- `copy` usa `UID COPY` (parte de IMAP4rev1; no requiere extensión).
+- `move` usa `UID MOVE` cuando el servidor anuncia `MOVE`; si no, emula el
+  movimiento con `UID COPY` + `UID STORE +FLAGS.SILENT (\Deleted)` +
+  `UID EXPUNGE` cuando anuncia `UIDPLUS` (primero copia, después marca y por
+  último expurga, para no perder correo).
+
+Respuesta `200 OK`:
+
+```json
+{ "mailbox": "INBOX", "uid": 42, "to": "Archive", "status": "moved" }
+```
+
+`status` es `"moved"` para `/move` y `"copied"` para `/copy`.
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"Archive"}' \
+  "http://127.0.0.1:3000/api/messages/42/move?mailbox=INBOX"
+```
+
+#### Borrar
+
+```http
+DELETE /api/messages/{uid}?mailbox=INBOX
+```
+
+Marca el mensaje como `\Deleted` con `UID STORE` y lo purga **solo a él** con
+`UID EXPUNGE`. Exige que el servidor anuncie `UIDPLUS`: si no lo hace, responde
+`501 capability_not_supported` y **nunca** ejecuta un `EXPUNGE` global (que
+borraría también los `\Deleted` de otros mensajes).
+
+Respuesta `200 OK`:
+
+```json
+{ "mailbox": "INBOX", "uid": 42, "status": "deleted" }
+```
+
+```bash
+curl -fsS -X DELETE -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages/42?mailbox=INBOX"
+```
+
+Códigos de error comunes (modelo `{"error":...,"message":...}`):
+
+- `400` (`invalid_request`) — `uid` no numérico o `0`; `mailbox` o `to` ausentes,
+  en blanco o con caracteres de control (`CR`/`LF`/`NUL`); bandera desconocida o
+  contradictoria; actualización de banderas vacía; cuerpo JSON malformado.
+- `404` (`mailbox_not_found`) — el servidor responde `NO`: el buzón no existe.
+- `404` (`message_not_found`) — el `uid` indicado no existe. La existencia del
+  mensaje se comprueba **antes** que la capacidad del servidor.
+- `501` (`capability_not_supported`) — el servidor no anuncia `MOVE`/`UIDPLUS`
+  para la operación pedida.
+- `503` (`imap_unavailable`) — el servidor o la sesión no están disponibles.
+- `401` (`unauthorized`) — sin API key válida.
+
+> **Seguridad:** la *query* del `STORE` se compone **solo** con la allowlist y
+> los items fijos (`+FLAGS.SILENT`/`-FLAGS.SILENT`), y el *uid set* se rinde a
+> partir de un `u32`, de modo que ninguna petición puede inyectar comandos IMAP.
 
 ### Envío de correo (protegido)
 
