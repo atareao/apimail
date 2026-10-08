@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::Client;
-use async_imap::types::{Flag, NameAttribute};
+use async_imap::types::{Fetch, Flag, NameAttribute};
 use futures_util::TryStreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -60,6 +60,9 @@ pub enum ImapError {
     /// The requested mailbox does not exist on the server (`NO` on `SELECT`).
     #[error("mailbox not found")]
     MailboxNotFound,
+    /// The requested message does not exist in the selected mailbox.
+    #[error("message not found")]
+    MessageNotFound,
     /// The connection ended before a usable state was reached.
     #[error("IMAP server unavailable: {0}")]
     Unavailable(String),
@@ -92,6 +95,7 @@ impl ImapError {
             }
             Self::Login(_) | Self::Imap(_) => "IMAP authentication or command failed",
             Self::MailboxNotFound => "mailbox not found",
+            Self::MessageNotFound => "message not found",
             Self::Io(_) => "IMAP I/O error",
         }
     }
@@ -107,6 +111,7 @@ impl ImapError {
             Self::Tls(_) | Self::TlsConfig(_) | Self::InvalidServerName(_) => "tls",
             Self::Login(_) => "login",
             Self::MailboxNotFound => "not_found",
+            Self::MessageNotFound => "not_found",
             Self::Unavailable(_) => "unavailable",
             Self::Timeout(_) => "timeout",
             Self::Imap(_) => "imap",
@@ -131,7 +136,7 @@ impl ImapError {
             | Self::Timeout(_)
             | Self::Unavailable(_)
             | Self::Io(_) => true,
-            Self::Login(_) | Self::MailboxNotFound => false,
+            Self::Login(_) | Self::MailboxNotFound | Self::MessageNotFound => false,
             Self::Imap(inner) => matches!(
                 inner,
                 async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost
@@ -168,6 +173,274 @@ pub struct MailboxStatus {
     pub flags: Vec<String>,
 }
 
+/// Errors produced while building a `SEARCH` query.
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    /// The supplied date is not a valid `YYYY-MM-DD` calendar date.
+    #[error("invalid date")]
+    InvalidDate,
+}
+
+/// A calendar date used in `SINCE`/`BEFORE` search keys.
+///
+/// The fields are private so every instance is guaranteed to be a valid calendar
+/// date: [`SearchDate::parse`] is the only constructor and validates the range of
+/// each component (including leap years). [`SearchDate::to_imap`] renders the
+/// canonical `DD-Mon-YYYY` form, which the server parses unambiguously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchDate {
+    /// Day of the month (`1..=days_in_month`).
+    day: u8,
+    /// Month of the year (`1..=12`).
+    month: u8,
+    /// Four-digit year.
+    year: u32,
+}
+
+impl SearchDate {
+    /// Parses a strict `YYYY-MM-DD` date, validating the calendar.
+    ///
+    /// The format is exact (four-digit year, two-digit month and day separated by
+    /// hyphens); the month must be `1..=12` and the day must be within the month,
+    /// honouring leap years.
+    pub fn parse(value: &str) -> Result<Self, QueryError> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+            return Err(QueryError::InvalidDate);
+        }
+        let digits = |slice: &[u8]| -> Result<u32, QueryError> {
+            if slice.iter().all(u8::is_ascii_digit) {
+                // The slice is at most four ASCII digits, so the value fits `u32`.
+                Ok(slice
+                    .iter()
+                    .fold(0, |acc, digit| acc * 10 + u32::from(digit - b'0')))
+            } else {
+                Err(QueryError::InvalidDate)
+            }
+        };
+        let year = digits(&bytes[0..4])?;
+        let month = digits(&bytes[5..7])?;
+        let day = digits(&bytes[8..10])?;
+
+        if !(1..=12).contains(&month) {
+            return Err(QueryError::InvalidDate);
+        }
+        if year == 0 {
+            // IMAP dates carry a four-digit year; `0000` is not a usable date.
+            return Err(QueryError::InvalidDate);
+        }
+        if day < 1 || day > days_in_month(month, year) {
+            return Err(QueryError::InvalidDate);
+        }
+
+        // Every component above is in range, so the casts are lossless.
+        Ok(Self {
+            day: day as u8,
+            month: month as u8,
+            year,
+        })
+    }
+
+    /// Renders the canonical IMAP `DD-Mon-YYYY` form (for example `05-Jan-2024`).
+    pub fn to_imap(&self) -> String {
+        let name = MONTH_NAMES[(self.month - 1) as usize];
+        format!("{:02}-{name}-{:04}", self.day, self.year)
+    }
+}
+
+/// English month abbreviations used by IMAP dates, indexed from 0.
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Number of days in `month` (1-based) of `year`, honouring leap years.
+fn days_in_month(month: u32, year: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Whether `year` is a leap year in the proleptic Gregorian calendar.
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+/// Renders `value` as an IMAP quoted string that cannot break the command line.
+///
+/// `CR`, `LF` and `NUL` are **dropped** (defence in depth against command
+/// injection through the unvalidated `UID SEARCH`/`UID FETCH` strings), and the
+/// backslash and double quote are escaped. The result is always wrapped in double
+/// quotes, so it is a single IMAP `quoted` argument.
+fn quote_search_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '\r' | '\n' | '\0' => {}
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Criteria translated into an IMAP `SEARCH` key.
+///
+/// Each `Some` field renders exactly one search key; an empty criteria renders
+/// `ALL`. Textual values go through [`quote_search_string`] so no user input can
+/// inject a second command, and dates render in canonical `DD-Mon-YYYY` form.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchCriteria {
+    /// Matches the `From` header.
+    pub from: Option<String>,
+    /// Matches the `To` header.
+    pub to: Option<String>,
+    /// Matches the `Subject` header.
+    pub subject: Option<String>,
+    /// Matches text anywhere in the message (`BODY`).
+    pub text: Option<String>,
+    /// Matches messages received on or after this date (`SINCE`).
+    pub since: Option<SearchDate>,
+    /// Matches messages received before this date (`BEFORE`).
+    pub before: Option<SearchDate>,
+    /// `Some(true)` selects `SEEN`, `Some(false)` selects `UNSEEN`.
+    pub seen: Option<bool>,
+    /// `Some(true)` selects `FLAGGED`, `Some(false)` selects `UNFLAGGED`.
+    pub flagged: Option<bool>,
+}
+
+impl SearchCriteria {
+    /// Renders the criteria as the argument of `UID SEARCH`, or `ALL` when empty.
+    pub fn imap_key(&self) -> String {
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(from) = &self.from {
+            keys.push(format!("FROM {}", quote_search_string(from)));
+        }
+        if let Some(to) = &self.to {
+            keys.push(format!("TO {}", quote_search_string(to)));
+        }
+        if let Some(subject) = &self.subject {
+            keys.push(format!("SUBJECT {}", quote_search_string(subject)));
+        }
+        if let Some(text) = &self.text {
+            keys.push(format!("BODY {}", quote_search_string(text)));
+        }
+        if let Some(since) = &self.since {
+            keys.push(format!("SINCE {}", since.to_imap()));
+        }
+        if let Some(before) = &self.before {
+            keys.push(format!("BEFORE {}", before.to_imap()));
+        }
+        match self.seen {
+            Some(true) => keys.push("SEEN".to_string()),
+            Some(false) => keys.push("UNSEEN".to_string()),
+            None => {}
+        }
+        match self.flagged {
+            Some(true) => keys.push("FLAGGED".to_string()),
+            Some(false) => keys.push("UNFLAGGED".to_string()),
+            None => {}
+        }
+
+        if keys.is_empty() {
+            "ALL".to_string()
+        } else {
+            keys.join(" ")
+        }
+    }
+}
+
+/// How much of a message `UID FETCH` should return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchFormat {
+    /// Metadata and envelope only.
+    Summary,
+    /// Metadata, envelope and the raw header block.
+    Headers,
+    /// Metadata, envelope and the raw full RFC822 source.
+    Full,
+}
+
+impl FetchFormat {
+    /// The exact `FETCH` data-items query for this format.
+    ///
+    /// Body sections are requested with `BODY.PEEK`, so fetching never sets the
+    /// `\Seen` flag on the server.
+    pub fn query(&self) -> &'static str {
+        match self {
+            Self::Summary => "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE)",
+            Self::Headers => "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE BODY.PEEK[HEADER])",
+            Self::Full => "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE BODY.PEEK[])",
+        }
+    }
+}
+
+/// An email address extracted from a message envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Address {
+    /// Display name, if the server reported one.
+    pub name: Option<String>,
+    /// `mailbox@host`, or just the mailbox when no host was reported.
+    pub address: Option<String>,
+}
+
+/// The subset of an envelope exposed by the API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageEnvelope {
+    /// `From` addresses.
+    pub from: Vec<Address>,
+    /// `To` addresses.
+    pub to: Vec<Address>,
+    /// `Cc` addresses.
+    pub cc: Vec<Address>,
+    /// Raw `Subject` header, if reported.
+    pub subject: Option<String>,
+    /// Raw `Date` header, if reported.
+    pub date: Option<String>,
+    /// `Message-ID`, if reported.
+    pub message_id: Option<String>,
+}
+
+/// A message as returned by `UID FETCH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// Sequence number within the selected mailbox.
+    pub seq: u32,
+    /// Flags set on the message, in IMAP style (`\Seen`, …).
+    pub flags: Vec<String>,
+    /// `RFC822.SIZE`, if reported.
+    pub size: Option<u32>,
+    /// `INTERNALDATE` in RFC 3339 form, if reported.
+    pub internal_date: Option<String>,
+    /// Parsed envelope, if requested and reported.
+    pub envelope: Option<MessageEnvelope>,
+    /// Raw header block, only for [`FetchFormat::Headers`].
+    pub headers: Option<Vec<u8>>,
+    /// Raw full RFC822 source, only for [`FetchFormat::Full`].
+    pub body: Option<Vec<u8>>,
+}
+
+/// One page of messages plus the pagination metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePage {
+    /// Total number of messages matching the search.
+    pub total: u32,
+    /// Requested page size.
+    pub limit: u32,
+    /// Requested page offset.
+    pub offset: u32,
+    /// The messages in this page.
+    pub messages: Vec<Message>,
+}
+
 /// Renders a message flag in its IMAP textual form.
 ///
 /// `imap-proto` implements neither `Display` nor an accessor for the original
@@ -185,6 +458,79 @@ fn flag_label(flag: &Flag<'_>) -> String {
         Flag::MayCreate => "\\*".to_string(),
         Flag::Custom(name) => name.to_string(),
     }
+}
+
+/// Decodes raw envelope bytes with a lossy UTF-8 conversion.
+///
+/// The server's envelope fields are opaque byte strings; a lossy conversion keeps
+/// the message readable without failing on malformed input.
+fn decode_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Joins a raw mailbox and host into `mailbox@host`.
+///
+/// An address without a mailbox is not meaningful and maps to `None`.
+fn mailbox_at_host(mailbox: Option<&[u8]>, host: Option<&[u8]>) -> Option<String> {
+    let mailbox = mailbox?;
+    let mailbox = String::from_utf8_lossy(mailbox);
+    match host {
+        Some(host) => Some(format!("{mailbox}@{}", String::from_utf8_lossy(host))),
+        None => Some(mailbox.into_owned()),
+    }
+}
+
+/// Maps a raw `imap-proto` address to the API [`Address`].
+fn address_to_dto(address: &async_imap::imap_proto::Address<'_>) -> Address {
+    Address {
+        name: address.name.as_deref().map(decode_bytes),
+        address: mailbox_at_host(address.mailbox.as_deref(), address.host.as_deref()),
+    }
+}
+
+/// Maps a list of raw addresses, defaulting a missing list to empty.
+fn addresses_to_dto(addresses: Option<&[async_imap::imap_proto::Address<'_>]>) -> Vec<Address> {
+    addresses
+        .unwrap_or_default()
+        .iter()
+        .map(address_to_dto)
+        .collect()
+}
+
+/// Maps a raw `imap-proto` envelope to the API [`MessageEnvelope`].
+fn envelope_to_dto(envelope: &async_imap::imap_proto::Envelope<'_>) -> MessageEnvelope {
+    MessageEnvelope {
+        from: addresses_to_dto(envelope.from.as_deref()),
+        to: addresses_to_dto(envelope.to.as_deref()),
+        cc: addresses_to_dto(envelope.cc.as_deref()),
+        subject: envelope.subject.as_deref().map(decode_bytes),
+        date: envelope.date.as_deref().map(decode_bytes),
+        message_id: envelope.message_id.as_deref().map(decode_bytes),
+    }
+}
+
+/// Maps a raw `async-imap` [`Fetch`] to an API [`Message`].
+///
+/// Returns `None` for a response without a UID (which cannot be addressed by the
+/// API), so the caller can skip it.
+fn fetch_to_message(fetch: &Fetch, format: FetchFormat) -> Option<Message> {
+    let uid = fetch.uid?;
+    let mut message = Message {
+        uid,
+        seq: fetch.message,
+        flags: fetch.flags().map(|flag| flag_label(&flag)).collect(),
+        size: fetch.size,
+        internal_date: fetch.internal_date().map(|date| date.to_rfc3339()),
+        envelope: fetch.envelope().map(envelope_to_dto),
+        headers: None,
+        body: None,
+    };
+    match format {
+        FetchFormat::Summary => {}
+        FetchFormat::Headers => message.headers = fetch.header().map(<[u8]>::to_vec),
+        FetchFormat::Full => message.body = fetch.body().map(<[u8]>::to_vec),
+    }
+    Some(message)
 }
 
 /// Ensures `name` carries exactly one leading backslash.
@@ -242,6 +588,22 @@ pub trait ImapSession: Send {
     ///
     /// An unknown mailbox is reported as [`ImapError::MailboxNotFound`].
     fn select(&mut self, mailbox: String) -> SendFuture<'_, Result<MailboxStatus, ImapError>>;
+
+    /// Runs `UID SEARCH` with `criteria`, returning matching UIDs newest-first.
+    ///
+    /// `async-imap` returns a `HashSet`, so the implementation sorts the UIDs in
+    /// descending order before returning them.
+    fn search(&mut self, criteria: SearchCriteria) -> SendFuture<'_, Result<Vec<u32>, ImapError>>;
+
+    /// Runs `UID FETCH` over `uids` in the requested `format`.
+    ///
+    /// An empty `uids` list returns an empty result **without sending a command**
+    /// (an empty UID set is not a valid IMAP command).
+    fn fetch(
+        &mut self,
+        uids: Vec<u32>,
+        format: FetchFormat,
+    ) -> SendFuture<'_, Result<Vec<Message>, ImapError>>;
 }
 
 /// A factory able to open a fresh authenticated IMAP session.
@@ -511,6 +873,50 @@ impl ImapSession for SessionHandle {
             })
         })
     }
+
+    fn search(&mut self, criteria: SearchCriteria) -> SendFuture<'_, Result<Vec<u32>, ImapError>> {
+        Box::pin(async move {
+            let mut uids: Vec<u32> = self
+                .session
+                .uid_search(criteria.imap_key())
+                .await
+                .map_err(ImapError::from)?
+                .into_iter()
+                .collect();
+            // `uid_search` returns a `HashSet`, so impose the newest-first order
+            // the API promises.
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            Ok(uids)
+        })
+    }
+
+    fn fetch(
+        &mut self,
+        uids: Vec<u32>,
+        format: FetchFormat,
+    ) -> SendFuture<'_, Result<Vec<Message>, ImapError>> {
+        Box::pin(async move {
+            if uids.is_empty() {
+                // An empty UID set is not a valid IMAP command; skip it entirely.
+                return Ok(Vec::new());
+            }
+            let set = uids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let stream = self
+                .session
+                .uid_fetch(set, format.query())
+                .await
+                .map_err(ImapError::from)?;
+            let fetches: Vec<Fetch> = stream.try_collect().await?;
+            Ok(fetches
+                .iter()
+                .filter_map(|fetch| fetch_to_message(fetch, format))
+                .collect())
+        })
+    }
 }
 
 /// Retry policy with bounded exponential backoff.
@@ -705,6 +1111,67 @@ impl ConnectionManager {
         let mailbox = mailbox.to_string();
         self.run_once(move |session| session.select(mailbox)).await
     }
+
+    /// Lists the messages of `mailbox` matching `criteria`, paginated.
+    ///
+    /// Composes the whole operation on a single live session (one lock): selects
+    /// the mailbox, runs the search, reports the full match count in `total`,
+    /// trims the requested window and fetches its summary metadata. An empty page
+    /// never sends a `UID FETCH`.
+    pub async fn list_messages(
+        &self,
+        mailbox: &str,
+        criteria: SearchCriteria,
+        limit: u32,
+        offset: u32,
+    ) -> Result<MessagePage, ImapError> {
+        let mailbox = mailbox.to_string();
+        self.run_once(move |session| {
+            Box::pin(async move {
+                session.select(mailbox).await?;
+                let uids = session.search(criteria).await?;
+                let total = uids.len() as u32;
+                let page_uids: Vec<u32> = uids
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect();
+                let mut messages = session.fetch(page_uids, FetchFormat::Summary).await?;
+                // The protocol allows the FETCH responses in any order, so impose
+                // the newest-first order the API promises instead of trusting the
+                // server's response order.
+                messages.sort_unstable_by_key(|message| std::cmp::Reverse(message.uid));
+                Ok(MessagePage {
+                    total,
+                    limit,
+                    offset,
+                    messages,
+                })
+            })
+        })
+        .await
+    }
+
+    /// Fetches a single message by `uid` in the requested `format`.
+    ///
+    /// Selects the mailbox and runs a `UID FETCH` for the one UID; a fetch that
+    /// yields no message is reported as [`ImapError::MessageNotFound`].
+    pub async fn fetch_message(
+        &self,
+        mailbox: &str,
+        uid: u32,
+        format: FetchFormat,
+    ) -> Result<Message, ImapError> {
+        let mailbox = mailbox.to_string();
+        self.run_once(move |session| {
+            Box::pin(async move {
+                session.select(mailbox).await?;
+                let mut messages = session.fetch(vec![uid], format).await?;
+                messages.pop().ok_or(ImapError::MessageNotFound)
+            })
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -713,6 +1180,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_imap::imap_proto;
 
     use super::*;
 
@@ -727,8 +1196,8 @@ mod tests {
         Connection,
     }
 
-    /// A fake session whose `NOOP`, `list_mailboxes` and `select` outcomes are
-    /// scripted.
+    /// A fake session whose `NOOP`, `list_mailboxes`, `select`, `search` and
+    /// `fetch` outcomes are scripted.
     #[derive(Clone)]
     struct FakeSession {
         /// When `true`, every `noop` fails.
@@ -737,6 +1206,12 @@ mod tests {
         mailboxes: Vec<MailboxInfo>,
         /// Outcome of `select`.
         select: SelectScript,
+        /// UIDs returned by `search`.
+        uids: Vec<u32>,
+        /// Messages returned by `fetch`.
+        messages: Vec<Message>,
+        /// UID sets received by `fetch`, in call order.
+        fetch_uids: Arc<Mutex<Vec<Vec<u32>>>>,
     }
 
     impl FakeSession {
@@ -746,6 +1221,9 @@ mod tests {
                 dead: false,
                 mailboxes: Vec::new(),
                 select: SelectScript::Status(default_status()),
+                uids: Vec::new(),
+                messages: Vec::new(),
+                fetch_uids: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -755,7 +1233,28 @@ mod tests {
                 dead: true,
                 mailboxes: Vec::new(),
                 select: SelectScript::Connection,
+                uids: Vec::new(),
+                messages: Vec::new(),
+                fetch_uids: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Sets the UIDs returned by `search`.
+        fn with_uids(mut self, uids: Vec<u32>) -> Self {
+            self.uids = uids;
+            self
+        }
+
+        /// Sets the messages returned by `fetch`.
+        fn with_messages(mut self, messages: Vec<Message>) -> Self {
+            self.messages = messages;
+            self
+        }
+
+        /// Shares the UID-set log so a test can assert the fetched window.
+        fn with_fetch_uids_log(mut self, log: Arc<Mutex<Vec<Vec<u32>>>>) -> Self {
+            self.fetch_uids = log;
+            self
         }
 
         /// Sets the mailboxes returned by `list_mailboxes`.
@@ -804,6 +1303,34 @@ mod tests {
         }
     }
 
+    /// A representative message with the given UID.
+    fn message(uid: u32) -> Message {
+        Message {
+            uid,
+            seq: uid,
+            flags: vec!["\\Seen".to_string()],
+            size: Some(1024),
+            internal_date: Some("2024-02-05T10:00:00+00:00".to_string()),
+            envelope: None,
+            headers: None,
+            body: None,
+        }
+    }
+
+    /// Builds a raw `imap-proto` address for the mapping tests.
+    fn raw_address(
+        name: Option<&[u8]>,
+        mailbox: Option<&[u8]>,
+        host: Option<&[u8]>,
+    ) -> imap_proto::Address<'static> {
+        imap_proto::Address {
+            name: name.map(|value| Cow::Owned(value.to_vec())),
+            adl: None,
+            mailbox: mailbox.map(|value| Cow::Owned(value.to_vec())),
+            host: host.map(|value| Cow::Owned(value.to_vec())),
+        }
+    }
+
     impl ImapSession for FakeSession {
         fn noop(&mut self) -> SendFuture<'_, Result<(), ImapError>> {
             let dead = self.dead;
@@ -832,6 +1359,34 @@ mod tests {
                     }
                 }
             })
+        }
+
+        fn search(
+            &mut self,
+            _criteria: SearchCriteria,
+        ) -> SendFuture<'_, Result<Vec<u32>, ImapError>> {
+            let uids = self.uids.clone();
+            Box::pin(async move { Ok(uids) })
+        }
+
+        fn fetch(
+            &mut self,
+            uids: Vec<u32>,
+            _format: FetchFormat,
+        ) -> SendFuture<'_, Result<Vec<Message>, ImapError>> {
+            self.fetch_uids
+                .lock()
+                .expect("fetch uids log poisoned")
+                .push(uids.clone());
+            // Only the requested messages are returned, in the scripted order, so
+            // a wrong window or a missing sort in the caller is observable.
+            let messages = self
+                .messages
+                .iter()
+                .filter(|message| uids.contains(&message.uid))
+                .cloned()
+                .collect();
+            Box::pin(async move { Ok(messages) })
         }
     }
 
@@ -1319,5 +1874,292 @@ mod tests {
                 "expected a non-connection error: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn quote_search_string_escapes_and_strips_control_characters() {
+        assert_eq!(quote_search_string("plain"), "\"plain\"");
+        assert_eq!(quote_search_string("a\\b"), "\"a\\\\b\"");
+        assert_eq!(quote_search_string("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_search_string("a\r\nb"), "\"ab\"");
+        assert_eq!(quote_search_string("a\0b"), "\"ab\"");
+
+        // The quoted string must never carry a raw control character.
+        let quoted = quote_search_string("x\r\ny\n\0z");
+        assert!(!quoted.contains('\r'), "{quoted:?}");
+        assert!(!quoted.contains('\n'), "{quoted:?}");
+        assert!(!quoted.contains('\0'), "{quoted:?}");
+    }
+
+    #[test]
+    fn search_criteria_without_filters_is_all() {
+        assert_eq!(SearchCriteria::default().imap_key(), "ALL");
+    }
+
+    #[test]
+    fn search_criteria_renders_text_keys_quoted() {
+        let criteria = SearchCriteria {
+            from: Some("boss@example.com".to_string()),
+            to: Some("me@example.com".to_string()),
+            subject: Some("hola \"mundo\"".to_string()),
+            text: Some("cuerpo".to_string()),
+            ..SearchCriteria::default()
+        };
+        assert_eq!(
+            criteria.imap_key(),
+            "FROM \"boss@example.com\" TO \"me@example.com\" \
+             SUBJECT \"hola \\\"mundo\\\"\" BODY \"cuerpo\""
+        );
+    }
+
+    #[test]
+    fn search_criteria_renders_dates_and_flags() {
+        let since = SearchDate::parse("2024-01-05").expect("valid date");
+        let before = SearchDate::parse("2024-12-31").expect("valid date");
+        let criteria = SearchCriteria {
+            since: Some(since),
+            before: Some(before),
+            seen: Some(false),
+            flagged: Some(true),
+            ..SearchCriteria::default()
+        };
+        assert_eq!(
+            criteria.imap_key(),
+            "SINCE 05-Jan-2024 BEFORE 31-Dec-2024 UNSEEN FLAGGED"
+        );
+
+        let criteria = SearchCriteria {
+            seen: Some(true),
+            flagged: Some(false),
+            ..SearchCriteria::default()
+        };
+        assert_eq!(criteria.imap_key(), "SEEN UNFLAGGED");
+    }
+
+    #[test]
+    fn search_criteria_drops_control_characters() {
+        let criteria = SearchCriteria {
+            subject: Some("x\r\nSEARCH ALL".to_string()),
+            ..SearchCriteria::default()
+        };
+        let key = criteria.imap_key();
+        assert_eq!(key, "SUBJECT \"xSEARCH ALL\"");
+        assert!(!key.contains('\n'), "{key:?}");
+    }
+
+    #[test]
+    fn search_date_parse_accepts_valid_and_rejects_invalid() {
+        assert_eq!(
+            SearchDate::parse("2024-02-29")
+                .expect("2024 is a leap year")
+                .to_imap(),
+            "29-Feb-2024"
+        );
+        assert_eq!(
+            SearchDate::parse("2023-12-01")
+                .expect("valid date")
+                .to_imap(),
+            "01-Dec-2023"
+        );
+
+        for invalid in [
+            "2024-2-9",
+            "2024-02-9",
+            "2024-2-09",
+            "24-02-09",
+            "2024-13-01",
+            "2024-00-01",
+            "2024-01-00",
+            "2024-01-32",
+            "2023-02-29",
+            "0000-01-01",
+            "2024/02/09",
+            "not-a-date",
+            "",
+            "2024-01-05T00:00:00",
+        ] {
+            assert!(
+                SearchDate::parse(invalid).is_err(),
+                "`{invalid}` should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_format_queries_are_the_exact_constants() {
+        assert_eq!(
+            FetchFormat::Summary.query(),
+            "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE)"
+        );
+        assert_eq!(
+            FetchFormat::Headers.query(),
+            "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE BODY.PEEK[HEADER])"
+        );
+        assert_eq!(
+            FetchFormat::Full.query(),
+            "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE BODY.PEEK[])"
+        );
+        // Bodies are always requested with `PEEK`, so no `\Seen` is set.
+        let summary = FetchFormat::Summary.query();
+        assert!(!summary.contains("BODY["), "{summary}");
+        assert!(FetchFormat::Headers.query().contains("BODY.PEEK[HEADER]"));
+        assert!(FetchFormat::Full.query().contains("BODY.PEEK[]"));
+    }
+
+    #[test]
+    fn address_to_dto_builds_mailbox_at_host() {
+        assert_eq!(
+            address_to_dto(&raw_address(
+                Some(b"Jane Doe"),
+                Some(b"jane"),
+                Some(b"example.com")
+            )),
+            Address {
+                name: Some("Jane Doe".to_string()),
+                address: Some("jane@example.com".to_string()),
+            }
+        );
+        assert_eq!(
+            address_to_dto(&raw_address(None, Some(b"jane"), None)),
+            Address {
+                name: None,
+                address: Some("jane".to_string()),
+            }
+        );
+        assert_eq!(
+            address_to_dto(&raw_address(None, None, Some(b"example.com"))),
+            Address {
+                name: None,
+                address: None,
+            }
+        );
+    }
+
+    #[test]
+    fn envelope_to_dto_maps_addresses_and_text_fields() {
+        let envelope = imap_proto::Envelope {
+            date: Some(Cow::Borrowed(b"Mon, 05 Feb 2024 10:00:00 +0000")),
+            subject: Some(Cow::Borrowed(b"Hi")),
+            from: Some(vec![raw_address(
+                Some(b"Jane"),
+                Some(b"jane"),
+                Some(b"example.com"),
+            )]),
+            sender: None,
+            reply_to: None,
+            to: Some(vec![raw_address(None, Some(b"me"), Some(b"example.com"))]),
+            cc: None,
+            bcc: None,
+            in_reply_to: None,
+            message_id: Some(Cow::Borrowed(b"<id@example.com>")),
+        };
+
+        let dto = envelope_to_dto(&envelope);
+        assert_eq!(dto.subject.as_deref(), Some("Hi"));
+        assert_eq!(dto.date.as_deref(), Some("Mon, 05 Feb 2024 10:00:00 +0000"));
+        assert_eq!(dto.message_id.as_deref(), Some("<id@example.com>"));
+        assert_eq!(
+            dto.from,
+            vec![Address {
+                name: Some("Jane".to_string()),
+                address: Some("jane@example.com".to_string()),
+            }]
+        );
+        assert_eq!(
+            dto.to,
+            vec![Address {
+                name: None,
+                address: Some("me@example.com".to_string()),
+            }]
+        );
+        assert!(dto.cc.is_empty(), "a missing cc must map to an empty list");
+    }
+
+    #[tokio::test]
+    async fn list_messages_reports_total_window_and_descending_order() {
+        let fetch_uids = Arc::new(Mutex::new(Vec::new()));
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy()
+                .with_uids(vec![9, 7, 5, 3, 1])
+                // Deliberately not newest-first: the manager must impose the order.
+                .with_messages(vec![message(5), message(7)])
+                .with_fetch_uids_log(Arc::clone(&fetch_uids)),
+        )]);
+        let manager = manager(connector.clone());
+
+        let page = manager
+            .list_messages("INBOX", SearchCriteria::default(), 2, 1)
+            .await
+            .expect("listing should succeed");
+        assert_eq!(page.total, 5, "total must count every matching message");
+        assert_eq!(page.limit, 2);
+        assert_eq!(page.offset, 1);
+        assert_eq!(
+            page.messages,
+            vec![message(7), message(5)],
+            "messages must be newest-first regardless of the FETCH response order"
+        );
+        assert_eq!(
+            fetch_uids.lock().expect("fetch uids log poisoned").clone(),
+            vec![vec![7, 5]],
+            "the FETCH must request exactly the paginated window"
+        );
+        assert_eq!(connector.connects(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_messages_past_the_end_is_empty() {
+        let fetch_uids = Arc::new(Mutex::new(Vec::new()));
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy()
+                .with_uids(vec![3, 1])
+                .with_fetch_uids_log(Arc::clone(&fetch_uids)),
+        )]);
+        let manager = manager(connector.clone());
+
+        let page = manager
+            .list_messages("INBOX", SearchCriteria::default(), 10, 5)
+            .await
+            .expect("listing should succeed");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.offset, 5);
+        assert!(page.messages.is_empty(), "{:?}", page.messages);
+        assert_eq!(
+            fetch_uids.lock().expect("fetch uids log poisoned").clone(),
+            vec![Vec::<u32>::new()],
+            "an empty page must still be a well-formed (empty) window"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_message_returns_the_first_message() {
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy().with_messages(vec![message(42)]),
+        )]);
+        let manager = manager(connector.clone());
+
+        let fetched = manager
+            .fetch_message("INBOX", 42, FetchFormat::Full)
+            .await
+            .expect("the message must be found");
+        assert_eq!(fetched.uid, 42);
+    }
+
+    #[tokio::test]
+    async fn fetch_message_missing_uid_is_not_found() {
+        let connector = FakeConnector::scripted([Outcome::Session(FakeSession::healthy())]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .fetch_message("INBOX", 42, FetchFormat::Summary)
+            .await
+            .expect_err("a missing message must fail");
+        assert!(matches!(error, ImapError::MessageNotFound), "{error:?}");
+        assert!(
+            !error.is_connection(),
+            "a missing message keeps the session"
+        );
+        assert_eq!(error.public_message(), "message not found");
+        assert_eq!(error.kind(), "not_found");
     }
 }
