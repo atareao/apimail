@@ -76,10 +76,10 @@ fn config(max_attachment_bytes: usize) -> Config {
 
 /// Builds the router with the fake mailer injected, without touching the network.
 fn app(mailer: &FakeMailer, max_attachment_bytes: usize) -> Router {
-    build_router(AppState::with_mailer(
-        &config(max_attachment_bytes),
-        Arc::new(mailer.clone()),
-    ))
+    build_router(
+        AppState::with_mailer(&config(max_attachment_bytes), Arc::new(mailer.clone()))
+            .expect("building the app state must not touch the network"),
+    )
 }
 
 /// Sends a JSON body to `POST /api/messages`, optionally authenticated.

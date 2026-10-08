@@ -13,14 +13,17 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > configurada**. Ya funcionan el arranque configurable por variables de entorno,
 > el endpoint de salud público `GET /api/health`, la autenticación por API key y
 > la inspección de la cuenta con `GET /api/account`. **Ya se puede enviar correo**
-> con `POST /api/messages`. La conexión de lectura a IMAP está en desarrollo.
+> con `POST /api/messages`. La **conexión de lectura a IMAP** ya está disponible
+> mediante `GET /api/imap/status`. El resto de operaciones de lectura (búsqueda,
+> banderas, `IDLE`) siguen en desarrollo.
 
 ## Requisitos
 
 - **Rust edition 2024** (se recomienda una toolchain reciente; el proyecto se
   compila con las versiones compatibles fijadas en `Cargo.toml`).
-- Conexión a un servidor IMAP/SMTP para las funcionalidades de correo (todavía
-  no implementadas).
+- Conexión a un servidor IMAP/SMTP para las funcionalidades de correo (envío
+  SMTP y comprobación de la conexión IMAP; el resto de operaciones de lectura
+  siguen en desarrollo).
 
 ## Construcción
 
@@ -68,6 +71,16 @@ modo TLS son opcionales.
 | `APIMAIL_SMTP_PORT`         | Puerto SMTP                             | según TLS (ver abajo)        |
 | `APIMAIL_SMTP_TLS`          | Modo TLS (`implicit`/`starttls`/`none`) | `implicit`                   |
 
+### Conexión IMAP
+
+| Variable                     | Descripción                                              | Valor por defecto |
+| ---------------------------- | -------------------------------------------------------- | ----------------- |
+| `APIMAIL_IMAP_TIMEOUT_SECS`  | Timeout (segundos) para TCP, handshake TLS y login IMAP  | `30`              |
+
+`APIMAIL_IMAP_TIMEOUT_SECS` debe ser un entero **mayor que cero**; un valor `0`
+o no numérico provoca un **error de arranque** (menciona la variable), sin
+*fallback* silencioso.
+
 ### Envío
 
 | Variable                        | Descripción                                     | Valor por defecto    |
@@ -97,8 +110,9 @@ falta (o está en blanco) cualquiera de los valores obligatorios de la cuenta
 (`..._HOST`, `..._USER`, `..._PASSWORD`), el servicio **no arranca** (error
 descriptivo que nombra la variable y código de salida distinto de cero) en lugar
 de quedar expuesto o a medias. Del mismo modo, un `APIMAIL_PORT` que no sea un
-`u16`, un `..._PORT` de correo fuera de `1..=65535` o un `..._TLS` desconocido
-provocan un error de arranque, sin *fallback* silencioso.
+`u16`, un `..._PORT` de correo fuera de `1..=65535`, un `..._TLS` desconocido o
+un `APIMAIL_IMAP_TIMEOUT_SECS` que no sea un entero mayor que cero provocan un
+error de arranque, sin *fallback* silencioso.
 
 > El modo TLS `none` se acepta (útil para servidores de prueba locales como
 > MailHog o GreenMail) pero registra un **aviso**: las credenciales viajarían en
@@ -196,6 +210,55 @@ usuario ni el secreto). Requiere la API key:
 ```bash
 curl -fsS -H "Authorization: Bearer una-clave-secreta" \
   http://127.0.0.1:3000/api/account
+```
+
+### Estado de la conexión IMAP (protegido)
+
+```http
+GET /api/imap/status
+```
+
+Asegura una sesión IMAP viva y reporta el resultado. Requiere la API key y
+**solo** expone el host, el puerto y el modo TLS configurados; **nunca** el
+usuario ni el secreto.
+
+Respuesta `200 OK` con `Content-Type: application/json` cuando la conexión está
+disponible:
+
+```json
+{
+  "connected": true,
+  "host": "imap.example.com",
+  "port": 993,
+  "tls": "implicit"
+}
+```
+
+`tls` es una de las etiquetas del modo configurado: `implicit`, `starttls` o
+`none`.
+
+Si no se puede establecer la conexión, la respuesta es `503 Service Unavailable`
+con `Content-Type: application/json`:
+
+```json
+{
+  "connected": false,
+  "error": "imap_unavailable",
+  "message": "could not connect to the IMAP server"
+}
+```
+
+El código `error` es estable y `message` no revela detalles internos (direcciones,
+credenciales ni trazas).
+
+> La conexión IMAP es **perezosa**: el servicio **arranca aunque el servidor IMAP
+> no esté disponible** (no se abre red en el arranque). Este endpoint refleja el
+> estado real en el momento de la consulta; cada petición intenta (re)conectar si
+> no hay una sesión viva.
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/imap/status
 ```
 
 ### Envío de correo (protegido)
