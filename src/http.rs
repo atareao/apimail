@@ -89,6 +89,18 @@
 //! Requests for unknown routes still return `404`, and requests using an
 //! unhandled method (for example `POST /api/health`) still return `405`; the
 //! authentication middleware is layered only over the protected sub-router.
+//!
+//! # IMAP status contract
+//!
+//! `GET /api/imap/status` is protected by [`require_api_key`]. It attempts to
+//! ensure a live IMAP session (connecting lazily on first use) and reports the
+//! outcome — never a credential:
+//!
+//! - success returns HTTP `200`, `Content-Type: application/json` and
+//!   `{"connected":true,"host":"...","port":993,"tls":"implicit|starttls|none"}`,
+//!   where `tls` is the configured IMAP mode;
+//! - failure returns HTTP `503`, `Content-Type: application/json` and
+//!   `{"connected":false,"error":"imap_unavailable","message":"..."}`.
 
 use axum::body::to_bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -105,6 +117,8 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use crate::Config;
+use crate::config::TlsMode;
+use crate::imap::{Backoff, ConnectionManager, ImapConnector, ImapError, TokioImapConnector};
 use crate::smtp::{
     MailSender, MessageError, OutgoingAttachment, OutgoingMessage, SmtpError, SmtpSender,
 };
@@ -118,12 +132,27 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// attachment bytes, to cover the rest of the JSON envelope.
 const BODY_LIMIT_SLACK: usize = 64 * 1024;
 
+/// Errors produced while building [`AppState`].
+///
+/// It wraps both service constructors so a single `Result` covers the real SMTP
+/// transport and the IMAP connector, neither of which opens a connection at
+/// construction time.
+#[derive(Debug, thiserror::Error)]
+pub enum AppStateError {
+    /// Building the SMTP transport failed.
+    #[error(transparent)]
+    Smtp(#[from] SmtpError),
+    /// Building the IMAP connector failed.
+    #[error(transparent)]
+    Imap(#[from] ImapError),
+}
+
 /// Shared state exposed to handlers.
 ///
 /// The configured API key is stored only as its SHA-256 digest and the field is
 /// private, so the plaintext secret can neither be read nor formatted. The
-/// manual [`Debug`] implementation redacts the digest as well as the mailer,
-/// which holds the SMTP credentials.
+/// manual [`Debug`] implementation redacts the digest as well as the mailer and
+/// the connection manager, which hold the SMTP and IMAP credentials.
 #[derive(Clone)]
 pub struct AppState {
     /// Application name.
@@ -140,6 +169,10 @@ pub struct AppState {
     max_attachment_bytes: usize,
     /// Sender used when a message omits `from` (the configured SMTP user).
     default_from: String,
+    /// Lazy, persistent IMAP connection manager.
+    imap: Arc<ConnectionManager>,
+    /// TLS mode of the configured IMAP endpoint, for the status endpoint.
+    imap_tls: TlsMode,
 }
 
 impl std::fmt::Debug for AppState {
@@ -151,6 +184,8 @@ impl std::fmt::Debug for AppState {
             .field("account", &self.account)
             .field("mailer", &"***")
             .field("max_attachment_bytes", &self.max_attachment_bytes)
+            .field("imap", &"***")
+            .field("imap_tls", &self.imap_tls)
             .finish()
     }
 }
@@ -158,29 +193,48 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     /// Builds the application state from the loaded [`Config`].
     ///
-    /// This constructs the real SMTP transport from `config.account.smtp` — it
-    /// opens no connection, but building it (or resolving its TLS configuration)
-    /// can fail, hence the `Result`.
+    /// This constructs the real SMTP transport and the real IMAP connector from
+    /// `config` — it opens no connection, but building either (or resolving its
+    /// TLS configuration) can fail, hence the `Result`.
     ///
     /// The expected key is hashed to a fixed-size digest here (not on every
     /// request) so the middleware can compare two equal-length buffers in
     /// constant time. [`Config`] guarantees a non-empty key; the assertion below
     /// documents that invariant in debug builds.
-    pub fn from_config(config: &Config) -> Result<Self, SmtpError> {
+    pub fn from_config(config: &Config) -> Result<Self, AppStateError> {
         debug_assert!(
             !config.api_key.is_empty(),
             "AppState must not be built with an empty API key"
         );
         let mailer: Arc<dyn MailSender> =
             Arc::new(SmtpSender::from_endpoint(&config.account.smtp)?);
-        Ok(Self::with_mailer(config, mailer))
+        let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
+        Ok(Self::with_services(config, mailer, connector))
     }
 
     /// Builds the application state with an injected [`MailSender`].
     ///
-    /// Used by tests to avoid the network and by [`from_config`](Self::from_config)
-    /// to wrap the real [`SmtpSender`].
-    pub fn with_mailer(config: &Config, mailer: Arc<dyn MailSender>) -> Self {
+    /// Used by tests to avoid the network. It delegates to
+    /// [`with_services`](Self::with_services) with a real [`TokioImapConnector`]
+    /// built from `config` (which opens no connection). The connector can still
+    /// fail to build (for example, resolving its TLS configuration), so the
+    /// fallible construction is propagated instead of panicking.
+    pub fn with_mailer(
+        config: &Config,
+        mailer: Arc<dyn MailSender>,
+    ) -> Result<Self, AppStateError> {
+        let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
+        Ok(Self::with_services(config, mailer, connector))
+    }
+
+    /// Builds the application state with both services injected.
+    ///
+    /// Used by tests to exercise the HTTP layer without touching the network.
+    pub fn with_services(
+        config: &Config,
+        mailer: Arc<dyn MailSender>,
+        imap_connector: Arc<dyn ImapConnector>,
+    ) -> Self {
         Self {
             name: APP_NAME,
             version: APP_VERSION,
@@ -198,6 +252,8 @@ impl AppState {
             mailer,
             max_attachment_bytes: config.max_attachment_bytes,
             default_from: config.account.smtp.username.clone(),
+            imap: Arc::new(ConnectionManager::new(imap_connector, Backoff::default())),
+            imap_tls: config.account.imap.tls,
         }
     }
 
@@ -263,6 +319,30 @@ struct WhoamiResponse {
 struct SentResponse {
     /// Always `sent`: reached only after the transport accepted the message.
     status: &'static str,
+}
+
+/// JSON payload returned by a successful `GET /api/imap/status`.
+#[derive(Debug, Serialize)]
+struct ImapStatusResponse {
+    /// Always `true`: reached only after a live session was ensured.
+    connected: bool,
+    /// IMAP server host.
+    host: String,
+    /// IMAP server port.
+    port: u16,
+    /// Configured TLS mode label.
+    tls: &'static str,
+}
+
+/// JSON payload returned by a failing `GET /api/imap/status`.
+#[derive(Debug, Serialize)]
+struct ImapUnavailableResponse {
+    /// Always `false`.
+    connected: bool,
+    /// Stable machine-readable error code.
+    error: &'static str,
+    /// Human-readable explanation.
+    message: String,
 }
 
 /// One attachment of the `POST /api/messages` request body.
@@ -448,6 +528,32 @@ async fn account(State(state): State<AppState>) -> Response {
     Json(&state.account).into_response()
 }
 
+/// `GET /api/imap/status` handler: ensures a live IMAP session and reports the
+/// outcome without exposing any credential.
+async fn imap_status(State(state): State<AppState>) -> Response {
+    match state.imap.status().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ImapStatusResponse {
+                connected: true,
+                host: state.account.imap.host.clone(),
+                port: state.account.imap.port,
+                tls: state.imap_tls.as_str(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ImapUnavailableResponse {
+                connected: false,
+                error: "imap_unavailable",
+                message: error.public_message().to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /api/messages` handler: reads the body, validates it, then sends it.
 ///
 /// The route disables axum's `DefaultBodyLimit`; the body is read here with
@@ -533,6 +639,7 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/whoami", get(whoami))
         .route("/api/account", get(account))
+        .route("/api/imap/status", get(imap_status))
         // The handler enforces its own body limit (and its JSON `413` envelope),
         // so axum's default rejection must not pre-empt it.
         .route(

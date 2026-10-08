@@ -1,5 +1,7 @@
 //! Application configuration loaded from the environment.
 
+use std::time::Duration;
+
 /// Default bind host when `APIMAIL_HOST` is unset.
 pub const DEFAULT_HOST: &str = "0.0.0.0";
 /// Default bind port when `APIMAIL_PORT` is unset.
@@ -9,6 +11,11 @@ pub const MAX_ATTACHMENT_BYTES_VAR: &str = "APIMAIL_MAX_ATTACHMENT_BYTES";
 /// Default maximum total attachment size (10 MiB) when
 /// `APIMAIL_MAX_ATTACHMENT_BYTES` is unset.
 pub const DEFAULT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+/// Environment variable holding the IMAP operation timeout, in seconds.
+pub const IMAP_TIMEOUT_SECS_VAR: &str = "APIMAIL_IMAP_TIMEOUT_SECS";
+/// Default IMAP operation timeout (30 s) when `APIMAIL_IMAP_TIMEOUT_SECS` is
+/// unset.
+pub const DEFAULT_IMAP_TIMEOUT_SECS: u64 = 30;
 
 /// TLS mode negotiated with a mail endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +29,15 @@ pub enum TlsMode {
 }
 
 impl TlsMode {
+    /// Stable, lower-case label used in API responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implicit => "implicit",
+            Self::StartTls => "starttls",
+            Self::Plain => "none",
+        }
+    }
+
     /// Parses a TLS mode case-insensitively, or `None` when unsupported.
     fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -219,6 +235,8 @@ pub struct Config {
     pub account: MailAccount,
     /// Maximum total size, in bytes, of the decoded attachments of a message.
     pub max_attachment_bytes: usize,
+    /// Timeout applied to TCP connect, the TLS handshake and the IMAP login.
+    pub imap_timeout: Duration,
 }
 
 impl std::fmt::Debug for Config {
@@ -228,6 +246,7 @@ impl std::fmt::Debug for Config {
             .field("port", &self.port)
             .field("api_key", &"***")
             .field("account", &self.account)
+            .field("imap_timeout", &self.imap_timeout)
             .finish()
     }
 }
@@ -249,6 +268,14 @@ pub enum ConfigError {
         "invalid APIMAIL_MAX_ATTACHMENT_BYTES value `{value}`: expected a positive number of bytes"
     )]
     InvalidMaxAttachmentBytes {
+        /// The offending raw value.
+        value: String,
+    },
+    /// `APIMAIL_IMAP_TIMEOUT_SECS` was present but not a positive integer.
+    #[error(
+        "invalid APIMAIL_IMAP_TIMEOUT_SECS value `{value}`: expected a positive number of seconds"
+    )]
+    InvalidImapTimeout {
         /// The offending raw value.
         value: String,
     },
@@ -275,9 +302,9 @@ impl Config {
     /// without touching the process environment.
     ///
     /// Validation runs in the order host → port → api key → mail account →
-    /// attachment limit, so an invalid server port is reported before any
-    /// missing API key or account value, and an invalid attachment limit is
-    /// reported last.
+    /// attachment limit → IMAP timeout, so an invalid server port is reported
+    /// before any missing API key or account value, an invalid attachment limit
+    /// is reported after the account, and an invalid IMAP timeout last.
     pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -306,12 +333,25 @@ impl Config {
             }
             None => DEFAULT_MAX_ATTACHMENT_BYTES,
         };
+        let imap_timeout = match lookup(IMAP_TIMEOUT_SECS_VAR) {
+            Some(raw) => {
+                let parsed = raw
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidImapTimeout { value: raw.clone() })?;
+                if parsed == 0 {
+                    return Err(ConfigError::InvalidImapTimeout { value: raw });
+                }
+                Duration::from_secs(parsed)
+            }
+            None => Duration::from_secs(DEFAULT_IMAP_TIMEOUT_SECS),
+        };
         Ok(Self {
             host,
             port,
             api_key,
             account,
             max_attachment_bytes,
+            imap_timeout,
         })
     }
 }
@@ -761,5 +801,69 @@ mod tests {
             ConfigError::InvalidMaxAttachmentBytes { value } => assert_eq!(value, "abc"),
             other => panic!("expected InvalidMaxAttachmentBytes, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn imap_timeout_defaults_to_30_seconds_when_absent() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(
+            config.imap_timeout,
+            Duration::from_secs(DEFAULT_IMAP_TIMEOUT_SECS)
+        );
+        assert_eq!(DEFAULT_IMAP_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn imap_timeout_uses_configured_value() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(IMAP_TIMEOUT_SECS_VAR, "5")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.imap_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn imap_timeout_zero_is_an_error() {
+        let err = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(IMAP_TIMEOUT_SECS_VAR, "0")]),
+        ))
+        .expect_err("zero timeout must fail");
+        assert!(
+            err.to_string().contains(IMAP_TIMEOUT_SECS_VAR),
+            "the error message must name the offending variable: {err}"
+        );
+        match err {
+            ConfigError::InvalidImapTimeout { value } => assert_eq!(value, "0"),
+            other => panic!("expected InvalidImapTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imap_timeout_non_numeric_is_an_error() {
+        let err = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(IMAP_TIMEOUT_SECS_VAR, "abc")]),
+        ))
+        .expect_err("non-numeric timeout must fail");
+        assert!(
+            err.to_string().contains(IMAP_TIMEOUT_SECS_VAR),
+            "the error message must name the offending variable: {err}"
+        );
+        match err {
+            ConfigError::InvalidImapTimeout { value } => assert_eq!(value, "abc"),
+            other => panic!("expected InvalidImapTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_mode_as_str_matches_the_api_labels() {
+        assert_eq!(TlsMode::Implicit.as_str(), "implicit");
+        assert_eq!(TlsMode::StartTls.as_str(), "starttls");
+        assert_eq!(TlsMode::Plain.as_str(), "none");
     }
 }

@@ -41,7 +41,7 @@ async fn main() -> ExitCode {
     let state = match AppState::from_config(&config) {
         Ok(state) => state,
         Err(error) => {
-            tracing::error!("failed to initialise the mail sender: {error}");
+            tracing::error!("failed to initialise application services: {error}");
             return ExitCode::FAILURE;
         }
     };
