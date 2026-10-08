@@ -101,8 +101,44 @@
 //!   where `tls` is the configured IMAP mode;
 //! - failure returns HTTP `503`, `Content-Type: application/json` and
 //!   `{"connected":false,"error":"imap_unavailable","message":"..."}`.
+//!
+//! # Mailbox contract
+//!
+//! `GET /api/mailboxes` is protected by [`require_api_key`]. It lists the
+//! account's mailboxes (`LIST`) and never exposes a credential. On success it
+//! returns HTTP `200`, `Content-Type: application/json` and a body of the shape:
+//!
+//! ```json
+//! {"mailboxes":[{"name":"INBOX","delimiter":"/","attributes":["\\HasNoChildren"]}]}
+//! ```
+//!
+//! where `delimiter` is `null` when the server reports a flat namespace and
+//! `attributes` are the IMAP-style mailbox attributes (for example
+//! `\NoSelect`).
+//!
+//! `POST /api/mailboxes/select` is protected by [`require_api_key`] and accepts
+//! an `application/json` body `{"mailbox":"INBOX"}`. On success it selects the
+//! mailbox (`SELECT`) and returns HTTP `200`, `Content-Type: application/json`
+//! and a body of the shape:
+//!
+//! ```json
+//! {"mailbox":"INBOX","exists":42,"recent":0,"unseen":3,"uid_validity":7,"uid_next":100,"flags":["\\Seen"]}
+//! ```
+//!
+//! where `unseen`, `uid_validity` and `uid_next` are `null` when the server
+//! omits them. The selected mailbox stays active for subsequent operations.
+//!
+//! Both routes share the `{"error":...,"message":...}` envelope:
+//!
+//! - `400` (`invalid_request`) — malformed JSON body or a missing/blank
+//!   `mailbox`.
+//! - `404` (`mailbox_not_found`) — the server answered `NO` for the mailbox.
+//! - `503` (`imap_unavailable`) — the session or server is unavailable; the
+//!   message is the stable [`ImapError::public_message`] and never
+//!   [`Display`](std::fmt::Display) text from a third party.
+//! - `401` (`unauthorized`) — missing or invalid API key.
 
-use axum::body::to_bytes;
+use axum::body::{Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -118,7 +154,10 @@ use subtle::ConstantTimeEq;
 
 use crate::Config;
 use crate::config::TlsMode;
-use crate::imap::{Backoff, ConnectionManager, ImapConnector, ImapError, TokioImapConnector};
+use crate::imap::{
+    Backoff, ConnectionManager, ImapConnector, ImapError, MailboxInfo, MailboxStatus,
+    TokioImapConnector,
+};
 use crate::smtp::{
     MailSender, MessageError, OutgoingAttachment, OutgoingMessage, SmtpError, SmtpSender,
 };
@@ -345,6 +384,117 @@ struct ImapUnavailableResponse {
     message: String,
 }
 
+/// One mailbox in the `GET /api/mailboxes` response.
+#[derive(Debug, Serialize)]
+struct MailboxDto {
+    /// Mailbox name.
+    name: String,
+    /// Hierarchy delimiter, or `null` for a flat namespace.
+    delimiter: Option<String>,
+    /// Mailbox attributes in IMAP style (`\NoSelect`, …).
+    attributes: Vec<String>,
+}
+
+impl From<MailboxInfo> for MailboxDto {
+    fn from(info: MailboxInfo) -> Self {
+        Self {
+            name: info.name,
+            delimiter: info.delimiter,
+            attributes: info.attributes,
+        }
+    }
+}
+
+/// JSON payload returned by a successful `GET /api/mailboxes`.
+#[derive(Debug, Serialize)]
+struct MailboxListResponse {
+    /// The account's mailboxes.
+    mailboxes: Vec<MailboxDto>,
+}
+
+/// `POST /api/mailboxes/select` request body.
+#[derive(Debug, Deserialize)]
+struct SelectMailboxDto {
+    /// Mailbox to select.
+    mailbox: String,
+}
+
+/// JSON payload returned by a successful `POST /api/mailboxes/select`.
+#[derive(Debug, Serialize)]
+struct MailboxStatusResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Number of messages (`EXISTS`).
+    exists: u32,
+    /// Messages with the `\Recent` flag (`RECENT`).
+    recent: u32,
+    /// First unseen message (`UNSEEN`), if reported.
+    unseen: Option<u32>,
+    /// UID validity (`UIDVALIDITY`), if reported.
+    uid_validity: Option<u32>,
+    /// Next UID (`UIDNEXT`), if reported.
+    uid_next: Option<u32>,
+    /// Defined message flags in IMAP style (`\Seen`, …).
+    flags: Vec<String>,
+}
+
+impl MailboxStatusResponse {
+    /// Builds the response from the selected mailbox status.
+    fn new(mailbox: String, status: MailboxStatus) -> Self {
+        Self {
+            mailbox,
+            exists: status.exists,
+            recent: status.recent,
+            unseen: status.unseen,
+            uid_validity: status.uid_validity,
+            uid_next: status.uid_next,
+            flags: status.flags,
+        }
+    }
+}
+
+/// Failure modes of the mailbox routes, mapped to the documented statuses.
+#[derive(Debug)]
+enum MailboxError {
+    /// The request payload is malformed or misses a non-empty `mailbox`
+    /// (`400`).
+    InvalidRequest(String),
+    /// The server answered `NO`: the mailbox does not exist (`404`).
+    NotFound,
+    /// The IMAP session or server is unavailable (`503`).
+    Unavailable(String),
+}
+
+impl IntoResponse for MailboxError {
+    fn into_response(self) -> Response {
+        let (status, error, message) = match self {
+            Self::InvalidRequest(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
+            Self::NotFound => (
+                StatusCode::NOT_FOUND,
+                "mailbox_not_found",
+                "mailbox not found".to_string(),
+            ),
+            Self::Unavailable(message) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "imap_unavailable", message)
+            }
+        };
+        (status, Json(ErrorResponse { error, message })).into_response()
+    }
+}
+
+/// Maps an [`ImapError`] to the mailbox routes' failure model.
+///
+/// A missing mailbox becomes `404`; every other failure becomes `503` carrying
+/// the stable, credential-free [`ImapError::public_message`].
+impl From<ImapError> for MailboxError {
+    fn from(error: ImapError) -> Self {
+        match error {
+            ImapError::MailboxNotFound => Self::NotFound,
+            other => Self::Unavailable(other.public_message().to_string()),
+        }
+    }
+}
+
 /// One attachment of the `POST /api/messages` request body.
 #[derive(Debug, Deserialize)]
 struct AttachmentDto {
@@ -554,6 +704,43 @@ async fn imap_status(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `GET /api/mailboxes` handler: lists the account's mailboxes.
+async fn list_mailboxes(State(state): State<AppState>) -> Result<Response, MailboxError> {
+    let mailboxes = state.imap.list_mailboxes().await?;
+    let response = MailboxListResponse {
+        mailboxes: mailboxes.into_iter().map(MailboxDto::from).collect(),
+    };
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// `POST /api/mailboxes/select` handler: selects a mailbox, reporting its
+/// status.
+///
+/// The body is read as raw bytes and parsed here so a malformed payload gets
+/// the shared JSON error envelope (`400 invalid_request`) instead of axum's
+/// plain-text rejection. A missing or blank (`trim`-empty) `mailbox` is also
+/// rejected with a `400`.
+async fn select_mailbox(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, MailboxError> {
+    // A fixed message: the serde error could echo part of the attacker-supplied
+    // payload, so it must not be reflected back to the client.
+    let dto: SelectMailboxDto = serde_json::from_slice(&body)
+        .map_err(|_| MailboxError::InvalidRequest("invalid JSON body".to_string()))?;
+
+    let mailbox = dto.mailbox.trim();
+    if mailbox.is_empty() {
+        return Err(MailboxError::InvalidRequest(
+            "`mailbox` must not be empty".to_string(),
+        ));
+    }
+
+    let status = state.imap.select_mailbox(mailbox).await?;
+    let response = MailboxStatusResponse::new(mailbox.to_string(), status);
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
 /// `POST /api/messages` handler: reads the body, validates it, then sends it.
 ///
 /// The route disables axum's `DefaultBodyLimit`; the body is read here with
@@ -640,6 +827,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/whoami", get(whoami))
         .route("/api/account", get(account))
         .route("/api/imap/status", get(imap_status))
+        .route("/api/mailboxes", get(list_mailboxes))
+        .route("/api/mailboxes/select", post(select_mailbox))
         // The handler enforces its own body limit (and its JSON `413` envelope),
         // so axum's default rejection must not pre-empt it.
         .route(

@@ -15,6 +15,7 @@ dependencies = [
  "async-imap",
  "axum",
  "base64 0.22.1",
+ "futures-util",
  "http-body-util",
  "lettre",
  "serde",

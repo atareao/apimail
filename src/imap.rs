@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::Client;
+use async_imap::types::{Flag, NameAttribute};
+use futures_util::TryStreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -55,6 +57,9 @@ pub enum ImapError {
     /// The IMAP `LOGIN` was rejected.
     #[error("IMAP login failed: {0}")]
     Login(String),
+    /// The requested mailbox does not exist on the server (`NO` on `SELECT`).
+    #[error("mailbox not found")]
+    MailboxNotFound,
     /// The connection ended before a usable state was reached.
     #[error("IMAP server unavailable: {0}")]
     Unavailable(String),
@@ -86,6 +91,7 @@ impl ImapError {
                 "IMAP TLS handshake failed"
             }
             Self::Login(_) | Self::Imap(_) => "IMAP authentication or command failed",
+            Self::MailboxNotFound => "mailbox not found",
             Self::Io(_) => "IMAP I/O error",
         }
     }
@@ -100,21 +106,142 @@ impl ImapError {
             Self::Tcp(_) => "tcp",
             Self::Tls(_) | Self::TlsConfig(_) | Self::InvalidServerName(_) => "tls",
             Self::Login(_) => "login",
+            Self::MailboxNotFound => "not_found",
             Self::Unavailable(_) => "unavailable",
             Self::Timeout(_) => "timeout",
             Self::Imap(_) => "imap",
             Self::Io(_) => "io",
         }
     }
+
+    /// Whether the failure indicates the cached session is no longer usable.
+    ///
+    /// Transport-level failures (the socket, TLS, a timeout, a dead server or an
+    /// `async-imap` I/O/connection-lost error) mean the session must be dropped
+    /// and rebuilt on the next request. Logical failures (rejected credentials,
+    /// a missing mailbox, a `BAD`/`NO`/parse error) do **not** invalidate the
+    /// session. The classification intentionally sits in one place so the
+    /// `ConnectionManager` can act on it uniformly.
+    pub fn is_connection(&self) -> bool {
+        match self {
+            Self::Tcp(_)
+            | Self::Tls(_)
+            | Self::TlsConfig(_)
+            | Self::InvalidServerName(_)
+            | Self::Timeout(_)
+            | Self::Unavailable(_)
+            | Self::Io(_) => true,
+            Self::Login(_) | Self::MailboxNotFound => false,
+            Self::Imap(inner) => matches!(
+                inner,
+                async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost
+            ),
+        }
+    }
+}
+
+/// Public description of a mailbox, as reported by `LIST`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxInfo {
+    /// Mailbox name (the raw, server-provided string).
+    pub name: String,
+    /// Hierarchy delimiter, or `None` for a flat namespace.
+    pub delimiter: Option<String>,
+    /// Mailbox attributes, rendered in IMAP style (`\NoSelect`, …).
+    pub attributes: Vec<String>,
+}
+
+/// Mailbox status reported by `SELECT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxStatus {
+    /// Number of messages in the mailbox (`EXISTS`).
+    pub exists: u32,
+    /// Number of messages with the `\Recent` flag (`RECENT`).
+    pub recent: u32,
+    /// Sequence number of the first unseen message (`UNSEEN`), if reported.
+    pub unseen: Option<u32>,
+    /// UID validity value (`UIDVALIDITY`), if reported.
+    pub uid_validity: Option<u32>,
+    /// Next unique identifier (`UIDNEXT`), if reported.
+    pub uid_next: Option<u32>,
+    /// Defined message flags, rendered in IMAP style (`\Seen`, …).
+    pub flags: Vec<String>,
+}
+
+/// Renders a message flag in its IMAP textual form.
+///
+/// `imap-proto` implements neither `Display` nor an accessor for the original
+/// name, so the system flags are mapped explicitly and a user/server keyword is
+/// returned verbatim (as IMAP keywords carry no leading backslash). `\*`
+/// ([`Flag::MayCreate`]) is the only system flag that is not a named flag.
+fn flag_label(flag: &Flag<'_>) -> String {
+    match flag {
+        Flag::Seen => "\\Seen".to_string(),
+        Flag::Answered => "\\Answered".to_string(),
+        Flag::Flagged => "\\Flagged".to_string(),
+        Flag::Deleted => "\\Deleted".to_string(),
+        Flag::Draft => "\\Draft".to_string(),
+        Flag::Recent => "\\Recent".to_string(),
+        Flag::MayCreate => "\\*".to_string(),
+        Flag::Custom(name) => name.to_string(),
+    }
+}
+
+/// Ensures `name` carries exactly one leading backslash.
+///
+/// `imap-proto` reports the known attributes and the extension names **with**
+/// the leading backslash already included, but a future variant (or a different
+/// `Debug` rendering) could expose it without one. Stripping any existing
+/// prefix before re-adding a single one keeps the output stable in every case
+/// and never produces a doubled `\\`.
+fn with_attribute_prefix(name: &str) -> String {
+    format!("\\{}", name.trim_start_matches('\\'))
+}
+
+/// Renders a `LIST` mailbox attribute in its IMAP textual form.
+///
+/// `imap-proto` does not implement `Display`; each known variant maps to the
+/// canonical `\Name` spelling. Attributes from extensions the crate does not
+/// model arrive as [`NameAttribute::Extension`] **already carrying** the leading
+/// backslash (for example `\HasNoChildren`), so it is normalised here rather
+/// than prefixed again. The enum is `#[non_exhaustive]`, so a defensive arm
+/// keeps the mapping total if a future release adds a variant; it too is
+/// normalised so it can never emit a doubled backslash.
+fn attribute_label(attr: &NameAttribute<'_>) -> String {
+    match attr {
+        NameAttribute::NoInferiors => "\\NoInferiors".to_string(),
+        NameAttribute::NoSelect => "\\NoSelect".to_string(),
+        NameAttribute::Marked => "\\Marked".to_string(),
+        NameAttribute::Unmarked => "\\Unmarked".to_string(),
+        NameAttribute::All => "\\All".to_string(),
+        NameAttribute::Archive => "\\Archive".to_string(),
+        NameAttribute::Drafts => "\\Drafts".to_string(),
+        NameAttribute::Flagged => "\\Flagged".to_string(),
+        NameAttribute::Junk => "\\Junk".to_string(),
+        NameAttribute::Sent => "\\Sent".to_string(),
+        NameAttribute::Trash => "\\Trash".to_string(),
+        NameAttribute::Extension(name) => with_attribute_prefix(name),
+        other => with_attribute_prefix(&format!("{other:?}")),
+    }
 }
 
 /// A live, authenticated IMAP session able to run commands.
 ///
-/// The trait intentionally exposes only what the connection layer needs to
-/// verify liveness for now; mailbox operations will extend it in later changes.
+/// The trait exposes the commands the mailbox layer needs: a `NOOP` liveness
+/// probe, `LIST` (as [`list_mailboxes`](ImapSession::list_mailboxes)) and
+/// `SELECT` (as [`select`](ImapSession::select)). It stays object-safe without
+/// `async-trait` by returning boxed futures.
 pub trait ImapSession: Send {
     /// Sends a `NOOP`, used to check that the session is still alive.
     fn noop(&mut self) -> SendFuture<'_, Result<(), ImapError>>;
+
+    /// Lists the account's mailboxes with `LIST`.
+    fn list_mailboxes(&mut self) -> SendFuture<'_, Result<Vec<MailboxInfo>, ImapError>>;
+
+    /// Selects `mailbox` with `SELECT`, returning its status.
+    ///
+    /// An unknown mailbox is reported as [`ImapError::MailboxNotFound`].
+    fn select(&mut self, mailbox: String) -> SendFuture<'_, Result<MailboxStatus, ImapError>>;
 }
 
 /// A factory able to open a fresh authenticated IMAP session.
@@ -340,6 +467,50 @@ impl ImapSession for SessionHandle {
     fn noop(&mut self) -> SendFuture<'_, Result<(), ImapError>> {
         Box::pin(async move { self.session.noop().await.map_err(ImapError::from) })
     }
+
+    fn list_mailboxes(&mut self) -> SendFuture<'_, Result<Vec<MailboxInfo>, ImapError>> {
+        Box::pin(async move {
+            // `None` as the pattern would send `LIST "" ""`, which answers with
+            // the hierarchy delimiter only and does **not** enumerate the
+            // mailboxes. `Some("*")` sends `LIST "" "*"` (the RFC 3501 wildcard
+            // matching every name) so the whole mailbox list is returned.
+            let names = self
+                .session
+                .list(None, Some("*"))
+                .await
+                .map_err(ImapError::from)?;
+            let mailboxes = names
+                .map_ok(|name| MailboxInfo {
+                    name: name.name().to_string(),
+                    delimiter: name.delimiter().map(str::to_string),
+                    attributes: name.attributes().iter().map(attribute_label).collect(),
+                })
+                .try_collect()
+                .await?;
+            Ok(mailboxes)
+        })
+    }
+
+    fn select(&mut self, mailbox: String) -> SendFuture<'_, Result<MailboxStatus, ImapError>> {
+        Box::pin(async move {
+            let mailbox = self
+                .session
+                .select(mailbox)
+                .await
+                .map_err(|error| match error {
+                    async_imap::error::Error::No(_) => ImapError::MailboxNotFound,
+                    other => ImapError::Imap(other),
+                })?;
+            Ok(MailboxStatus {
+                exists: mailbox.exists,
+                recent: mailbox.recent,
+                unseen: mailbox.unseen,
+                uid_validity: mailbox.uid_validity,
+                uid_next: mailbox.uid_next,
+                flags: mailbox.flags.iter().map(flag_label).collect(),
+            })
+        })
+    }
 }
 
 /// Retry policy with bounded exponential backoff.
@@ -431,15 +602,16 @@ impl ConnectionManager {
         }
     }
 
-    /// Ensures a live session, connecting or reconnecting as needed.
+    /// Ensures the cached slot holds a live session, (re)connecting as needed.
     ///
     /// If a session is cached, it is probed with `NOOP`; a failure discards it.
     /// Then a fresh session is attempted up to `backoff.attempts` times, sleeping
     /// the backoff delay between attempts. Returns `Ok(())` once a live session is
     /// cached, or the last error after exhausting the attempts.
-    pub async fn status(&self) -> Result<(), ImapError> {
-        let mut guard = self.session.lock().await;
-
+    async fn ensure_session(
+        &self,
+        guard: &mut Option<Box<dyn ImapSession>>,
+    ) -> Result<(), ImapError> {
         if let Some(session) = guard.as_mut() {
             match session.noop().await {
                 Ok(()) => return Ok(()),
@@ -473,20 +645,163 @@ impl ConnectionManager {
             ImapError::Unavailable("no connection attempt was configured".to_string())
         }))
     }
+
+    /// Ensures a live session, connecting or reconnecting as needed.
+    ///
+    /// Delegates to [`ensure_session`](Self::ensure_session); this is the entry
+    /// point used by the IMAP status endpoint.
+    pub async fn status(&self) -> Result<(), ImapError> {
+        let mut guard = self.session.lock().await;
+        self.ensure_session(&mut guard).await
+    }
+
+    /// Runs `command` exactly once on a live session.
+    ///
+    /// The shared policy for the mailbox commands: lock the session, guarantee it
+    /// with [`ensure_session`](Self::ensure_session), run `command` **once** (no
+    /// in-place retry, since future commands may not be idempotent), and discard
+    /// the cached session only when the failure is a connection error so the next
+    /// request reconnects. The `for<'a>` bound ties the future returned by
+    /// `command` to the session borrow, which is what lets the guard be reused
+    /// after the await without cloning the session.
+    async fn run_once<T, F>(&self, command: F) -> Result<T, ImapError>
+    where
+        F: for<'a> FnOnce(&'a mut Box<dyn ImapSession>) -> SendFuture<'a, Result<T, ImapError>>,
+    {
+        let mut guard = self.session.lock().await;
+        self.ensure_session(&mut guard).await?;
+
+        let outcome = match guard.as_mut() {
+            Some(session) => command(session).await,
+            None => Err(ImapError::Unavailable(
+                "no IMAP session available".to_string(),
+            )),
+        };
+
+        if let Err(error) = &outcome
+            && error.is_connection()
+        {
+            *guard = None;
+        }
+        outcome
+    }
+
+    /// Lists the account's mailboxes, reusing the live session when possible.
+    ///
+    /// Delegates to [`run_once`](Self::run_once): the command runs once on a
+    /// session guaranteed by [`ensure_session`](Self::ensure_session), and a
+    /// connection failure discards the cached session for the next request.
+    pub async fn list_mailboxes(&self) -> Result<Vec<MailboxInfo>, ImapError> {
+        self.run_once(|session| session.list_mailboxes()).await
+    }
+
+    /// Selects `mailbox` on the live session, returning its status.
+    ///
+    /// Follows the same single-attempt policy as
+    /// [`list_mailboxes`](Self::list_mailboxes): a connection failure discards
+    /// the cached session, while a logical failure (for example, an unknown
+    /// mailbox) keeps it.
+    pub async fn select_mailbox(&self, mailbox: &str) -> Result<MailboxStatus, ImapError> {
+        let mailbox = mailbox.to_string();
+        self.run_once(move |session| session.select(mailbox)).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
-    /// A fake session whose `NOOP` outcome is scripted.
+    /// Scripted outcome of a `select` call on a [`FakeSession`].
+    #[derive(Clone)]
+    enum SelectScript {
+        /// Return this status.
+        Status(MailboxStatus),
+        /// Answer `NO`, as a server does for an unknown mailbox.
+        NotFound,
+        /// Fail as a connection error.
+        Connection,
+    }
+
+    /// A fake session whose `NOOP`, `list_mailboxes` and `select` outcomes are
+    /// scripted.
+    #[derive(Clone)]
     struct FakeSession {
         /// When `true`, every `noop` fails.
         dead: bool,
+        /// Mailboxes returned by `list_mailboxes`.
+        mailboxes: Vec<MailboxInfo>,
+        /// Outcome of `select`.
+        select: SelectScript,
+    }
+
+    impl FakeSession {
+        /// A healthy session with an empty mailbox list.
+        fn healthy() -> Self {
+            Self {
+                dead: false,
+                mailboxes: Vec::new(),
+                select: SelectScript::Status(default_status()),
+            }
+        }
+
+        /// A session whose `noop` fails.
+        fn dead() -> Self {
+            Self {
+                dead: true,
+                mailboxes: Vec::new(),
+                select: SelectScript::Connection,
+            }
+        }
+
+        /// Sets the mailboxes returned by `list_mailboxes`.
+        fn with_mailboxes(mut self, mailboxes: Vec<MailboxInfo>) -> Self {
+            self.mailboxes = mailboxes;
+            self
+        }
+
+        /// Sets the status returned by `select`.
+        fn with_status(mut self, status: MailboxStatus) -> Self {
+            self.select = SelectScript::Status(status);
+            self
+        }
+
+        /// Makes `select` answer `NO`.
+        fn not_found(mut self) -> Self {
+            self.select = SelectScript::NotFound;
+            self
+        }
+
+        /// Makes `select` fail with a connection error.
+        fn select_connection_error(mut self) -> Self {
+            self.select = SelectScript::Connection;
+            self
+        }
+    }
+
+    /// A representative mailbox status used by the fakes.
+    fn default_status() -> MailboxStatus {
+        MailboxStatus {
+            exists: 0,
+            recent: 0,
+            unseen: None,
+            uid_validity: None,
+            uid_next: None,
+            flags: Vec::new(),
+        }
+    }
+
+    /// A representative mailbox.
+    fn inbox() -> MailboxInfo {
+        MailboxInfo {
+            name: "INBOX".to_string(),
+            delimiter: Some("/".to_string()),
+            attributes: vec!["\\HasNoChildren".to_string()],
+        }
     }
 
     impl ImapSession for FakeSession {
@@ -500,12 +815,30 @@ mod tests {
                 }
             })
         }
+
+        fn list_mailboxes(&mut self) -> SendFuture<'_, Result<Vec<MailboxInfo>, ImapError>> {
+            let mailboxes = self.mailboxes.clone();
+            Box::pin(async move { Ok(mailboxes) })
+        }
+
+        fn select(&mut self, _mailbox: String) -> SendFuture<'_, Result<MailboxStatus, ImapError>> {
+            let script = self.select.clone();
+            Box::pin(async move {
+                match script {
+                    SelectScript::Status(status) => Ok(status),
+                    SelectScript::NotFound => Err(ImapError::MailboxNotFound),
+                    SelectScript::Connection => {
+                        Err(ImapError::Unavailable("simulated dead session".to_string()))
+                    }
+                }
+            })
+        }
     }
 
     /// A scripted outcome for a single `connect` call.
     enum Outcome {
-        /// Hands back a session whose `noop` succeeds (`false`) or fails (`true`).
-        Session(bool),
+        /// Hands back the given fake session.
+        Session(FakeSession),
     }
 
     /// A fake [`ImapConnector`] that counts calls and follows a script.
@@ -542,8 +875,8 @@ mod tests {
                 .pop_front();
             Box::pin(async move {
                 match next {
-                    Some(Outcome::Session(dead)) => {
-                        Ok(Box::new(FakeSession { dead }) as Box<dyn ImapSession>)
+                    Some(Outcome::Session(session)) => {
+                        Ok(Box::new(session) as Box<dyn ImapSession>)
                     }
                     _ => Err(ImapError::Unavailable(
                         "simulated connect failure".to_string(),
@@ -625,6 +958,7 @@ mod tests {
             std::io::ErrorKind::UnexpectedEof,
             "socket 10.0.0.5",
         ));
+        let not_found = ImapError::MailboxNotFound;
 
         for (error, message, kind) in [
             (&tcp, "could not connect to the IMAP server", "tcp"),
@@ -639,6 +973,7 @@ mod tests {
             (&invalid_name, "IMAP TLS handshake failed", "tls"),
             (&login, "IMAP authentication or command failed", "login"),
             (&io, "IMAP I/O error", "io"),
+            (&not_found, "mailbox not found", "not_found"),
         ] {
             assert_eq!(error.public_message(), message, "{error:?}");
             assert_eq!(error.kind(), kind, "{error:?}");
@@ -693,7 +1028,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_status_connects_and_second_reuses_the_session() {
-        let connector = FakeConnector::scripted([Outcome::Session(false)]);
+        let connector = FakeConnector::scripted([Outcome::Session(FakeSession::healthy())]);
         let manager = manager(connector.clone());
 
         manager.status().await.expect("first use should connect");
@@ -714,7 +1049,10 @@ mod tests {
     async fn dead_session_is_discarded_and_reconnected() {
         // First connect yields a session whose `noop` fails; the retry yields a
         // healthy one.
-        let connector = FakeConnector::scripted([Outcome::Session(true), Outcome::Session(false)]);
+        let connector = FakeConnector::scripted([
+            Outcome::Session(FakeSession::dead()),
+            Outcome::Session(FakeSession::healthy()),
+        ]);
         let manager = manager(connector.clone());
 
         manager.status().await.expect("first use should connect");
@@ -767,5 +1105,219 @@ mod tests {
             rendered.contains("Backoff"),
             "manager Debug should still expose the retry policy: {rendered}"
         );
+    }
+
+    #[test]
+    fn flag_label_renders_system_flags_and_keywords() {
+        assert_eq!(flag_label(&Flag::Seen), "\\Seen");
+        assert_eq!(flag_label(&Flag::Answered), "\\Answered");
+        assert_eq!(flag_label(&Flag::Flagged), "\\Flagged");
+        assert_eq!(flag_label(&Flag::Deleted), "\\Deleted");
+        assert_eq!(flag_label(&Flag::Draft), "\\Draft");
+        assert_eq!(flag_label(&Flag::Recent), "\\Recent");
+        assert_eq!(flag_label(&Flag::MayCreate), "\\*");
+        assert_eq!(
+            flag_label(&Flag::Custom(Cow::Borrowed("$Forwarded"))),
+            "$Forwarded"
+        );
+    }
+
+    #[test]
+    fn attribute_label_renders_known_attributes_and_extensions() {
+        for (attribute, label) in [
+            (NameAttribute::NoInferiors, "\\NoInferiors"),
+            (NameAttribute::NoSelect, "\\NoSelect"),
+            (NameAttribute::Marked, "\\Marked"),
+            (NameAttribute::Unmarked, "\\Unmarked"),
+            (NameAttribute::All, "\\All"),
+            (NameAttribute::Archive, "\\Archive"),
+            (NameAttribute::Drafts, "\\Drafts"),
+            (NameAttribute::Flagged, "\\Flagged"),
+            (NameAttribute::Junk, "\\Junk"),
+            (NameAttribute::Sent, "\\Sent"),
+            (NameAttribute::Trash, "\\Trash"),
+        ] {
+            assert_eq!(attribute_label(&attribute), label, "{attribute:?}");
+        }
+        // `imap-proto` parses the extension with the leading backslash already
+        // included, so the label must not add a second one.
+        assert_eq!(
+            attribute_label(&NameAttribute::Extension(Cow::Borrowed("\\HasNoChildren"))),
+            "\\HasNoChildren"
+        );
+        assert_eq!(
+            attribute_label(&NameAttribute::Extension(Cow::Borrowed("\\HasChildren"))),
+            "\\HasChildren"
+        );
+        // A future variant exposing the name without a backslash is normalised
+        // to exactly one.
+        assert_eq!(
+            attribute_label(&NameAttribute::Extension(Cow::Borrowed("HasChildren"))),
+            "\\HasChildren"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_mailboxes_returns_scripted_mailboxes_and_reuses_the_session() {
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy().with_mailboxes(vec![inbox()]),
+        )]);
+        let manager = manager(connector.clone());
+
+        let first = manager
+            .list_mailboxes()
+            .await
+            .expect("listing should succeed");
+        assert_eq!(first, vec![inbox()]);
+
+        let second = manager
+            .list_mailboxes()
+            .await
+            .expect("second listing should succeed");
+        assert_eq!(second, vec![inbox()]);
+        assert_eq!(
+            connector.connects(),
+            1,
+            "a live session must be reused across listings"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_mailbox_returns_the_scripted_status() {
+        let status = MailboxStatus {
+            exists: 42,
+            recent: 1,
+            unseen: Some(3),
+            uid_validity: Some(7),
+            uid_next: Some(100),
+            flags: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+        };
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy().with_status(status.clone()),
+        )]);
+        let manager = manager(connector.clone());
+
+        let observed = manager
+            .select_mailbox("INBOX")
+            .await
+            .expect("selection should succeed");
+        assert_eq!(observed, status);
+        assert_eq!(connector.connects(), 1);
+    }
+
+    #[tokio::test]
+    async fn select_unknown_mailbox_is_not_found_and_keeps_the_session() {
+        let connector =
+            FakeConnector::scripted([Outcome::Session(FakeSession::healthy().not_found())]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .select_mailbox("Missing")
+            .await
+            .expect_err("an unknown mailbox must fail");
+        assert!(matches!(error, ImapError::MailboxNotFound), "{error:?}");
+        assert!(!error.is_connection(), "a `NO` is not a connection error");
+        assert_eq!(connector.connects(), 1);
+
+        // The session is kept, so the next operation reuses it.
+        manager
+            .list_mailboxes()
+            .await
+            .expect("the live session must be kept");
+        assert_eq!(
+            connector.connects(),
+            1,
+            "a `NO` must not discard the live session"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_session_is_replaced_for_mailbox_operations() {
+        // First connect yields a session whose `noop` fails; when the next
+        // operation probes it, it is discarded and replaced with a healthy one.
+        let connector = FakeConnector::scripted([
+            Outcome::Session(FakeSession::dead()),
+            Outcome::Session(FakeSession::healthy().with_mailboxes(vec![inbox()])),
+        ]);
+        let manager = manager(connector.clone());
+
+        manager
+            .status()
+            .await
+            .expect("the first use connects the (soon-to-be-dead) session");
+
+        let mailboxes = manager
+            .list_mailboxes()
+            .await
+            .expect("the dead session should be replaced and the listing run");
+        assert_eq!(mailboxes, vec![inbox()]);
+        assert_eq!(
+            connector.connects(),
+            2,
+            "the dead session must be discarded and one reconnect attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_error_on_a_command_discards_the_session() {
+        let connector = FakeConnector::scripted([
+            Outcome::Session(FakeSession::healthy().select_connection_error()),
+            Outcome::Session(FakeSession::healthy()),
+        ]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .select_mailbox("INBOX")
+            .await
+            .expect_err("the command must surface the connection error");
+        assert!(error.is_connection(), "{error:?}");
+
+        // The cached session was discarded, so the next use reconnects.
+        manager
+            .status()
+            .await
+            .expect("a fresh session should be established");
+        assert_eq!(
+            connector.connects(),
+            2,
+            "a connection error on a command must discard the session"
+        );
+    }
+
+    #[test]
+    fn is_connection_classifies_transport_and_protocol_errors() {
+        let connection = [
+            ImapError::Tcp(std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp")),
+            ImapError::Tls("tls".to_string()),
+            ImapError::TlsConfig("tls config".to_string()),
+            ImapError::InvalidServerName("name".to_string()),
+            ImapError::Timeout(Duration::from_secs(1)),
+            ImapError::Unavailable("down".to_string()),
+            ImapError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "io")),
+            ImapError::Imap(async_imap::error::Error::ConnectionLost),
+            ImapError::Imap(async_imap::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "io",
+            ))),
+        ];
+        for error in &connection {
+            assert!(
+                error.is_connection(),
+                "expected a connection error: {error:?}"
+            );
+        }
+
+        let logical = [
+            ImapError::Login("nope".to_string()),
+            ImapError::MailboxNotFound,
+            ImapError::Imap(async_imap::error::Error::No("no".to_string())),
+            ImapError::Imap(async_imap::error::Error::Bad("bad".to_string())),
+        ];
+        for error in &logical {
+            assert!(
+                !error.is_connection(),
+                "expected a non-connection error: {error:?}"
+            );
+        }
     }
 }
