@@ -238,12 +238,12 @@ Respuesta `200 OK` con `Content-Type: application/json`:
 {
   "status": "ok",
   "name": "apimail",
-  "version": "0.3.1"
+  "version": "x.y.z"
 }
 ```
 
 El campo `version` es la versión del crate en ejecución (`CARGO_PKG_VERSION`), no una
-constante de la API.
+constante de la API; en el ejemplo se muestra como `x.y.z`.
 
 ```bash
 curl -fsS http://127.0.0.1:3000/api/health
