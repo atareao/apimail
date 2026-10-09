@@ -1,4 +1,14 @@
 # Changelog
+## [0.2.1] - 2026-10-09
+
+### Bug Fixes
+
+- *(release)* Sync Cargo.lock on bump and keep process artifacts out of the crate
+
+### Documentation
+
+- Move the roadmap into plans/ and add PLAN-001.md
+- *(openspec)* Add and archive the release-hygiene change
 ## [0.2.0] - 2026-10-09
 
 ### Bug Fixes
@@ -41,6 +51,10 @@
 - *(flags)* Update flags, move, copy and delete messages over IMAP
 - *(mime)* Parse message text, HTML and attachments over IMAP
 - *(idle)* Watch the mailbox over IDLE and notify a webhook
+
+### Miscellaneous Tasks
+
+- Release v0.2.0
 ## [0.1.0] - 2026-10-07
 
 ### Features
