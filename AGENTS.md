@@ -6,7 +6,7 @@
 - `Cargo.toml` (Rust **edition 2024**) ya tiene las dependencias base: `axum`, `tokio`, `serde`/`serde_json`, `tracing`/`tracing-subscriber`, `thiserror`; dev: `tower`, `http-body-util`.
 - API implementada en estructura **lib + bin**: `src/lib.rs` (`Config`, `MailAccount`, `build_router`), `src/config.rs`, `src/http.rs`, `src/main.rs`; tests en `tests/` (`health.rs`, `auth.rs`, `account.rs`, `startup.rs`).
 - Autenticación por **API key** (`APIMAIL_API_KEY`, fail-closed) y **cuenta IMAP/SMTP** configurada por entorno (fail-closed) con endpoint `GET /api/account`.
-- Existe `openspec/` (schema `spec-driven`), `README.md`, `PLAN.md`, gitflow + CI/CD (`.github/workflows/`). No hay `frontend/`.
+- Existe `openspec/` (schema `spec-driven`), `README.md`, `plans/PLAN.md` (roadmap completado) y `plans/PLAN-001.md` (trabajo posterior), gitflow + CI/CD (`.github/workflows/`). No hay `frontend/`.
 
 ## Qué se está construyendo
 API HTTP con **Axum** que expone un CRUD sobre una cuenta de correo:
