@@ -193,7 +193,7 @@ impl SmtpSender {
     /// The TLS mode mirrors `mail-account`: `implicit` uses an implicitly
     /// encrypted connection, `starttls` upgrades in-band, and `none` disables
     /// TLS entirely (with the same warning already emitted while loading the
-    /// account). The strategy is chosen via [`tls_strategy`].
+    /// account). The strategy is chosen via `tls_strategy`.
     pub fn from_endpoint(endpoint: &MailEndpoint) -> Result<Self, SmtpError> {
         let builder = match tls_strategy(endpoint.tls) {
             TlsStrategy::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(&endpoint.host)?,

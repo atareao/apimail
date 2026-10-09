@@ -173,9 +173,9 @@ impl From<FlagError> for ImapError {
 
 /// Errors produced while fetching and parsing a single message.
 ///
-/// Every variant is stable and free of third-party error text: [`Imap`] keeps
+/// Every variant is stable and free of third-party error text: [`Self::Imap`] keeps
 /// the classification of [`ImapError`] so the HTTP layer can reuse the existing
-/// mapping, [`TooLarge`] reports the size guard and [`Unparsable`] the parser's
+/// mapping, [`Self::TooLarge`] reports the size guard and [`Self::Unparsable`] the parser's
 /// refusal.
 #[derive(Debug, thiserror::Error)]
 pub enum ParsedMessageError {
@@ -375,7 +375,7 @@ fn quote_search_string(value: &str) -> String {
 /// Criteria translated into an IMAP `SEARCH` key.
 ///
 /// Each `Some` field renders exactly one search key; an empty criteria renders
-/// `ALL`. Textual values go through [`quote_search_string`] so no user input can
+/// `ALL`. Textual values go through `quote_search_string` so no user input can
 /// inject a second command, and dates render in canonical `DD-Mon-YYYY` form.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchCriteria {
@@ -1373,7 +1373,7 @@ impl ConnectionManager {
 
     /// Ensures a live session, connecting or reconnecting as needed.
     ///
-    /// Delegates to [`ensure_session`](Self::ensure_session); this is the entry
+    /// Delegates to `ensure_session`; this is the entry
     /// point used by the IMAP status endpoint.
     pub async fn status(&self) -> Result<(), ImapError> {
         let mut guard = self.session.lock().await;
@@ -1414,8 +1414,8 @@ impl ConnectionManager {
 
     /// Lists the account's mailboxes, reusing the live session when possible.
     ///
-    /// Delegates to [`run_once`](Self::run_once): the command runs once on a
-    /// session guaranteed by [`ensure_session`](Self::ensure_session), and a
+    /// Delegates to `run_once`: the command runs once on a
+    /// session guaranteed by `ensure_session`, and a
     /// connection failure discards the cached session for the next request.
     pub async fn list_mailboxes(&self) -> Result<Vec<MailboxInfo>, ImapError> {
         self.run_once(|session| session.list_mailboxes()).await
