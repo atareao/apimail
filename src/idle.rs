@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_imap::Session;
 use async_imap::extensions::idle::IdleResponse;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::MailEndpoint;
 use crate::imap::{
@@ -24,6 +24,7 @@ use crate::imap::{
     SendFuture, build_tls_config, connect_and_login, fetch_messages, mailbox_status,
 };
 use crate::mime::{ParsedAttachment, ParsedMessage};
+use crate::queue::{NotificationQueue, StoredWatermark};
 
 /// Outcome of a bounded IDLE wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +105,7 @@ pub trait WebhookSender: Send + Sync {
 ///
 /// Attachments are listed with their metadata only; their bytes are **never**
 /// carried in the payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookPayload {
     /// Mailbox the message was delivered to.
     pub mailbox: String,
@@ -131,7 +132,7 @@ pub struct WebhookPayload {
 }
 
 /// The subset of a message envelope carried in a [`WebhookPayload`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopePayload {
     /// `From` addresses.
     pub from: Vec<AddressPayload>,
@@ -148,7 +149,7 @@ pub struct EnvelopePayload {
 }
 
 /// One envelope address carried in a [`WebhookPayload`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressPayload {
     /// Display name, if the server reported one.
     pub name: Option<String>,
@@ -160,7 +161,7 @@ pub struct AddressPayload {
 ///
 /// The attachment's bytes are deliberately absent: only the metadata is
 /// reported.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentPayload {
     /// Positional identifier within the parsed attachment list.
     pub id: u32,
@@ -417,12 +418,6 @@ impl WebhookSender for HttpWebhookSender {
 /// Bounded time [`IdleSupervisor::stop`] waits for its task before aborting it.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Total number of webhook delivery attempts (the first try plus its retries).
-const WEBHOOK_ATTEMPTS: usize = 3;
-
-/// Delays applied before the second and third webhook attempts.
-const WEBHOOK_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
-
 /// [`IdleStatus::status`] while the subscription is active.
 pub const STATUS_RUNNING: &str = "running";
 /// [`IdleStatus::status`] when the subscription is not active.
@@ -431,6 +426,13 @@ pub const STATUS_STOPPED: &str = "stopped";
 pub const LAST_ERROR_IMAP_UNAVAILABLE: &str = "imap_unavailable";
 /// [`IdleStatus::last_error`] after the webhook retries are exhausted.
 pub const LAST_ERROR_WEBHOOK_FAILED: &str = "webhook_failed";
+/// [`IdleStatus::last_error`] when the delivery queue itself is unreachable.
+pub const LAST_ERROR_QUEUE_UNAVAILABLE: &str = "queue_unavailable";
+/// How often the delivery worker checks for pending work while the queue is empty.
+pub const DELIVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Bounded attempts for a non-retryable failure before the notification is
+/// discarded and counted as failed.
+pub const POISON_ATTEMPTS: u32 = 3;
 
 /// Settings of one IDLE subscription, built from [`Config`](crate::Config).
 #[derive(Debug, Clone)]
@@ -455,9 +457,9 @@ pub enum IdleError {
 
 /// Observable state of the subscription.
 ///
-/// `last_error` is always a stable code ([`LAST_ERROR_IMAP_UNAVAILABLE`] or
-/// [`LAST_ERROR_WEBHOOK_FAILED`]) or `None`: no raw error rendering ever leaves
-/// the supervisor.
+/// `last_error` is always a stable code ([`LAST_ERROR_IMAP_UNAVAILABLE`],
+/// [`LAST_ERROR_WEBHOOK_FAILED`] or [`LAST_ERROR_QUEUE_UNAVAILABLE`]) or `None`:
+/// no raw error rendering ever leaves the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IdleStatus {
     /// [`STATUS_RUNNING`] or [`STATUS_STOPPED`].
@@ -468,12 +470,14 @@ pub struct IdleStatus {
     pub last_error: Option<&'static str>,
 }
 
-/// Running task and its shutdown channel.
+/// Running tasks and their shutdown channel.
 struct TaskHandle {
-    /// Notifies the task that it must stop.
+    /// Notifies the tasks that they must stop.
     shutdown: tokio::sync::watch::Sender<bool>,
-    /// Join handle of the supervisor task.
-    handle: tokio::task::JoinHandle<()>,
+    /// Join handle of the supervisor (observer) task.
+    observer: tokio::task::JoinHandle<()>,
+    /// Join handle of the webhook delivery worker.
+    worker: tokio::task::JoinHandle<()>,
 }
 
 /// Owns the IDLE subscription over its own dedicated IMAP connection.
@@ -491,9 +495,13 @@ pub struct IdleSupervisor {
     settings: IdleSettings,
     /// Reconnection backoff.
     backoff: Backoff,
-    /// Last failure code, shared with the task.
+    /// Backoff applied to webhook retries by the delivery worker.
+    delivery_backoff: Backoff,
+    /// Durable delivery queue drained by the worker.
+    queue: Arc<dyn NotificationQueue>,
+    /// Last failure code, shared with the tasks.
     last_error: Arc<StdMutex<Option<&'static str>>>,
-    /// Running task and its shutdown channel, if any.
+    /// Running tasks and their shutdown channel, if any.
     task: tokio::sync::Mutex<Option<TaskHandle>>,
 }
 
@@ -511,23 +519,33 @@ impl fmt::Debug for IdleSupervisor {
 }
 
 impl IdleSupervisor {
-    /// Builds a supervisor over `connector` and `webhook`.
+    /// Builds a supervisor whose delivery worker drains `queue`.
     ///
     /// Nothing is opened or scheduled until [`start`](Self::start) is called.
+    /// The `queue` is mandatory: the caller decides whether it is in memory or
+    /// persistent, so the supervisor never silently picks a storage backend.
     pub fn new(
         connector: Arc<dyn IdleConnector>,
         webhook: Arc<dyn WebhookSender>,
         settings: IdleSettings,
         backoff: Backoff,
+        queue: Arc<dyn NotificationQueue>,
     ) -> Self {
         Self {
             connector,
             webhook,
             settings,
             backoff,
+            delivery_backoff: default_delivery_backoff(),
+            queue,
             last_error: Arc::new(StdMutex::new(None)),
             task: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// The durable delivery queue drained by the worker.
+    pub fn queue(&self) -> &Arc<dyn NotificationQueue> {
+        &self.queue
     }
 
     /// Starts the subscription.
@@ -541,16 +559,18 @@ impl IdleSupervisor {
     /// A genuinely new subscription starts clean: any `last_error` left by a
     /// previous run is cleared.
     pub async fn start(&self) -> Result<IdleStatus, IdleError> {
-        if self.settings.webhook_url.is_none() {
+        let Some(webhook_url) = self.settings.webhook_url.clone() else {
             return Err(IdleError::NotConfigured);
-        }
+        };
 
         let mut task = self.task.lock().await;
         if let Some(existing) = task.as_ref() {
-            if !existing.handle.is_finished() {
+            if !existing.observer.is_finished() {
                 return Ok(self.snapshot(STATUS_RUNNING));
             }
-            // The previous task died: drop its handle so a new one can be spawned.
+            // The previous observer died: drop its handle so a new pair of tasks
+            // can be spawned. Dropping the old sender stops any worker it left
+            // behind.
             *task = None;
         }
 
@@ -559,34 +579,55 @@ impl IdleSupervisor {
         *self.last_error.lock().expect("last_error lock poisoned") = None;
 
         let (shutdown, receiver) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(run_supervisor(
-            Arc::clone(&self.connector),
+        let worker = tokio::spawn(run_delivery_worker(
+            Arc::clone(&self.queue),
             Arc::clone(&self.webhook),
+            webhook_url,
+            Arc::clone(&self.last_error),
+            self.delivery_backoff,
+            receiver.clone(),
+        ));
+        let observer = tokio::spawn(run_supervisor(
+            Arc::clone(&self.connector),
+            Arc::clone(&self.queue),
             self.settings.clone(),
             self.backoff,
             Arc::clone(&self.last_error),
             receiver,
         ));
-        *task = Some(TaskHandle { shutdown, handle });
+        *task = Some(TaskHandle {
+            shutdown,
+            observer,
+            worker,
+        });
         Ok(self.snapshot(STATUS_RUNNING))
     }
 
-    /// Stops the subscription and waits for its task, bounded by
-    /// [`STOP_TIMEOUT`]; the task is aborted if it does not finish in time.
+    /// Stops the subscription and waits for both tasks, bounded by
+    /// [`STOP_TIMEOUT`]; the tasks are aborted if they do not finish in time.
     ///
     /// Idempotent: stopping a subscription that is not running is a no-op.
     pub async fn stop(&self) -> IdleStatus {
         let handle = self.task.lock().await.take();
-        if let Some(TaskHandle { shutdown, handle }) = handle {
+        if let Some(TaskHandle {
+            shutdown,
+            observer,
+            worker,
+        }) = handle
+        {
             // Closing the connection ends IDLE; a `DONE` is sent on the normal
             // timeout path inside `wait_for_change`.
             let _ = shutdown.send(true);
-            let mut handle = handle;
-            if tokio::time::timeout(STOP_TIMEOUT, &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
+            let mut observer = observer;
+            let mut worker = worker;
+            let stopped = tokio::time::timeout(STOP_TIMEOUT, async {
+                let _ = (&mut observer).await;
+                let _ = (&mut worker).await;
+            })
+            .await;
+            if stopped.is_err() {
+                observer.abort();
+                worker.abort();
             }
         }
         self.snapshot(STATUS_STOPPED)
@@ -602,7 +643,7 @@ impl IdleSupervisor {
             .lock()
             .await
             .as_ref()
-            .map(|task| !task.handle.is_finished())
+            .map(|task| !task.observer.is_finished())
             .unwrap_or(false);
         let status = if running {
             STATUS_RUNNING
@@ -622,19 +663,24 @@ impl IdleSupervisor {
     }
 }
 
-/// Background loop: connect, watch the mailbox and notify new messages.
+/// Background loop: connect, watch the mailbox and enqueue new messages.
+///
+/// A new message is handed to the durable `queue` (never delivered inline): the
+/// delivery worker drains it on its own task. The mailbox watermark only advances
+/// after the enqueue succeeds, so a failed enqueue re-fetches the message on the
+/// next connection instead of losing it.
 async fn run_supervisor(
     connector: Arc<dyn IdleConnector>,
-    webhook: Arc<dyn WebhookSender>,
+    queue: Arc<dyn NotificationQueue>,
     settings: IdleSettings,
     backoff: Backoff,
     last_error: Arc<StdMutex<Option<&'static str>>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let Some(webhook_url) = settings.webhook_url.clone() else {
+    if settings.webhook_url.is_none() {
         // `start` guards this, but never run without a webhook.
         return;
-    };
+    }
 
     // `last_uid` deliberately lives outside the connection loop: a reconnection
     // must never skip mail that arrived while the link was down.
@@ -647,7 +693,15 @@ async fn run_supervisor(
         let mut session = match until_shutdown(&mut shutdown, connector.connect()).await {
             Some(Ok(session)) => session,
             Some(Err(_)) => {
-                if !handle_failure(&mut shutdown, &backoff, &last_error, &mut attempt).await {
+                if !handle_failure(
+                    &mut shutdown,
+                    &backoff,
+                    &last_error,
+                    LAST_ERROR_IMAP_UNAVAILABLE,
+                    &mut attempt,
+                )
+                .await
+                {
                     break 'reconnect;
                 }
                 continue 'reconnect;
@@ -659,7 +713,15 @@ async fn run_supervisor(
             match until_shutdown(&mut shutdown, session.select(settings.mailbox.clone())).await {
                 Some(Ok(status)) => status,
                 Some(Err(_)) => {
-                    if !handle_failure(&mut shutdown, &backoff, &last_error, &mut attempt).await {
+                    if !handle_failure(
+                        &mut shutdown,
+                        &backoff,
+                        &last_error,
+                        LAST_ERROR_IMAP_UNAVAILABLE,
+                        &mut attempt,
+                    )
+                    .await
+                    {
                         break 'reconnect;
                     }
                     continue 'reconnect;
@@ -667,13 +729,44 @@ async fn run_supervisor(
                 None => break 'reconnect,
             };
 
-        // The starting point is `UIDNEXT - 1`, so only mail that arrives *after*
-        // the subscription starts is reported. A change of `UIDVALIDITY`
-        // invalidates every stored UID, so the point is re-derived from the new
-        // status.
+        // The starting point is the highest UID present when the subscription
+        // first started (`UIDNEXT - 1`), or, when a persistent queue holds a
+        // watermark for the same mailbox and `UIDVALIDITY`, that stored watermark,
+        // so the mail that arrived while the service was down is still notified. A
+        // change of `UIDVALIDITY` invalidates every stored UID, so the point is
+        // re-derived from the new status.
+        //
+        // An in-memory queue never resumes: the point is always re-derived from
+        // `UIDNEXT - 1`, keeping the default behaviour intact.
         if first_select || status.uid_validity != uid_validity {
-            last_uid = status.uid_next.map_or(0, |next| next.saturating_sub(1));
-            uid_validity = status.uid_validity;
+            let resumed = if queue.is_persistent() {
+                queue.watermark().filter(|watermark| {
+                    watermark.mailbox == settings.mailbox
+                        && watermark.uid_validity == status.uid_validity
+                })
+            } else {
+                None
+            };
+            match resumed {
+                Some(watermark) => {
+                    last_uid = watermark.last_uid;
+                    uid_validity = watermark.uid_validity;
+                }
+                None => {
+                    last_uid = status.uid_next.map_or(0, |next| next.saturating_sub(1));
+                    uid_validity = status.uid_validity;
+                    if queue.is_persistent() {
+                        let watermark = StoredWatermark {
+                            mailbox: settings.mailbox.clone(),
+                            uid_validity,
+                            last_uid,
+                        };
+                        if queue.set_watermark(watermark).await.is_err() {
+                            set_last_error(&last_error, LAST_ERROR_QUEUE_UNAVAILABLE);
+                        }
+                    }
+                }
+            }
             first_select = false;
         }
 
@@ -690,7 +783,15 @@ async fn run_supervisor(
             {
                 Some(Ok(_)) => {}
                 Some(Err(_)) => {
-                    if !handle_failure(&mut shutdown, &backoff, &last_error, &mut attempt).await {
+                    if !handle_failure(
+                        &mut shutdown,
+                        &backoff,
+                        &last_error,
+                        LAST_ERROR_IMAP_UNAVAILABLE,
+                        &mut attempt,
+                    )
+                    .await
+                    {
                         break 'reconnect;
                     }
                     continue 'reconnect;
@@ -706,7 +807,15 @@ async fn run_supervisor(
             let mut messages = match fetched {
                 Some(Ok(messages)) => messages,
                 Some(Err(_)) => {
-                    if !handle_failure(&mut shutdown, &backoff, &last_error, &mut attempt).await {
+                    if !handle_failure(
+                        &mut shutdown,
+                        &backoff,
+                        &last_error,
+                        LAST_ERROR_IMAP_UNAVAILABLE,
+                        &mut attempt,
+                    )
+                    .await
+                    {
                         break 'reconnect;
                     }
                     continue 'reconnect;
@@ -727,11 +836,45 @@ async fn run_supervisor(
                     &message,
                     parsed.as_ref(),
                 );
-                if !deliver(&webhook, &webhook_url, &payload, &last_error, &mut shutdown).await {
-                    // The subscription was asked to stop while retrying.
-                    break 'reconnect;
+                match queue.enqueue(payload).await {
+                    Ok(()) => {
+                        // Durability order: the notification is enqueued first and
+                        // only then the watermark advances, so a crash can never
+                        // acknowledge mail that was never handed over.
+                        last_uid = message.uid;
+                        if queue.is_persistent() {
+                            let watermark = StoredWatermark {
+                                mailbox: settings.mailbox.clone(),
+                                uid_validity,
+                                last_uid,
+                            };
+                            match queue.set_watermark(watermark).await {
+                                Ok(()) => {
+                                    clear_last_error_if(&last_error, LAST_ERROR_QUEUE_UNAVAILABLE)
+                                }
+                                Err(_) => set_last_error(&last_error, LAST_ERROR_QUEUE_UNAVAILABLE),
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // The notification was not acknowledged: keep the old
+                        // watermark and reconnect with backoff, so the message is
+                        // re-fetched instead of lost.
+                        set_last_error(&last_error, LAST_ERROR_QUEUE_UNAVAILABLE);
+                        if !handle_failure(
+                            &mut shutdown,
+                            &backoff,
+                            &last_error,
+                            LAST_ERROR_QUEUE_UNAVAILABLE,
+                            &mut attempt,
+                        )
+                        .await
+                        {
+                            break 'reconnect;
+                        }
+                        continue 'reconnect;
+                    }
                 }
-                last_uid = message.uid;
             }
         }
     }
@@ -752,16 +895,18 @@ where
     }
 }
 
-/// Records an IMAP failure and waits the backoff delay for `attempt`.
+/// Records a failure with the stable `code` and waits the backoff delay for
+/// `attempt`.
 ///
 /// Returns `false` when the subscription was asked to stop while waiting.
 async fn handle_failure(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     backoff: &Backoff,
     last_error: &StdMutex<Option<&'static str>>,
+    code: &'static str,
     attempt: &mut u32,
 ) -> bool {
-    set_last_error(last_error, LAST_ERROR_IMAP_UNAVAILABLE);
+    set_last_error(last_error, code);
     let delay = backoff.delay(*attempt);
     let keep_watching = if delay.is_zero() {
         !*shutdown.borrow()
@@ -801,52 +946,78 @@ async fn parse_bounded(message: &Message, max_message_bytes: usize) -> Option<Pa
         .flatten()
 }
 
-/// Delivers `payload` to `url`, with bounded retries for retryable failures.
+/// Dedicated backoff for the delivery worker's webhook retries: unlimited
+/// attempts with a capped exponential delay.
+fn default_delivery_backoff() -> Backoff {
+    Backoff {
+        attempts: u32::MAX,
+        base: Duration::from_secs(1),
+        factor: 2,
+        max: Duration::from_secs(300),
+    }
+}
+
+/// Background loop: drains the queue, delivering each notification in FIFO order.
 ///
-/// On success the webhook error is cleared. When the failure is not retryable or
-/// the attempts are exhausted, [`LAST_ERROR_WEBHOOK_FAILED`] is recorded and the
-/// subscription keeps running.
-///
-/// Returns `false` when the subscription was asked to stop while waiting between
-/// retries, so the caller can unwind immediately; `true` otherwise. The retry
-/// sleeps are cancellable: a stop signal during a wait ends the retries without
-/// delivering further attempts.
-async fn deliver(
-    webhook: &Arc<dyn WebhookSender>,
-    url: &str,
-    payload: &WebhookPayload,
-    last_error: &StdMutex<Option<&'static str>>,
-    shutdown: &mut tokio::sync::watch::Receiver<bool>,
-) -> bool {
-    let mut attempts_left = WEBHOOK_ATTEMPTS;
+/// A retryable failure is retried forever with the capped `retry_backoff`; a
+/// non-retryable one is attempted up to [`POISON_ATTEMPTS`] times and then
+/// discarded, counted as failed, so a poison notification never blocks the FIFO.
+/// Every wait is cancellable with the shutdown signal: a stop returns at once.
+async fn run_delivery_worker(
+    queue: Arc<dyn NotificationQueue>,
+    webhook: Arc<dyn WebhookSender>,
+    webhook_url: String,
+    last_error: Arc<StdMutex<Option<&'static str>>>,
+    retry_backoff: Backoff,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     loop {
-        match webhook.send(url, payload).await {
-            Ok(()) => {
-                clear_last_error_if(last_error, LAST_ERROR_WEBHOOK_FAILED);
-                return true;
-            }
-            Err(error) => {
-                attempts_left -= 1;
-                if error.is_retryable() && attempts_left > 0 {
-                    let index = WEBHOOK_ATTEMPTS - attempts_left - 1;
-                    if let Some(delay) = WEBHOOK_RETRY_DELAYS.get(index) {
-                        // A stop during the retry wait aborts the delivery: the
-                        // outer loop breaks out on the `false` return.
-                        let stopped = tokio::select! {
-                            biased;
-                            _ = shutdown.changed() => true,
-                            _ = tokio::time::sleep(*delay) => false,
-                        };
-                        if stopped {
-                            return false;
-                        }
-                    }
-                    continue;
+        match queue.peek_oldest().await {
+            Ok(Some(item)) => match webhook.send(&webhook_url, &item.payload).await {
+                Ok(()) => {
+                    let _ = queue.ack(item.seq).await;
+                    clear_last_error_if(&last_error, LAST_ERROR_WEBHOOK_FAILED);
                 }
-                set_last_error(last_error, LAST_ERROR_WEBHOOK_FAILED);
-                return true;
+                Err(error) if error.is_retryable() => {
+                    set_last_error(&last_error, LAST_ERROR_WEBHOOK_FAILED);
+                    let delay = retry_backoff.delay(item.attempts.saturating_add(1));
+                    if wait_or_shutdown(&mut shutdown, delay).await {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    set_last_error(&last_error, LAST_ERROR_WEBHOOK_FAILED);
+                    if item.attempts >= POISON_ATTEMPTS {
+                        let _ = queue.discard(item.seq).await;
+                    } else if wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL).await {
+                        return;
+                    }
+                }
+            },
+            Ok(None) => {
+                if wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL).await {
+                    return;
+                }
+            }
+            Err(_) => {
+                set_last_error(&last_error, LAST_ERROR_QUEUE_UNAVAILABLE);
+                if wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL).await {
+                    return;
+                }
             }
         }
+    }
+}
+
+/// Waits `delay`, returning `true` when the shutdown signal fires first.
+async fn wait_or_shutdown(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => true,
+        _ = tokio::time::sleep(delay) => false,
     }
 }
 
@@ -871,6 +1042,7 @@ mod tests {
     use crate::config::{MailEndpoint, TlsMode};
     use crate::imap::{Address, Message, MessageEnvelope};
     use crate::mime::{ParsedAttachment, ParsedMessage};
+    use crate::queue::{QueueError, QueueLimits, QueueStats, QueuedNotification, WebhookQueue};
 
     use super::*;
 
@@ -1176,6 +1348,11 @@ mod tests {
         failing: bool,
         /// The shared script.
         script: StdMutex<IdleScript>,
+        /// The `fetch_from` starting UIDs observed, in call order.
+        fetches: StdMutex<Vec<u32>>,
+        /// Notified whenever an event is queued, so a session already waiting in
+        /// `wait_for_change` wakes up instead of missing it.
+        changed: tokio::sync::Notify,
     }
 
     /// A fake [`IdleConnector`] counting connections and scripting sessions.
@@ -1197,6 +1374,8 @@ mod tests {
                         events: events.into_iter().collect(),
                         messages,
                     }),
+                    fetches: StdMutex::new(Vec::new()),
+                    changed: tokio::sync::Notify::new(),
                 }),
             }
         }
@@ -1212,6 +1391,8 @@ mod tests {
                         events: VecDeque::new(),
                         messages: Vec::new(),
                     }),
+                    fetches: StdMutex::new(Vec::new()),
+                    changed: tokio::sync::Notify::new(),
                 }),
             }
         }
@@ -1219,6 +1400,24 @@ mod tests {
         /// Number of `connect` calls observed.
         fn connects(&self) -> usize {
             self.state.connects.load(Ordering::SeqCst)
+        }
+
+        /// Records one mailbox change carrying a single message: the message is
+        /// added to the fetchable set and a `Changed` event is queued. The two
+        /// are pushed under the same lock so a session never sees the event
+        /// before the message exists.
+        fn push_change(&self, message: Message) {
+            {
+                let mut script = self.state.script.lock().expect("script poisoned");
+                script.messages.push(message);
+                script.events.push_back(IdleEvent::Changed);
+            }
+            self.state.changed.notify_one();
+        }
+
+        /// The `fetch_from` starting UIDs observed, in call order.
+        fn fetches(&self) -> Vec<u32> {
+            self.state.fetches.lock().expect("fetches poisoned").clone()
         }
     }
 
@@ -1260,18 +1459,21 @@ mod tests {
             &mut self,
             _timeout: Duration,
         ) -> SendFuture<'_, Result<IdleEvent, ImapError>> {
-            let event = self
-                .state
-                .script
-                .lock()
-                .expect("script poisoned")
-                .events
-                .pop_front();
+            let state = Arc::clone(&self.state);
             Box::pin(async move {
-                match event {
-                    Some(event) => Ok(event),
-                    // Block forever so `stop` cancels the pending wait.
-                    None => std::future::pending::<Result<IdleEvent, ImapError>>().await,
+                loop {
+                    if let Some(event) = state
+                        .script
+                        .lock()
+                        .expect("script poisoned")
+                        .events
+                        .pop_front()
+                    {
+                        return Ok(event);
+                    }
+                    // Block until `push_change` queues an event; the shutdown
+                    // path cancels this wait from the outside.
+                    state.changed.notified().await;
                 }
             })
         }
@@ -1281,6 +1483,11 @@ mod tests {
             from_uid: u32,
             _format: FetchFormat,
         ) -> SendFuture<'_, Result<Vec<Message>, ImapError>> {
+            self.state
+                .fetches
+                .lock()
+                .expect("fetches poisoned")
+                .push(from_uid);
             let messages = {
                 let script = self.state.script.lock().expect("script poisoned");
                 let mut available: Vec<Message> = script
@@ -1309,8 +1516,10 @@ mod tests {
     struct FakeWebhook {
         /// Sink for the delivered payloads.
         deliveries: tokio::sync::mpsc::UnboundedSender<WebhookPayload>,
-        /// Configured failure, if any.
+        /// Configured failure, if any, applied to every call.
         failure: StdMutex<Option<WebhookFailure>>,
+        /// One-shot failures consumed by the next `send` calls, before `failure`.
+        script: StdMutex<VecDeque<WebhookFailure>>,
         /// Number of `send` calls so far.
         calls: AtomicUsize,
     }
@@ -1321,13 +1530,19 @@ mod tests {
             Self {
                 deliveries,
                 failure: StdMutex::new(None),
+                script: StdMutex::new(VecDeque::new()),
                 calls: AtomicUsize::new(0),
             }
         }
 
-        /// Sets (`Some`) or clears (`None`) the configured failure.
+        /// Sets (`Some`) or clears (`None`) a failure applied to every call.
         fn set_failure(&self, failure: Option<WebhookFailure>) {
             *self.failure.lock().expect("failure poisoned") = failure;
+        }
+
+        /// Queues one-shot failures consumed by the next `send` calls.
+        fn fail_next(&self, failures: impl IntoIterator<Item = WebhookFailure>) {
+            *self.script.lock().expect("script poisoned") = failures.into_iter().collect();
         }
 
         /// Number of `send` calls observed.
@@ -1343,7 +1558,12 @@ mod tests {
             payload: &'a WebhookPayload,
         ) -> SendFuture<'a, Result<(), WebhookError>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let failure = *self.failure.lock().expect("failure poisoned");
+            let failure = {
+                let mut script = self.script.lock().expect("script poisoned");
+                script
+                    .pop_front()
+                    .or_else(|| *self.failure.lock().expect("failure poisoned"))
+            };
             let result = match failure {
                 Some(WebhookFailure::Status(code)) => Err(WebhookError::Status(code)),
                 Some(WebhookFailure::Transport) => Err(WebhookError::Transport),
@@ -1435,6 +1655,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(None, 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         let error = supervisor
@@ -1455,6 +1676,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         let started = supervisor.start().await.expect("start with a webhook");
@@ -1481,6 +1703,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         let first = supervisor.start().await.expect("first start");
@@ -1510,6 +1733,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         supervisor.start().await.expect("start");
@@ -1532,6 +1756,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         supervisor.start().await.expect("start");
@@ -1576,6 +1801,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         supervisor.start().await.expect("start");
@@ -1614,6 +1840,7 @@ mod tests {
             webhook.clone(),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         supervisor.start().await.expect("start");
@@ -1644,6 +1871,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         let started = supervisor.start().await.expect("start");
@@ -1663,14 +1891,19 @@ mod tests {
         assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
     }
 
-    /// A [`TaskHandle`] whose background task has already finished.
+    /// A [`TaskHandle`] whose tasks have already finished.
     async fn finished_task_handle() -> TaskHandle {
         let (shutdown, _receiver) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(async {});
-        while !handle.is_finished() {
+        let observer = tokio::spawn(async {});
+        let worker = tokio::spawn(async {});
+        while !observer.is_finished() {
             tokio::task::yield_now().await;
         }
-        TaskHandle { shutdown, handle }
+        TaskHandle {
+            shutdown,
+            observer,
+            worker,
+        }
     }
 
     #[tokio::test]
@@ -1682,6 +1915,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         *supervisor.task.lock().await = Some(finished_task_handle().await);
@@ -1702,6 +1936,7 @@ mod tests {
             Arc::new(FakeWebhook::new(tx)),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            worker_queue(),
         );
 
         *supervisor.task.lock().await = Some(finished_task_handle().await);
@@ -1729,34 +1964,587 @@ mod tests {
         assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
     }
 
+    // --- delivery worker tests ---------------------------------------------
+
+    /// An in-memory queue with generous limits for the worker tests.
+    fn worker_queue() -> Arc<dyn NotificationQueue> {
+        Arc::new(WebhookQueue::in_memory(QueueLimits {
+            max_items: 100,
+            max_bytes: u64::MAX,
+        }))
+    }
+
+    /// A 1 ms-base backoff so worker retries stay fast in tests.
+    fn fast_worker_backoff() -> Backoff {
+        Backoff {
+            attempts: u32::MAX,
+            base: Duration::from_millis(1),
+            factor: 2,
+            max: Duration::from_millis(20),
+        }
+    }
+
+    /// Spawns a delivery worker over `queue`/`webhook`, returning its shutdown
+    /// sender and join handle.
+    fn spawn_worker(
+        queue: Arc<dyn NotificationQueue>,
+        webhook: Arc<dyn WebhookSender>,
+    ) -> (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_delivery_worker(
+            queue,
+            webhook,
+            TEST_WEBHOOK_URL.to_string(),
+            Arc::new(StdMutex::new(None)),
+            fast_worker_backoff(),
+            receiver,
+        ));
+        (shutdown, handle)
+    }
+
+    /// Signals a worker to stop and waits for it, bounded.
+    async fn stop_worker(
+        shutdown: tokio::sync::watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = shutdown.send(true);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the worker must stop promptly")
+            .expect("the worker must not panic");
+    }
+
+    /// A payload for the worker tests.
+    fn worker_payload() -> WebhookPayload {
+        WebhookPayload::from_message("INBOX", Some(1), &idle_message(1, None, None), None)
+    }
+
     #[tokio::test]
-    async fn stop_cancels_pending_webhook_retries() {
+    async fn delivery_worker_delivers_a_queued_notification() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        let queue = worker_queue();
+        let payload = worker_payload();
+        queue.enqueue(payload.clone()).await.expect("enqueue");
+
+        let (shutdown, handle) = spawn_worker(Arc::clone(&queue), webhook);
+        wait_until(Duration::from_secs(2), || async {
+            queue.stats().delivered == 1
+        })
+        .await;
+
+        let stats = queue.stats();
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(rx.recv().await.expect("one delivery"), payload);
+        stop_worker(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn delivery_worker_retries_a_retryable_failure_until_delivered() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        webhook.fail_next([WebhookFailure::Transport, WebhookFailure::Transport]);
+        let queue = worker_queue();
+        let payload = worker_payload();
+        queue.enqueue(payload.clone()).await.expect("enqueue");
+
+        let (shutdown, handle) = spawn_worker(Arc::clone(&queue), webhook.clone());
+        wait_until(Duration::from_secs(2), || async {
+            queue.stats().delivered == 1
+        })
+        .await;
+
+        let stats = queue.stats();
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.failed, 0, "a retryable failure is never discarded");
+        assert_eq!(rx.recv().await.expect("one delivery"), payload);
+        assert_eq!(webhook.calls(), 3, "two failures then a success");
+        stop_worker(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn delivery_worker_discards_a_poison_notification_after_bounded_attempts() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let messages = vec![idle_message(43, Some(text_body("x")), Some(64))];
-        let connector =
-            FakeIdleConnector::new(idle_status(Some(43)), vec![IdleEvent::Changed], messages);
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        webhook.set_failure(Some(WebhookFailure::Status(400)));
+        let queue = worker_queue();
+        queue.enqueue(worker_payload()).await.expect("enqueue");
+
+        let (shutdown, handle) = spawn_worker(Arc::clone(&queue), webhook.clone());
+        wait_until(Duration::from_secs(3), || async {
+            queue.stats().failed == 1
+        })
+        .await;
+
+        let stats = queue.stats();
+        assert_eq!(
+            stats.failed, 1,
+            "a poison notification is counted as failed"
+        );
+        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.pending, 0, "the poison notification is discarded");
+        assert_eq!(
+            webhook.calls() as u32,
+            POISON_ATTEMPTS,
+            "a non-retryable failure is attempted exactly the bounded number of times"
+        );
+        stop_worker(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_the_delivery_worker() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector = FakeIdleConnector::new(idle_status(Some(43)), Vec::new(), Vec::new());
         let webhook = Arc::new(FakeWebhook::new(tx));
         webhook.set_failure(Some(WebhookFailure::Transport));
+        let queue = worker_queue();
+        queue.enqueue(worker_payload()).await.expect("enqueue");
         let supervisor = IdleSupervisor::new(
             Arc::new(connector),
             webhook.clone(),
             idle_settings(Some(TEST_WEBHOOK_URL), 4096),
             fast_backoff(),
+            Arc::clone(&queue),
         );
 
         supervisor.start().await.expect("start");
         wait_until(Duration::from_secs(2), || async { webhook.calls() >= 1 }).await;
 
-        // The 1 s retry wait must be cancellable: `stop` returns promptly instead
-        // of waiting the retries out (or reaching its own 5 s abort).
         let stopped = tokio::time::timeout(Duration::from_secs(2), supervisor.stop())
             .await
-            .expect("stop must cancel the pending retry instead of timing out");
+            .expect("stop must cancel the delivery worker promptly");
         assert_eq!(stopped.status, STATUS_STOPPED);
-        assert!(
-            webhook.calls() <= 2,
-            "a cancelled delivery must not run every retry: {}",
-            webhook.calls()
+        assert_eq!(queue.stats().delivered, 0, "nothing was delivered");
+
+        let calls = webhook.calls();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(webhook.calls(), calls, "the worker stopped retrying");
+    }
+
+    #[tokio::test]
+    async fn supervisor_exposes_its_delivery_queue() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector = FakeIdleConnector::new(idle_status(Some(43)), Vec::new(), Vec::new());
+        let queue = worker_queue();
+        let supervisor = IdleSupervisor::new(
+            Arc::new(connector),
+            Arc::new(FakeWebhook::new(tx)),
+            idle_settings(Some(TEST_WEBHOOK_URL), 4096),
+            fast_backoff(),
+            Arc::clone(&queue),
         );
+
+        assert!(Arc::ptr_eq(supervisor.queue(), &queue));
+    }
+
+    // --- ingestion, watermark and resume tests -----------------------------
+
+    /// A feedback backoff (1 ms base) so reconnection tests stay fast.
+    fn quick_backoff() -> Backoff {
+        Backoff {
+            attempts: u32::MAX,
+            base: Duration::from_millis(1),
+            factor: 2,
+            max: Duration::from_millis(5),
+        }
+    }
+
+    /// A self-cleaning temporary directory for the persistent-queue tests.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::AtomicU64;
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "apimail-idle-test-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Generous limits for an in-memory queue used by the ingestion tests.
+    fn ingest_queue() -> Arc<WebhookQueue> {
+        Arc::new(WebhookQueue::in_memory(QueueLimits {
+            max_items: 100,
+            max_bytes: u64::MAX,
+        }))
+    }
+
+    /// A generous persistent queue bound to `path`.
+    fn persistent_queue(path: std::path::PathBuf) -> Arc<WebhookQueue> {
+        Arc::new(
+            WebhookQueue::persistent(
+                path,
+                QueueLimits {
+                    max_items: 100,
+                    max_bytes: u64::MAX,
+                },
+            )
+            .expect("a persistent queue"),
+        )
+    }
+
+    /// A [`NotificationQueue`] wrapping a real queue, with a failure switch and
+    /// a record of every `set_watermark` call.
+    struct FakeQueue {
+        /// The real queue doing the work when injection is off.
+        inner: Arc<WebhookQueue>,
+        /// When `true`, every `enqueue` fails.
+        fail_enqueue: bool,
+        /// Every `set_watermark` argument observed, in order.
+        watermark_writes: StdMutex<Vec<StoredWatermark>>,
+    }
+
+    impl FakeQueue {
+        fn new(inner: Arc<WebhookQueue>, fail_enqueue: bool) -> Self {
+            Self {
+                inner,
+                fail_enqueue,
+                watermark_writes: StdMutex::new(Vec::new()),
+            }
+        }
+
+        /// The `set_watermark` arguments observed, in order.
+        fn watermark_writes(&self) -> Vec<StoredWatermark> {
+            self.watermark_writes
+                .lock()
+                .expect("watermark writes poisoned")
+                .clone()
+        }
+    }
+
+    impl NotificationQueue for FakeQueue {
+        fn enqueue<'a>(
+            &'a self,
+            payload: WebhookPayload,
+        ) -> SendFuture<'a, Result<(), QueueError>> {
+            if self.fail_enqueue {
+                Box::pin(async { Err(QueueError::Storage) })
+            } else {
+                Box::pin(self.inner.enqueue(payload))
+            }
+        }
+
+        fn peek_oldest<'a>(
+            &'a self,
+        ) -> SendFuture<'a, Result<Option<QueuedNotification>, QueueError>> {
+            Box::pin(self.inner.peek_oldest())
+        }
+
+        fn ack<'a>(&'a self, seq: u64) -> SendFuture<'a, Result<(), QueueError>> {
+            Box::pin(self.inner.ack(seq))
+        }
+
+        fn discard<'a>(&'a self, seq: u64) -> SendFuture<'a, Result<(), QueueError>> {
+            Box::pin(self.inner.discard(seq))
+        }
+
+        fn set_watermark<'a>(
+            &'a self,
+            watermark: StoredWatermark,
+        ) -> SendFuture<'a, Result<(), QueueError>> {
+            self.watermark_writes
+                .lock()
+                .expect("watermark writes poisoned")
+                .push(watermark.clone());
+            Box::pin(self.inner.set_watermark(watermark))
+        }
+
+        fn stats(&self) -> QueueStats {
+            self.inner.stats()
+        }
+
+        fn watermark(&self) -> Option<StoredWatermark> {
+            self.inner.watermark()
+        }
+
+        fn is_persistent(&self) -> bool {
+            self.inner.is_persistent()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_message_is_enqueued_and_ingestion_never_blocks_on_the_webhook() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        // The webhook always fails: delivery can never drain the queue.
+        webhook.set_failure(Some(WebhookFailure::Transport));
+        let connector = FakeIdleConnector::new(idle_status(Some(43)), Vec::new(), Vec::new());
+        let queue = ingest_queue();
+        let supervisor = IdleSupervisor::new(
+            Arc::new(connector.clone()),
+            webhook.clone(),
+            idle_settings(Some(TEST_WEBHOOK_URL), 4096),
+            quick_backoff(),
+            queue.clone(),
+        );
+
+        supervisor.start().await.expect("start");
+
+        connector.push_change(idle_message(44, Some(text_body("first")), Some(64)));
+        wait_until(Duration::from_secs(2), || async {
+            queue.stats().pending == 1
+        })
+        .await;
+
+        // The webhook is failing, yet the subscription keeps ingesting.
+        connector.push_change(idle_message(45, Some(text_body("second")), Some(64)));
+        wait_until(Duration::from_secs(2), || async {
+            queue.stats().pending == 2
+        })
+        .await;
+
+        assert_eq!(supervisor.status().await.status, STATUS_RUNNING);
+        // The worker drains on its own task; wait for its first (failing)
+        // attempt instead of assuming it already ran.
+        wait_until(Duration::from_secs(2), || async { webhook.calls() >= 1 }).await;
+        assert_eq!(queue.stats().delivered, 0, "nothing can be delivered");
+
+        assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn the_watermark_advances_only_after_an_enqueue() {
+        let dir = TempDir::new("watermark");
+        let queue = persistent_queue(dir.path().join("queue.jsonl"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        webhook.set_failure(Some(WebhookFailure::Transport));
+        let connector = FakeIdleConnector::new(
+            idle_status(Some(100)),
+            vec![IdleEvent::Changed],
+            vec![
+                idle_message(100, Some(text_body("a")), Some(64)),
+                idle_message(101, Some(text_body("b")), Some(64)),
+            ],
+        );
+        let supervisor = IdleSupervisor::new(
+            Arc::new(connector),
+            webhook,
+            idle_settings(Some(TEST_WEBHOOK_URL), 4096),
+            quick_backoff(),
+            queue.clone(),
+        );
+
+        supervisor.start().await.expect("start");
+
+        wait_until(Duration::from_secs(2), || async {
+            queue
+                .watermark()
+                .is_some_and(|watermark| watermark.last_uid == 101)
+        })
+        .await;
+
+        let watermark = queue.watermark().expect("a watermark must be persisted");
+        assert_eq!(watermark.mailbox, "INBOX");
+        assert_eq!(watermark.uid_validity, Some(7));
+        assert_eq!(
+            watermark.last_uid, 101,
+            "the watermark must end at the last enqueued message"
+        );
+
+        assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_watermark_resumes_from_the_stored_uid() {
+        let dir = TempDir::new("resume");
+        let queue = persistent_queue(dir.path().join("queue.jsonl"));
+        queue
+            .set_watermark(StoredWatermark {
+                mailbox: "INBOX".to_string(),
+                uid_validity: Some(7),
+                last_uid: 42,
+            })
+            .await
+            .expect("seed the watermark");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        webhook.set_failure(Some(WebhookFailure::Transport));
+        let connector = FakeIdleConnector::new(
+            idle_status(Some(100)),
+            vec![IdleEvent::Changed],
+            vec![idle_message(43, Some(text_body("resumed")), Some(64))],
+        );
+        let supervisor = IdleSupervisor::new(
+            Arc::new(connector.clone()),
+            webhook,
+            idle_settings(Some(TEST_WEBHOOK_URL), 4096),
+            quick_backoff(),
+            queue.clone(),
+        );
+
+        supervisor.start().await.expect("start");
+
+        wait_until(Duration::from_secs(2), || async {
+            connector.fetches().contains(&43)
+        })
+        .await;
+
+        let fetches = connector.fetches();
+        assert!(
+            fetches.contains(&43),
+            "resume must fetch from the watermark: {fetches:?}"
+        );
+        assert!(
+            !fetches.contains(&100),
+            "resume must not skip to UIDNEXT: {fetches:?}"
+        );
+
+        assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_queue_resets_to_uidnext_and_does_not_resume() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        let connector = FakeIdleConnector::new(
+            idle_status(Some(100)),
+            vec![IdleEvent::Changed],
+            vec![idle_message(100, Some(text_body("new")), Some(64))],
+        );
+        let queue: Arc<dyn NotificationQueue> = ingest_queue();
+        let supervisor = IdleSupervisor::new(
+            Arc::new(connector.clone()),
+            webhook,
+            idle_settings(Some(TEST_WEBHOOK_URL), 4096),
+            quick_backoff(),
+            queue,
+        );
+
+        supervisor.start().await.expect("start");
+
+        wait_until(Duration::from_secs(2), || async {
+            connector.fetches().contains(&100)
+        })
+        .await;
+
+        let fetches = connector.fetches();
+        assert!(
+            fetches.contains(&100),
+            "an in-memory queue must fetch from UIDNEXT: {fetches:?}"
+        );
+        assert!(
+            !fetches.contains(&99),
+            "an in-memory queue must never resume: {fetches:?}"
+        );
+
+        assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn a_failed_enqueue_records_queue_unavailable_without_advancing_the_watermark() {
+        let dir = TempDir::new("enqueue-fail");
+        let inner = persistent_queue(dir.path().join("queue.jsonl"));
+        inner
+            .set_watermark(StoredWatermark {
+                mailbox: "INBOX".to_string(),
+                uid_validity: Some(7),
+                last_uid: 42,
+            })
+            .await
+            .expect("seed the watermark");
+        let fake = Arc::new(FakeQueue::new(Arc::clone(&inner), true));
+        let queue: Arc<dyn NotificationQueue> = fake.clone();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        let connector = FakeIdleConnector::new(
+            idle_status(Some(100)),
+            vec![IdleEvent::Changed],
+            vec![idle_message(43, Some(text_body("x")), Some(64))],
+        );
+        let supervisor = IdleSupervisor::new(
+            Arc::new(connector),
+            webhook,
+            idle_settings(Some(TEST_WEBHOOK_URL), 4096),
+            quick_backoff(),
+            queue,
+        );
+
+        supervisor.start().await.expect("start");
+
+        wait_until(Duration::from_secs(2), || async {
+            supervisor.status().await.last_error == Some(LAST_ERROR_QUEUE_UNAVAILABLE)
+        })
+        .await;
+
+        assert_eq!(
+            inner.watermark().map(|watermark| watermark.last_uid),
+            Some(42),
+            "a failed enqueue must not advance the watermark"
+        );
+        assert!(
+            fake.watermark_writes().is_empty(),
+            "no watermark write must be attempted"
+        );
+
+        assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_queue_never_writes_a_watermark() {
+        let fake = Arc::new(FakeQueue::new(
+            WebhookQueue::in_memory(QueueLimits {
+                max_items: 100,
+                max_bytes: u64::MAX,
+            })
+            .into(),
+            false,
+        ));
+        let queue: Arc<dyn NotificationQueue> = fake.clone();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let webhook = Arc::new(FakeWebhook::new(tx));
+        webhook.set_failure(Some(WebhookFailure::Transport));
+        let connector = FakeIdleConnector::new(
+            idle_status(Some(100)),
+            vec![IdleEvent::Changed],
+            vec![idle_message(100, Some(text_body("x")), Some(64))],
+        );
+        let supervisor = IdleSupervisor::new(
+            Arc::new(connector),
+            webhook,
+            idle_settings(Some(TEST_WEBHOOK_URL), 4096),
+            quick_backoff(),
+            queue,
+        );
+
+        supervisor.start().await.expect("start");
+
+        wait_until(Duration::from_secs(2), || async {
+            fake.stats().pending == 1
+        })
+        .await;
+        // Give the supervisor a beat in case it would write a watermark late.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            fake.watermark_writes().is_empty(),
+            "an in-memory queue must never persist a watermark"
+        );
+
+        assert_eq!(supervisor.stop().await.status, STATUS_STOPPED);
     }
 }

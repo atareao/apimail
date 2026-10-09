@@ -128,6 +128,35 @@ otro esquema o un carácter de control provoca un **error de arranque**.
 `INBOX`. `APIMAIL_WEBHOOK_TIMEOUT_SECS` debe ser un entero **mayor que cero**; `0` o un
 valor no numérico provocan un **error de arranque**, sin *fallback* silencioso.
 
+#### Cola de entrega duradera
+
+Las notificaciones **no** se entregan en línea: cada mensaje nuevo se **encola** en una
+cola de entrega y un *worker* la drena en orden FIFO. La entrega es **at-least-once**: si
+el webhook falla, el aviso se reintenta con *backoff* exponencial acotado **hasta
+lograrlo**, de modo que una caída del webhook **nunca pierde** una notificación ni
+bloquea la ingesta. Como contrapartida, el webhook puede recibir **duplicados**: el
+receptor debe desduplicarlos con `(mailbox, uid_validity, uid)`, que el payload ya
+incluye.
+
+| Variable                   | Descripción                                        | Valor por defecto   |
+| -------------------------- | -------------------------------------------------- | ------------------- |
+| `APIMAIL_QUEUE_PATH`       | Fichero de la cola duradera (**opcional**)         | — (cola en memoria) |
+| `APIMAIL_QUEUE_MAX_ITEMS`  | Máximo de notificaciones pendientes                | `1000`              |
+| `APIMAIL_QUEUE_MAX_BYTES`  | Máximo de bytes vivos en la cola                   | `67108864` (64 MiB) |
+
+`APIMAIL_QUEUE_PATH` es **opcional**: sin ella la cola vive **en memoria** y no se
+escribe nada a disco. Cuando se define, la cola y el *watermark* del buzón se guardan en
+ese fichero con permisos `0600`, la suscripción **se reanuda** desde el watermark guardado
+al arrancar (notificando lo que llegó mientras el servicio estaba caído) y una ruta que no
+se pueda crear, abrir o escribir provoca un **error de arranque** (menciona la variable,
+sin *fallback* silencioso). Ese fichero **nunca** contiene credenciales ni texto de error
+de terceros.
+
+`APIMAIL_QUEUE_MAX_ITEMS` (defecto `1000`) y `APIMAIL_QUEUE_MAX_BYTES` (defecto
+`67108864`, 64 MiB) acotan la cola; al superarlos se **descarta la notificación pendiente
+más antigua** y se incrementa el contador `dropped`. Ambos deben ser enteros **mayores que
+cero**; un valor `0` o no numérico provoca un **error de arranque**.
+
 Puertos por defecto **derivados del modo TLS** (si no se fija `..._PORT`):
 
 | Modo TLS   | IMAP  | SMTP  |
@@ -780,10 +809,10 @@ curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
 
 ### Recepción en tiempo real (IDLE) (protegido)
 
-Estas tres rutas controlan una suscripción `IDLE` (RFC 2177) que vigila **un** buzón
+Estas cuatro rutas controlan una suscripción `IDLE` (RFC 2177) que vigila **un** buzón
 (`APIMAIL_IDLE_MAILBOX`, por defecto `INBOX`) sobre su **propia** conexión IMAP dedicada
-—sin interferir con la sesión compartida del resto de rutas— y hace un `POST` al webhook
-configurado cada vez que llega correo nuevo. Requieren la API key.
+—sin interferir con la sesión compartida del resto de rutas— y entrega al webhook
+configurado cada correo nuevo **a través de la cola duradera**. Requieren la API key.
 
 `POST /api/idle/start` arranca la suscripción. Es **idempotente**: si ya está en marcha
 devuelve el mismo cuerpo sin abrir una segunda conexión. Respuesta `200 OK` con
@@ -811,13 +840,43 @@ el **código estable** del último fallo o `null`:
 
 - `null` — la última operación tuvo éxito.
 - `"imap_unavailable"` — la conexión IMAP cayó; se reintenta con backoff.
-- `"webhook_failed"` — se agotaron los reintentos de entrega al webhook.
+- `"webhook_failed"` — la entrega al webhook falló; se reintenta con backoff.
+- `"queue_unavailable"` — la cola no se pudo leer o escribir; la ingesta no reconoce el mensaje.
 
 Las respuestas de `start`/`stop` son *snapshots* del mismo objeto, de modo que también
 incluyen `last_error` (con el mismo significado). Los fallos de IMAP y de webhook **no**
 devuelven código HTTP: la suscripción **sigue viva** y reconecta/reintenta.
 
+#### Estado de la cola de entrega
+
+```http
+GET /api/idle/queue
+```
+
+Informa del estado observable de la cola de entrega. Requiere la API key. Respuesta
+`200 OK` con `Content-Type: application/json`:
+
+```json
+{
+  "persistent": true,
+  "pending": 0,
+  "delivered": 42,
+  "dropped": 0,
+  "failed": 0,
+  "oldest_pending_secs": null
+}
+```
+
+- `persistent` — `true` si la cola se respalda en `APIMAIL_QUEUE_PATH`, `false` si vive en memoria.
+- `pending` — notificaciones aún no entregadas.
+- `delivered` — notificaciones entregadas al webhook.
+- `dropped` — descartadas por superar `APIMAIL_QUEUE_MAX_ITEMS`/`APIMAIL_QUEUE_MAX_BYTES`.
+- `failed` — descartadas tras agotar los intentos acotados (fallo no reintentable).
+- `oldest_pending_secs` — antigüedad, en segundos, de la notificación pendiente más antigua, o `null` si no hay ninguna.
+
 ```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/idle/queue
 curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
   http://127.0.0.1:3000/api/idle/start
 curl -fsS -H "Authorization: Bearer una-clave-secreta" \
@@ -833,10 +892,12 @@ Códigos de error (modelo `{"error":...,"message":...}`):
 
 #### Notificación al webhook
 
-**Solo se notifica el correo que llega después de arrancar** la suscripción (el primer
-`UID` notificado es `UIDNEXT`); el correo ya presente en el buzón al arrancar no se
-notifica. Al detectar un mensaje nuevo se hace un `POST` con
-`Content-Type: application/json` al webhook. El payload lleva los **metadatos**
+Sin cola persistente **solo se notifica el correo que llega después de arrancar** la
+suscripción (el primer `UID` notificado es `UIDNEXT`); el correo ya presente en el buzón al
+arrancar no se notifica. Con `APIMAIL_QUEUE_PATH` y un *watermark* guardado para el mismo
+buzón y `UIDVALIDITY`, la suscripción **reanuda** desde ese punto y notifica lo que llegó
+mientras el servicio estaba caído. Cada mensaje nuevo se **encola** y el *worker* hace un
+`POST` con `Content-Type: application/json` al webhook. El payload lleva los **metadatos**
 (`mailbox`, `uid`, `uid_validity`, `flags`, `size`, `internal_date`, `envelope`) y, cuando
 el mensaje cabe en `APIMAIL_MAX_MESSAGE_BYTES` y su MIME se puede parsear, el `text`/`html`
 y la **lista de adjuntos** (`id`, `filename`, `content_type`, `size`, `inline`,
@@ -844,9 +905,12 @@ y la **lista de adjuntos** (`id`, `filename`, `content_type`, `size`, `inline`,
 Si no cabe en el límite o no se puede parsear, `parsed` es `false`, con `text`/`html` a
 `null` y `attachments` vacío, y solo se envían los metadatos.
 
-La entrega se reintenta de forma acotada (1 intento + 2 reintentos con espera corta): solo
-se reintentan los fallos de transporte y los estados `5xx`/`429`. La suscripción es
-*at-most-once*: el objetivo es despertar automatizaciones, no sustituir un `fetch` fiable.
+La entrega es **at-least-once**: el *worker* reintenta los fallos de transporte y los
+estados `5xx`/`429` con *backoff* exponencial acotado **hasta entregarlos**, de modo que una
+caída del webhook no pierde notificaciones ni bloquea la ingesta; el webhook puede recibir
+**duplicados** y el receptor los desduplica con `(mailbox, uid_validity, uid)`. Un estado
+`4xx` (salvo `429`) es un rechazo definitivo: se intenta un número acotado de veces y luego
+se descarta, contándolo como `failed`, para no bloquear la cola.
 
 ## Licencia
 

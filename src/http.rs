@@ -272,12 +272,12 @@
 //!
 //! # IDLE contract
 //!
-//! `POST /api/idle/start`, `POST /api/idle/stop` and `GET /api/idle/status` are
-//! protected by [`require_api_key`]. They control the IDLE subscription, which
-//! watches a single configured mailbox (`APIMAIL_IDLE_MAILBOX`, default `INBOX`)
-//! over its own dedicated IMAP connection and POSTs every newly arrived message
-//! to `APIMAIL_WEBHOOK_URL`, without interfering with the shared session used by
-//! the other routes.
+//! `POST /api/idle/start`, `POST /api/idle/stop`, `GET /api/idle/status` and
+//! `GET /api/idle/queue` are protected by [`require_api_key`]. They control the
+//! IDLE subscription, which watches a single configured mailbox
+//! (`APIMAIL_IDLE_MAILBOX`, default `INBOX`) over its own dedicated IMAP
+//! connection and POSTs every newly arrived message to `APIMAIL_WEBHOOK_URL`,
+//! without interfering with the shared session used by the other routes.
 //!
 //! - `POST /api/idle/start` starts the subscription and returns HTTP `200`,
 //!   `Content-Type: application/json` and
@@ -289,6 +289,13 @@
 //! - `GET /api/idle/status` returns HTTP `200` with the current `status`
 //!   (`"running"` or `"stopped"`), the watched `mailbox` and `last_error` (a
 //!   stable code such as `"imap_unavailable"`/`"webhook_failed"`, or `null`).
+//! - `GET /api/idle/queue` returns HTTP `200` with the delivery queue's
+//!   observable state: `persistent` (whether the queue is backed by
+//!   `APIMAIL_QUEUE_PATH`), `pending` (notifications still undelivered),
+//!   `delivered`, `dropped` (evicted because a limit was exceeded), `failed`
+//!   (discarded after bounded attempts) and `oldest_pending_secs` (the age, in
+//!   seconds, of the oldest pending notification, or `null` when none is
+//!   pending).
 //!
 //! Failures use the shared `{"error":...,"message":...}` envelope:
 //!
@@ -322,6 +329,7 @@ use crate::imap::{
     SystemFlag, TokioImapConnector,
 };
 use crate::mime::ParsedAttachment;
+use crate::queue::{NotificationQueue, QueueError, WebhookQueue};
 use crate::smtp::{
     MailSender, MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage, SmtpError,
     SmtpSender,
@@ -338,9 +346,10 @@ const BODY_LIMIT_SLACK: usize = 64 * 1024;
 
 /// Errors produced while building [`AppState`].
 ///
-/// It wraps both service constructors so a single `Result` covers the real SMTP
-/// transport and the IMAP connector, neither of which opens a connection at
-/// construction time.
+/// It wraps the service constructors and the delivery queue so a single
+/// `Result` covers the real SMTP transport, the IMAP connector and the queue
+/// file, none of which opens a connection or performs I/O beyond the queue file
+/// at construction time.
 #[derive(Debug, thiserror::Error)]
 pub enum AppStateError {
     /// Building the SMTP transport failed.
@@ -349,6 +358,9 @@ pub enum AppStateError {
     /// Building the IMAP connector failed.
     #[error(transparent)]
     Imap(#[from] ImapError),
+    /// Building the delivery queue failed (an unusable `APIMAIL_QUEUE_PATH`).
+    #[error(transparent)]
+    Queue(#[from] QueueError),
 }
 
 impl AppStateError {
@@ -358,11 +370,16 @@ impl AppStateError {
     /// The wrapped [`SmtpError`]/[`ImapError`] already group their variants into
     /// stable, credential-free families, so this never propagates the raw
     /// [`Display`](std::fmt::Display) text produced by `lettre`, `async-imap`,
-    /// rustls or the operating system.
+    /// rustls or the operating system. A queue failure names the variable but
+    /// never the path.
     pub fn public_message(&self) -> String {
         match self {
             Self::Smtp(error) => error.public_message().to_string(),
             Self::Imap(error) => error.public_message().to_string(),
+            Self::Queue(_) => {
+                "invalid APIMAIL_QUEUE_PATH: the queue file could not be created or written"
+                    .to_string()
+            }
         }
     }
 
@@ -371,6 +388,7 @@ impl AppStateError {
         match self {
             Self::Smtp(_) => "smtp",
             Self::Imap(_) => "imap",
+            Self::Queue(_) => "queue",
         }
     }
 }
@@ -424,12 +442,29 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// Builds the delivery queue from `config`, failing closed.
+///
+/// With `APIMAIL_QUEUE_PATH` set the queue is persistent: any I/O failure (a
+/// path that cannot be created, opened or written) is reported as
+/// [`QueueError`] and aborts startup, naming the variable. Without a path the
+/// queue lives in memory only and nothing is ever written to disk. Either way
+/// the concrete [`WebhookQueue`] is erased behind the [`NotificationQueue`]
+/// trait the supervisor and worker depend on.
+fn build_queue(config: &Config) -> Result<Arc<dyn NotificationQueue>, QueueError> {
+    let limits = config.queue_limits();
+    match &config.queue_path {
+        Some(path) => Ok(Arc::new(WebhookQueue::persistent(path.clone(), limits)?)),
+        None => Ok(Arc::new(WebhookQueue::in_memory(limits))),
+    }
+}
+
 impl AppState {
     /// Builds the application state from the loaded [`Config`].
     ///
-    /// This constructs the real SMTP transport and the real IMAP connector from
-    /// `config` — it opens no connection, but building either (or resolving its
-    /// TLS configuration) can fail, hence the `Result`.
+    /// This constructs the real SMTP transport, the real IMAP connector and the
+    /// delivery queue from `config` — it opens no connection, but building any of
+    /// them (resolving a TLS configuration, or creating the queue file) can fail,
+    /// hence the `Result`.
     ///
     /// The expected key is hashed to a fixed-size digest here (not on every
     /// request) so the middleware can compare two equal-length buffers in
@@ -443,7 +478,7 @@ impl AppState {
         let mailer: Arc<dyn MailSender> =
             Arc::new(SmtpSender::from_endpoint(&config.account.smtp)?);
         let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
-        Ok(Self::with_services(config, mailer, connector))
+        Self::with_services(config, mailer, connector)
     }
 
     /// Builds the application state with an injected [`MailSender`].
@@ -458,7 +493,7 @@ impl AppState {
         mailer: Arc<dyn MailSender>,
     ) -> Result<Self, AppStateError> {
         let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
-        Ok(Self::with_services(config, mailer, connector))
+        Self::with_services(config, mailer, connector)
     }
 
     /// Builds the application state with both services injected.
@@ -466,12 +501,14 @@ impl AppState {
     /// Used by tests to exercise the HTTP layer without touching the network. It
     /// delegates to [`with_idle`](Self::with_idle) with a real
     /// [`TokioIdleConnector`] and an [`HttpWebhookSender`], both of which are
-    /// infallible to build (their TLS/HTTP clients are resolved lazily).
+    /// infallible to build (their TLS/HTTP clients are resolved lazily). The
+    /// delivery queue is built from `config` and can fail closed when
+    /// `APIMAIL_QUEUE_PATH` is unusable, hence the `Result`.
     pub fn with_services(
         config: &Config,
         mailer: Arc<dyn MailSender>,
         imap_connector: Arc<dyn ImapConnector>,
-    ) -> Self {
+    ) -> Result<Self, AppStateError> {
         let idle_connector: Arc<dyn IdleConnector> = Arc::new(TokioIdleConnector::new(
             config.account.imap.clone(),
             config.imap_timeout,
@@ -495,13 +532,18 @@ impl AppState {
     /// `config` (`APIMAIL_WEBHOOK_URL`, `APIMAIL_IDLE_MAILBOX`,
     /// `APIMAIL_WEBHOOK_TIMEOUT_SECS` and `APIMAIL_MAX_MESSAGE_BYTES`) but is not
     /// started until `POST /api/idle/start`.
+    ///
+    /// The delivery queue is built from `config` with [`build_queue`], so an
+    /// unusable `APIMAIL_QUEUE_PATH` fails the whole construction instead of
+    /// silently degrading to an in-memory queue.
     pub fn with_idle(
         config: &Config,
         mailer: Arc<dyn MailSender>,
         imap_connector: Arc<dyn ImapConnector>,
         idle_connector: Arc<dyn IdleConnector>,
         webhook_sender: Arc<dyn WebhookSender>,
-    ) -> Self {
+    ) -> Result<Self, AppStateError> {
+        let queue = build_queue(config)?;
         let idle = Arc::new(IdleSupervisor::new(
             idle_connector,
             webhook_sender,
@@ -512,8 +554,9 @@ impl AppState {
                 max_message_bytes: config.max_message_bytes,
             },
             Backoff::default(),
+            queue,
         ));
-        Self {
+        Ok(Self {
             name: APP_NAME,
             version: APP_VERSION,
             api_key_hash: Sha256::digest(config.api_key.as_bytes()).into(),
@@ -534,7 +577,7 @@ impl AppState {
             imap: Arc::new(ConnectionManager::new(imap_connector, Backoff::default())),
             imap_tls: config.account.imap.tls,
             idle,
-        }
+        })
     }
 
     /// The IDLE subscription supervisor, controlled by the `/api/idle/*` routes.
@@ -2052,6 +2095,15 @@ async fn idle_status(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(status)).into_response()
 }
 
+/// `GET /api/idle/queue` handler: reports the delivery queue's observable state.
+///
+/// The [`QueueStats`](crate::queue::QueueStats) snapshot already derives
+/// `Serialize`, so it is returned verbatim: `persistent`, `pending`,
+/// `delivered`, `dropped`, `failed` and `oldest_pending_secs`.
+async fn idle_queue(State(state): State<AppState>) -> Response {
+    (StatusCode::OK, Json(state.idle().queue().stats())).into_response()
+}
+
 /// Authorization middleware: rejects requests without a valid `Bearer` API key.
 async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if is_authorized(&request, &state.api_key_hash) {
@@ -2111,6 +2163,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/idle/start", post(idle_start))
         .route("/api/idle/stop", post(idle_stop))
         .route("/api/idle/status", get(idle_status))
+        .route("/api/idle/queue", get(idle_queue))
         .route("/api/mailboxes", get(list_mailboxes))
         .route("/api/mailboxes/select", post(select_mailbox))
         .route(
@@ -2176,5 +2229,19 @@ mod tests {
         assert_eq!(imap_tls.public_message(), "IMAP TLS handshake failed");
         assert!(!imap_tls.public_message().contains("internal.example"));
         assert_eq!(imap_tls.kind(), "imap");
+    }
+
+    #[test]
+    fn queue_error_public_message_names_the_variable_and_kind_is_stable() {
+        let error = AppStateError::Queue(crate::queue::QueueError::Storage);
+        assert_eq!(
+            error.public_message(),
+            "invalid APIMAIL_QUEUE_PATH: the queue file could not be created or written"
+        );
+        assert!(
+            error.public_message().contains("APIMAIL_QUEUE_PATH"),
+            "the message must name the offending variable"
+        );
+        assert_eq!(error.kind(), "queue");
     }
 }
