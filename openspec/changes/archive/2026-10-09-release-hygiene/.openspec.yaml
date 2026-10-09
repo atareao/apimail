@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-09
+goal: Sincronizar Cargo.lock al liberar y excluir los artefactos de proceso del paquete de crates.io
+skip_specs: true
