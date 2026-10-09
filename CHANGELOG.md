@@ -1,10 +1,34 @@
 # Changelog
+## [0.4.0] - 2026-10-09
+
+### Bug Fixes
+
+- A blank mail port counts as unset
+
+### Documentation
+
+- Stop pinning a real version in the health example
+- Propose treating a blank mail port as unset
+- Archive blank-port-as-absent
+- Archive the container-image change
+
+### Features
+
+- Distribuir apimail como imagen de contenedor
+
+### Miscellaneous Tasks
+
+- Keep the container infra out of the published crate
 ## [0.3.2] - 2026-10-09
 
 ### Documentation
 
 - Align the health example and PLAN-001 with reality
 - Describe what apimail actually does on crates.io
+
+### Miscellaneous Tasks
+
+- Release v0.3.2
 ## [0.3.1] - 2026-10-09
 
 ### Bug Fixes
