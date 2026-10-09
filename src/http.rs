@@ -351,6 +351,30 @@ pub enum AppStateError {
     Imap(#[from] ImapError),
 }
 
+impl AppStateError {
+    /// Stable, log-safe description; delegates to the wrapped error's public
+    /// message.
+    ///
+    /// The wrapped [`SmtpError`]/[`ImapError`] already group their variants into
+    /// stable, credential-free families, so this never propagates the raw
+    /// [`Display`](std::fmt::Display) text produced by `lettre`, `async-imap`,
+    /// rustls or the operating system.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Smtp(error) => error.public_message().to_string(),
+            Self::Imap(error) => error.public_message().to_string(),
+        }
+    }
+
+    /// Stable machine-filterable tag, for **logs only**.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Smtp(_) => "smtp",
+            Self::Imap(_) => "imap",
+        }
+    }
+}
+
 /// Shared state exposed to handlers.
 ///
 /// The configured API key is stored only as its SHA-256 digest and the field is
@@ -2117,4 +2141,40 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .merge(protected)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_state_error_public_message_never_leaks_third_party_text() {
+        // SMTP delivery: the server response carries a host name that must not
+        // reach the log-safe message.
+        let smtp = AppStateError::Smtp(SmtpError::Delivery(
+            "550 rejected by internal.example".into(),
+        ));
+        assert_eq!(smtp.public_message(), "SMTP delivery failed");
+        assert!(!smtp.public_message().contains("internal.example"));
+        assert_eq!(smtp.kind(), "smtp");
+
+        // IMAP login: the third-party text embeds a user and a host name.
+        let imap_login = AppStateError::Imap(ImapError::Login(
+            "auth failed for user@internal.example".into(),
+        ));
+        assert_eq!(
+            imap_login.public_message(),
+            "IMAP authentication or command failed"
+        );
+        assert!(!imap_login.public_message().contains("internal.example"));
+        assert_eq!(imap_login.kind(), "imap");
+
+        // IMAP TLS: the inner text embeds a host name too.
+        let imap_tls = AppStateError::Imap(ImapError::Tls(
+            "certificate for internal.example invalid".into(),
+        ));
+        assert_eq!(imap_tls.public_message(), "IMAP TLS handshake failed");
+        assert!(!imap_tls.public_message().contains("internal.example"));
+        assert_eq!(imap_tls.kind(), "imap");
+    }
 }

@@ -280,3 +280,56 @@ fn starts_and_serves_health_when_imap_is_unreachable() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// An invalid value must never be echoed to stderr: it may carry a credential.
+#[test]
+fn invalid_value_is_not_echoed_in_stderr() {
+    let output = configured_command()
+        .env("APIMAIL_PORT", "not-a-port-secret-value")
+        .output()
+        .expect("failed to spawn apimail binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit, got {:?}",
+        output.status
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("APIMAIL_PORT"),
+        "stderr should mention the variable, got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("not-a-port-secret-value"),
+        "stderr must not echo the raw value, got: {stderr:?}"
+    );
+}
+
+/// A malformed webhook URL may embed userinfo; the credential must not reach stderr.
+#[test]
+fn invalid_webhook_url_credentials_are_not_echoed_in_stderr() {
+    let output = configured_command()
+        .env(
+            "APIMAIL_WEBHOOK_URL",
+            "ftp://user:s3cret-token@hooks.example.com/incoming",
+        )
+        .output()
+        .expect("failed to spawn apimail binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit, got {:?}",
+        output.status
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("APIMAIL_WEBHOOK_URL"),
+        "stderr should mention the variable, got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("s3cret-token"),
+        "stderr must not echo the credential, got: {stderr:?}"
+    );
+}

@@ -167,6 +167,37 @@ pub enum AccountError {
     },
 }
 
+impl AccountError {
+    /// Stable, log-safe description: names the variable, never its value.
+    ///
+    /// Unlike [`Display`](std::fmt::Display), which can echo the offending raw
+    /// value, this accessor is safe to record in logs and to return to clients:
+    /// it names the affected environment variable (our own identifier) but never
+    /// embeds the value, a credential or any third-party text.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::MissingValue { name } => {
+                format!("missing {name}: a non-empty value is required")
+            }
+            Self::InvalidPort { name, .. } => {
+                format!("invalid {name}: expected a number between 1 and 65535")
+            }
+            Self::InvalidTls { name, .. } => {
+                format!("invalid {name}: expected one of implicit, starttls or none")
+            }
+        }
+    }
+
+    /// Stable machine-filterable tag, for **logs only**.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::MissingValue { .. } => "missing_value",
+            Self::InvalidPort { .. } => "invalid_port",
+            Self::InvalidTls { .. } => "invalid_tls",
+        }
+    }
+}
+
 /// Reads a required, non-empty variable or fails with
 /// [`AccountError::MissingValue`].
 ///
@@ -335,6 +366,60 @@ pub enum ConfigError {
     /// The mail account could not be loaded.
     #[error(transparent)]
     Account(#[from] AccountError),
+}
+
+impl ConfigError {
+    /// Stable, log-safe description that never echoes a configuration value.
+    ///
+    /// Unlike [`Display`](std::fmt::Display), which interpolates the offending
+    /// raw value (and, for [`Account`](Self::Account), may carry third-party
+    /// text), this accessor is safe to record in logs and to return to clients:
+    /// it names the affected environment variable but never embeds the value, a
+    /// credential or any third-party text.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::InvalidPort { .. } => {
+                "invalid APIMAIL_PORT: expected a number between 0 and 65535".to_string()
+            }
+            Self::MissingApiKey => {
+                "missing APIMAIL_API_KEY: a non-empty API key is required to start the service"
+                    .to_string()
+            }
+            Self::InvalidMaxAttachmentBytes { .. } => {
+                "invalid APIMAIL_MAX_ATTACHMENT_BYTES: expected a positive number of bytes"
+                    .to_string()
+            }
+            Self::InvalidMaxMessageBytes { .. } => {
+                "invalid APIMAIL_MAX_MESSAGE_BYTES: expected a positive number of bytes".to_string()
+            }
+            Self::InvalidWebhookUrl { .. } => {
+                "invalid APIMAIL_WEBHOOK_URL: expected an absolute http or https URL".to_string()
+            }
+            Self::InvalidWebhookTimeout { .. } => {
+                "invalid APIMAIL_WEBHOOK_TIMEOUT_SECS: expected a positive number of seconds"
+                    .to_string()
+            }
+            Self::InvalidImapTimeout { .. } => {
+                "invalid APIMAIL_IMAP_TIMEOUT_SECS: expected a positive number of seconds"
+                    .to_string()
+            }
+            Self::Account(error) => error.public_message(),
+        }
+    }
+
+    /// Stable machine-filterable tag, for **logs only**.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidPort { .. } => "invalid_port",
+            Self::MissingApiKey => "missing_api_key",
+            Self::InvalidMaxAttachmentBytes { .. } => "invalid_max_attachment_bytes",
+            Self::InvalidMaxMessageBytes { .. } => "invalid_max_message_bytes",
+            Self::InvalidWebhookUrl { .. } => "invalid_webhook_url",
+            Self::InvalidWebhookTimeout { .. } => "invalid_webhook_timeout",
+            Self::InvalidImapTimeout { .. } => "invalid_imap_timeout",
+            Self::Account(_) => "account",
+        }
+    }
 }
 
 impl Config {
@@ -1173,6 +1258,133 @@ mod tests {
                 ConfigError::InvalidWebhookTimeout { value: got } => assert_eq!(got, value),
                 other => panic!("expected InvalidWebhookTimeout for {value:?}, got {other:?}"),
             }
+        }
+    }
+
+    /// A distinctive raw value that must never appear in a public message.
+    const LEAKED_VALUE: &str = "leaked-value-123";
+
+    #[test]
+    fn config_error_public_message_never_leaks_the_value() {
+        let cases: Vec<(ConfigError, &'static str, &'static str)> = vec![
+            (
+                ConfigError::InvalidPort {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_port",
+                "APIMAIL_PORT",
+            ),
+            (
+                ConfigError::MissingApiKey,
+                "missing_api_key",
+                "APIMAIL_API_KEY",
+            ),
+            (
+                ConfigError::InvalidMaxAttachmentBytes {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_max_attachment_bytes",
+                "APIMAIL_MAX_ATTACHMENT_BYTES",
+            ),
+            (
+                ConfigError::InvalidMaxMessageBytes {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_max_message_bytes",
+                "APIMAIL_MAX_MESSAGE_BYTES",
+            ),
+            (
+                ConfigError::InvalidWebhookUrl {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_webhook_url",
+                "APIMAIL_WEBHOOK_URL",
+            ),
+            (
+                ConfigError::InvalidWebhookTimeout {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_webhook_timeout",
+                "APIMAIL_WEBHOOK_TIMEOUT_SECS",
+            ),
+            (
+                ConfigError::InvalidImapTimeout {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_imap_timeout",
+                "APIMAIL_IMAP_TIMEOUT_SECS",
+            ),
+            (
+                ConfigError::Account(AccountError::InvalidTls {
+                    name: "APIMAIL_IMAP_TLS".into(),
+                    value: LEAKED_VALUE.into(),
+                }),
+                "account",
+                "APIMAIL_IMAP_TLS",
+            ),
+        ];
+
+        for (error, expected_kind, variable) in cases {
+            let message = error.public_message();
+            assert!(
+                !message.contains(LEAKED_VALUE),
+                "public_message leaked the raw value: {message}"
+            );
+            assert!(
+                message.contains(variable),
+                "public_message should name {variable}: {message}"
+            );
+            assert_eq!(
+                error.kind(),
+                expected_kind,
+                "unexpected kind for {variable}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_error_public_message_never_leaks_the_value() {
+        let cases: Vec<(AccountError, &'static str, &'static str)> = vec![
+            (
+                AccountError::MissingValue {
+                    name: "APIMAIL_IMAP_HOST".into(),
+                },
+                "missing_value",
+                "APIMAIL_IMAP_HOST",
+            ),
+            (
+                AccountError::InvalidPort {
+                    name: "APIMAIL_IMAP_PORT".into(),
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_port",
+                "APIMAIL_IMAP_PORT",
+            ),
+            (
+                AccountError::InvalidTls {
+                    name: "APIMAIL_IMAP_TLS".into(),
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_tls",
+                "APIMAIL_IMAP_TLS",
+            ),
+        ];
+
+        for (error, expected_kind, variable) in cases {
+            let message = error.public_message();
+            assert!(
+                !message.contains(LEAKED_VALUE),
+                "public_message leaked the raw value: {message}"
+            );
+            assert!(
+                message.contains(variable),
+                "public_message should name {variable}: {message}"
+            );
+            assert_eq!(
+                error.kind(),
+                expected_kind,
+                "unexpected kind for {variable}"
+            );
         }
     }
 }
