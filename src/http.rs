@@ -14,7 +14,7 @@
 //! # Authentication contract
 //!
 //! Every route **except** `GET /api/health` is protected by the
-//! [`require_api_key`] middleware. A request must carry the configured API key
+//! `require_api_key` middleware. A request must carry the configured API key
 //! in the `Authorization` header using the `Bearer` scheme (the scheme is
 //! matched case-insensitively):
 //!
@@ -48,7 +48,7 @@
 //!
 //! # Message sending contract
 //!
-//! `POST /api/messages` is protected by [`require_api_key`] and accepts an
+//! `POST /api/messages` is protected by `require_api_key` and accepts an
 //! `application/json` body describing an outgoing message:
 //!
 //! ```json
@@ -92,7 +92,7 @@
 //!
 //! # IMAP status contract
 //!
-//! `GET /api/imap/status` is protected by [`require_api_key`]. It attempts to
+//! `GET /api/imap/status` is protected by `require_api_key`. It attempts to
 //! ensure a live IMAP session (connecting lazily on first use) and reports the
 //! outcome — never a credential:
 //!
@@ -104,7 +104,7 @@
 //!
 //! # Mailbox contract
 //!
-//! `GET /api/mailboxes` is protected by [`require_api_key`]. It lists the
+//! `GET /api/mailboxes` is protected by `require_api_key`. It lists the
 //! account's mailboxes (`LIST`) and never exposes a credential. On success it
 //! returns HTTP `200`, `Content-Type: application/json` and a body of the shape:
 //!
@@ -116,7 +116,7 @@
 //! `attributes` are the IMAP-style mailbox attributes (for example
 //! `\NoSelect`).
 //!
-//! `POST /api/mailboxes/select` is protected by [`require_api_key`] and accepts
+//! `POST /api/mailboxes/select` is protected by `require_api_key` and accepts
 //! an `application/json` body `{"mailbox":"INBOX"}`. On success it selects the
 //! mailbox (`SELECT`) and returns HTTP `200`, `Content-Type: application/json`
 //! and a body of the shape:
@@ -141,7 +141,7 @@
 //! # Message reading contract
 //!
 //! `GET /api/messages` and `GET /api/messages/{uid}` are protected by
-//! [`require_api_key`]. Both select the mailbox named by the required `mailbox`
+//! `require_api_key`. Both select the mailbox named by the required `mailbox`
 //! query parameter and never expose a credential; bodies are fetched with
 //! `BODY.PEEK`, so reading never sets `\Seen`.
 //!
@@ -184,7 +184,7 @@
 //!
 //! `PATCH /api/messages/{uid}/flags`, `POST /api/messages/{uid}/move`,
 //! `POST /api/messages/{uid}/copy` and `DELETE /api/messages/{uid}` are protected
-//! by [`require_api_key`]. All four select the mailbox named by the required
+//! by `require_api_key`. All four select the mailbox named by the required
 //! `mailbox` query parameter and act on the single message identified by the
 //! numeric `uid` in the path. On success they return HTTP `200` and
 //! `Content-Type: application/json`:
@@ -227,7 +227,7 @@
 //! # MIME parsing contract
 //!
 //! `GET /api/messages/{uid}/body`, `GET /api/messages/{uid}/attachments` and
-//! `GET /api/messages/{uid}/attachments/{id}` are protected by [`require_api_key`].
+//! `GET /api/messages/{uid}/attachments/{id}` are protected by `require_api_key`.
 //! All three select the mailbox named by the required `mailbox` query parameter,
 //! fetch the single message identified by the numeric `uid` in the path and
 //! parse its MIME content on the existing lazily-established session; the raw
@@ -273,7 +273,7 @@
 //! # IDLE contract
 //!
 //! `POST /api/idle/start`, `POST /api/idle/stop`, `GET /api/idle/status` and
-//! `GET /api/idle/queue` are protected by [`require_api_key`]. They control the
+//! `GET /api/idle/queue` are protected by `require_api_key`. They control the
 //! IDLE subscription, which watches a single configured mailbox
 //! (`APIMAIL_IDLE_MAILBOX`, default `INBOX`) over its own dedicated IMAP
 //! connection and POSTs every newly arrived message to `APIMAIL_WEBHOOK_URL`,
@@ -533,7 +533,7 @@ impl AppState {
     /// `APIMAIL_WEBHOOK_TIMEOUT_SECS` and `APIMAIL_MAX_MESSAGE_BYTES`) but is not
     /// started until `POST /api/idle/start`.
     ///
-    /// The delivery queue is built from `config` with [`build_queue`], so an
+    /// The delivery queue is built from `config` with `build_queue`, so an
     /// unusable `APIMAIL_QUEUE_PATH` fails the whole construction instead of
     /// silently degrading to an in-memory queue.
     pub fn with_idle(
@@ -2154,7 +2154,7 @@ fn bearer_token(value: &str) -> Option<&str> {
 ///
 /// The returned router is self-contained and can be exercised in tests via
 /// `tower::ServiceExt::oneshot` without binding a socket. `GET /api/health`
-/// stays public; every other route sits behind [`require_api_key`].
+/// stays public; every other route sits behind `require_api_key`.
 pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/whoami", get(whoami))
