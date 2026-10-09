@@ -21,6 +21,18 @@ pub const IMAP_TIMEOUT_SECS_VAR: &str = "APIMAIL_IMAP_TIMEOUT_SECS";
 /// Default IMAP operation timeout (30 s) when `APIMAIL_IMAP_TIMEOUT_SECS` is
 /// unset.
 pub const DEFAULT_IMAP_TIMEOUT_SECS: u64 = 30;
+/// Environment variable holding the webhook URL notified on new mail.
+pub const WEBHOOK_URL_VAR: &str = "APIMAIL_WEBHOOK_URL";
+/// Environment variable holding the mailbox watched by the IDLE subscription.
+pub const IDLE_MAILBOX_VAR: &str = "APIMAIL_IDLE_MAILBOX";
+/// Default mailbox watched by the IDLE subscription (`INBOX`) when
+/// `APIMAIL_IDLE_MAILBOX` is unset or blank.
+pub const DEFAULT_IDLE_MAILBOX: &str = "INBOX";
+/// Environment variable holding the webhook request timeout, in seconds.
+pub const WEBHOOK_TIMEOUT_SECS_VAR: &str = "APIMAIL_WEBHOOK_TIMEOUT_SECS";
+/// Default webhook request timeout (10 s) when `APIMAIL_WEBHOOK_TIMEOUT_SECS`
+/// is unset.
+pub const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 10;
 
 /// TLS mode negotiated with a mail endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +254,13 @@ pub struct Config {
     pub max_attachment_bytes: usize,
     /// Maximum size, in bytes, of a message that will be fetched and parsed.
     pub max_message_bytes: usize,
+    /// Webhook URL notified when the IDLE subscription sees a new message, or
+    /// `None` when the subscription cannot be started.
+    pub webhook_url: Option<String>,
+    /// Mailbox watched by the IDLE subscription.
+    pub idle_mailbox: String,
+    /// Timeout applied to each webhook request.
+    pub webhook_timeout: Duration,
     /// Timeout applied to TCP connect, the TLS handshake and the IMAP login.
     pub imap_timeout: Duration,
 }
@@ -255,6 +274,9 @@ impl std::fmt::Debug for Config {
             .field("account", &self.account)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .field("max_message_bytes", &self.max_message_bytes)
+            .field("webhook_url", &self.webhook_url)
+            .field("idle_mailbox", &self.idle_mailbox)
+            .field("webhook_timeout", &self.webhook_timeout)
             .field("imap_timeout", &self.imap_timeout)
             .finish()
     }
@@ -285,6 +307,20 @@ pub enum ConfigError {
         "invalid APIMAIL_MAX_MESSAGE_BYTES value `{value}`: expected a positive number of bytes"
     )]
     InvalidMaxMessageBytes {
+        /// The offending raw value.
+        value: String,
+    },
+    /// `APIMAIL_WEBHOOK_URL` was present but not an absolute `http`/`https` URL.
+    #[error("invalid APIMAIL_WEBHOOK_URL value `{value}`: expected an absolute http or https URL")]
+    InvalidWebhookUrl {
+        /// The offending raw value.
+        value: String,
+    },
+    /// `APIMAIL_WEBHOOK_TIMEOUT_SECS` was present but not a positive integer.
+    #[error(
+        "invalid APIMAIL_WEBHOOK_TIMEOUT_SECS value `{value}`: expected a positive number of seconds"
+    )]
+    InvalidWebhookTimeout {
         /// The offending raw value.
         value: String,
     },
@@ -319,10 +355,13 @@ impl Config {
     /// without touching the process environment.
     ///
     /// Validation runs in the order host → port → api key → mail account →
-    /// attachment limit → message limit → IMAP timeout, so an invalid server
-    /// port is reported before any missing API key or account value, an invalid
-    /// attachment limit is reported after the account, an invalid message limit
-    /// after the attachment limit, and an invalid IMAP timeout last.
+    /// attachment limit → message limit → webhook url → idle mailbox → webhook
+    /// timeout → IMAP timeout, so an invalid server port is reported before any
+    /// missing API key or account value, an invalid attachment limit is reported
+    /// after the account, an invalid message limit after the attachment limit, an
+    /// invalid webhook url after the message limit, an invalid idle mailbox after
+    /// the webhook url, an invalid webhook timeout after the idle mailbox, and an
+    /// invalid IMAP timeout last.
     pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -363,6 +402,28 @@ impl Config {
             }
             None => DEFAULT_MAX_MESSAGE_BYTES,
         };
+        // A blank value counts as absent, coherently with `required()`: an
+        // empty string means "not configured", not an invalid URL.
+        let webhook_url = match lookup(WEBHOOK_URL_VAR) {
+            Some(raw) if !raw.trim().is_empty() => Some(validate_webhook_url(&raw)?),
+            _ => None,
+        };
+        let idle_mailbox = match lookup(IDLE_MAILBOX_VAR) {
+            Some(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+            _ => DEFAULT_IDLE_MAILBOX.to_string(),
+        };
+        let webhook_timeout = match lookup(WEBHOOK_TIMEOUT_SECS_VAR) {
+            Some(raw) => {
+                let parsed = raw
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidWebhookTimeout { value: raw.clone() })?;
+                if parsed == 0 {
+                    return Err(ConfigError::InvalidWebhookTimeout { value: raw });
+                }
+                Duration::from_secs(parsed)
+            }
+            None => Duration::from_secs(DEFAULT_WEBHOOK_TIMEOUT_SECS),
+        };
         let imap_timeout = match lookup(IMAP_TIMEOUT_SECS_VAR) {
             Some(raw) => {
                 let parsed = raw
@@ -382,9 +443,42 @@ impl Config {
             account,
             max_attachment_bytes,
             max_message_bytes,
+            webhook_url,
+            idle_mailbox,
+            webhook_timeout,
             imap_timeout,
         })
     }
+}
+
+/// Validates and normalises `APIMAIL_WEBHOOK_URL`.
+///
+/// A webhook URL must be an **absolute** URL with an `http` or `https` scheme
+/// (compared case-insensitively) and a non-empty authority. A value carrying any
+/// whitespace or control character is rejected too, so a URL can never smuggle a
+/// second HTTP request. On success the value is returned **unchanged**.
+fn validate_webhook_url(value: &str) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::InvalidWebhookUrl {
+        value: value.to_string(),
+    };
+
+    if value.chars().any(char::is_whitespace) || value.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return Err(invalid());
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(invalid());
+    }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(invalid());
+    }
+
+    Ok(value.to_string())
 }
 
 #[cfg(test)]
@@ -950,5 +1044,135 @@ mod tests {
         assert_eq!(TlsMode::Implicit.as_str(), "implicit");
         assert_eq!(TlsMode::StartTls.as_str(), "starttls");
         assert_eq!(TlsMode::Plain.as_str(), "none");
+    }
+
+    #[test]
+    fn webhook_url_absent_is_none() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(config.webhook_url, None);
+    }
+
+    #[test]
+    fn webhook_url_valid_is_some() {
+        for url in [
+            "https://hooks.example.com/mail",
+            "http://127.0.0.1:8080/hook",
+            "HTTPS://hooks.example.com/mail",
+        ] {
+            let config = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(WEBHOOK_URL_VAR, url)]),
+            ))
+            .expect("a valid webhook url should load");
+            assert_eq!(config.webhook_url.as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn webhook_url_blank_is_none() {
+        for value in ["", "   ", "\t"] {
+            let config = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(WEBHOOK_URL_VAR, value)]),
+            ))
+            .expect("a blank webhook url must be treated as absent");
+            assert!(
+                config.webhook_url.is_none(),
+                "a blank webhook url must be absent, got {:?}",
+                config.webhook_url
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_url_invalid_is_an_error_naming_the_variable() {
+        for value in [
+            "ftp://x",
+            "example.com",
+            "https://exa\nmple.com",
+            "https://",
+            "http:///missing-authority",
+        ] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(WEBHOOK_URL_VAR, value)]),
+            ))
+            .expect_err("an invalid webhook url must fail");
+            assert!(
+                err.to_string().contains(WEBHOOK_URL_VAR),
+                "the error message must name the variable: {err}"
+            );
+            match err {
+                ConfigError::InvalidWebhookUrl { value: got } => assert_eq!(got, value),
+                other => panic!("expected InvalidWebhookUrl for {value:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn idle_mailbox_defaults_to_inbox() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(config.idle_mailbox, DEFAULT_IDLE_MAILBOX);
+        assert_eq!(DEFAULT_IDLE_MAILBOX, "INBOX");
+    }
+
+    #[test]
+    fn idle_mailbox_uses_configured_value_trimmed() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(IDLE_MAILBOX_VAR, "  Archive  ")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.idle_mailbox, "Archive");
+    }
+
+    #[test]
+    fn idle_mailbox_blank_falls_back_to_default() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(IDLE_MAILBOX_VAR, "   ")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.idle_mailbox, DEFAULT_IDLE_MAILBOX);
+    }
+
+    #[test]
+    fn webhook_timeout_defaults_to_ten_seconds() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(
+            config.webhook_timeout,
+            Duration::from_secs(DEFAULT_WEBHOOK_TIMEOUT_SECS)
+        );
+        assert_eq!(DEFAULT_WEBHOOK_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn webhook_timeout_uses_configured_value() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(WEBHOOK_TIMEOUT_SECS_VAR, "3")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.webhook_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn webhook_timeout_zero_or_non_numeric_is_an_error() {
+        for value in ["0", "abc"] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries()
+                    .into_iter()
+                    .chain([(WEBHOOK_TIMEOUT_SECS_VAR, value)]),
+            ))
+            .expect_err("an invalid webhook timeout must fail");
+            assert!(
+                err.to_string().contains(WEBHOOK_TIMEOUT_SECS_VAR),
+                "the error message must name the variable: {err}"
+            );
+            match err {
+                ConfigError::InvalidWebhookTimeout { value: got } => assert_eq!(got, value),
+                other => panic!("expected InvalidWebhookTimeout for {value:?}, got {other:?}"),
+            }
+        }
     }
 }

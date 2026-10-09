@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::Client;
-use async_imap::types::{Fetch, Flag, NameAttribute};
+use async_imap::types::{Fetch, Flag, Mailbox, NameAttribute};
 use futures_util::TryStreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -941,80 +941,106 @@ impl TokioImapConnector {
     /// Builds the connector from the loaded [`Config`] **without opening any
     /// connection**.
     pub fn from_config(config: &Config) -> Result<Self, ImapError> {
-        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|error| ImapError::TlsConfig(error.to_string()))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
         Ok(Self {
             endpoint: config.account.imap.clone(),
             timeout: config.imap_timeout,
-            tls_config: Arc::new(tls_config),
+            tls_config: build_tls_config()?,
         })
     }
 
     /// Runs the whole connection and authentication sequence under a single
     /// timeout.
     async fn connect_inner(&self) -> Result<Box<dyn ImapSession>, ImapError> {
-        let endpoint = &self.endpoint;
-        let strategy = tls_strategy(endpoint.tls);
-        let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-            .await
-            .map_err(ImapError::Tcp)?;
-
-        let stream = match strategy {
-            TlsStrategy::Implicit => {
-                let tls = self.upgrade(tcp, &endpoint.host).await?;
-                ImapStream::Tls(Box::new(tls))
-            }
-            TlsStrategy::Plain => ImapStream::Plain(tcp),
-            TlsStrategy::StartTls => {
-                let mut client = Client::new(ImapStream::Plain(tcp));
-                read_greeting(&mut client).await?;
-                client
-                    .run_command_and_check_ok("STARTTLS", None)
-                    .await
-                    .map_err(ImapError::Imap)?;
-                let tcp = match client.into_inner() {
-                    ImapStream::Plain(tcp) => tcp,
-                    ImapStream::Tls(_) => {
-                        return Err(ImapError::Tls(
-                            "STARTTLS did not return a cleartext stream".to_string(),
-                        ));
-                    }
-                };
-                let tls = self.upgrade(tcp, &endpoint.host).await?;
-                ImapStream::Tls(Box::new(tls))
-            }
-        };
-
-        let mut client = Client::new(stream);
-        // STARTTLS already consumed the greeting; the other modes must read it
-        // before authenticating.
-        if !matches!(strategy, TlsStrategy::StartTls) {
-            read_greeting(&mut client).await?;
-        }
-
-        let session = client
-            .login(endpoint.username.as_str(), endpoint.password.as_str())
-            .await
-            .map_err(|(error, _client)| ImapError::Login(error.to_string()))?;
+        let session = connect_and_login(&self.endpoint, &self.tls_config).await?;
         Ok(Box::new(SessionHandle { session }))
     }
+}
 
-    /// Performs the TLS handshake over an already-connected TCP stream.
-    async fn upgrade(&self, tcp: TcpStream, host: &str) -> Result<TlsStream<TcpStream>, ImapError> {
-        let server_name = ServerName::try_from(host)
-            .map_err(|_| ImapError::InvalidServerName(host.to_string()))?
-            .to_owned();
-        let connector = TlsConnector::from(Arc::clone(&self.tls_config));
-        connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|error| ImapError::Tls(error.to_string()))
+/// Builds the rustls client configuration shared by the shared session and the
+/// dedicated IDLE connection.
+///
+/// Explicitly pins the **ring** crypto provider and the Mozilla root store from
+/// `webpki-roots` instead of relying on the process default.
+pub(crate) fn build_tls_config() -> Result<Arc<ClientConfig>, ImapError> {
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| ImapError::TlsConfig(error.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(tls_config))
+}
+
+/// Performs the TLS handshake over an already-connected TCP stream.
+pub(crate) async fn upgrade(
+    tcp: TcpStream,
+    host: &str,
+    tls_config: &Arc<ClientConfig>,
+) -> Result<TlsStream<TcpStream>, ImapError> {
+    let server_name = ServerName::try_from(host)
+        .map_err(|_| ImapError::InvalidServerName(host.to_string()))?
+        .to_owned();
+    let connector = TlsConnector::from(Arc::clone(tls_config));
+    connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|error| ImapError::Tls(error.to_string()))
+}
+
+/// Connects, negotiates TLS according to the endpoint's [`TlsMode`] and runs
+/// `LOGIN`, returning the **raw** authenticated session.
+///
+/// Shared by [`TokioImapConnector`] (which wraps it in a
+/// [`SessionHandle`]) and the dedicated IDLE connection, so both go through the
+/// exact same connection and authentication routine.
+pub(crate) async fn connect_and_login(
+    endpoint: &MailEndpoint,
+    tls_config: &Arc<ClientConfig>,
+) -> Result<async_imap::Session<ImapStream>, ImapError> {
+    let strategy = tls_strategy(endpoint.tls);
+    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .map_err(ImapError::Tcp)?;
+
+    let stream = match strategy {
+        TlsStrategy::Implicit => {
+            let tls = upgrade(tcp, &endpoint.host, tls_config).await?;
+            ImapStream::Tls(Box::new(tls))
+        }
+        TlsStrategy::Plain => ImapStream::Plain(tcp),
+        TlsStrategy::StartTls => {
+            let mut client = Client::new(ImapStream::Plain(tcp));
+            read_greeting(&mut client).await?;
+            client
+                .run_command_and_check_ok("STARTTLS", None)
+                .await
+                .map_err(ImapError::Imap)?;
+            let tcp = match client.into_inner() {
+                ImapStream::Plain(tcp) => tcp,
+                ImapStream::Tls(_) => {
+                    return Err(ImapError::Tls(
+                        "STARTTLS did not return a cleartext stream".to_string(),
+                    ));
+                }
+            };
+            let tls = upgrade(tcp, &endpoint.host, tls_config).await?;
+            ImapStream::Tls(Box::new(tls))
+        }
+    };
+
+    let mut client = Client::new(stream);
+    // STARTTLS already consumed the greeting; the other modes must read it
+    // before authenticating.
+    if !matches!(strategy, TlsStrategy::StartTls) {
+        read_greeting(&mut client).await?;
     }
+
+    let session = client
+        .login(endpoint.username.as_str(), endpoint.password.as_str())
+        .await
+        .map_err(|(error, _client)| ImapError::Login(error.to_string()))?;
+    Ok(session)
 }
 
 impl ImapConnector for TokioImapConnector {
@@ -1035,6 +1061,42 @@ async fn read_greeting(client: &mut Client<ImapStream>) -> Result<(), ImapError>
             "connection closed before the IMAP greeting".to_string(),
         )),
     }
+}
+
+/// Maps an `async-imap` [`Mailbox`] to the API [`MailboxStatus`].
+///
+/// Shared by the shared session and the dedicated IDLE connection so both report
+/// the mailbox status identically.
+pub(crate) fn mailbox_status(mailbox: &Mailbox) -> MailboxStatus {
+    MailboxStatus {
+        exists: mailbox.exists,
+        recent: mailbox.recent,
+        unseen: mailbox.unseen,
+        uid_validity: mailbox.uid_validity,
+        uid_next: mailbox.uid_next,
+        flags: mailbox.flags.iter().map(flag_label).collect(),
+    }
+}
+
+/// Runs `UID FETCH` with the raw `uid_set` and maps every response to a
+/// [`Message`].
+///
+/// The caller is responsible for supplying a valid UID set (for example `"42"`,
+/// `"7,9"` or `"10:*"`); an empty set is not a valid IMAP command.
+pub(crate) async fn fetch_messages(
+    session: &mut async_imap::Session<ImapStream>,
+    uid_set: String,
+    format: FetchFormat,
+) -> Result<Vec<Message>, ImapError> {
+    let stream = session
+        .uid_fetch(uid_set, format.query())
+        .await
+        .map_err(ImapError::from)?;
+    let fetches: Vec<Fetch> = stream.try_collect().await?;
+    Ok(fetches
+        .iter()
+        .filter_map(|fetch| fetch_to_message(fetch, format))
+        .collect())
 }
 
 /// A real [`ImapSession`] wrapping an `async-imap` [`Session`](async_imap::Session).
@@ -1081,14 +1143,7 @@ impl ImapSession for SessionHandle {
                     async_imap::error::Error::No(_) => ImapError::MailboxNotFound,
                     other => ImapError::Imap(other),
                 })?;
-            Ok(MailboxStatus {
-                exists: mailbox.exists,
-                recent: mailbox.recent,
-                unseen: mailbox.unseen,
-                uid_validity: mailbox.uid_validity,
-                uid_next: mailbox.uid_next,
-                flags: mailbox.flags.iter().map(flag_label).collect(),
-            })
+            Ok(mailbox_status(&mailbox))
         })
     }
 
@@ -1123,16 +1178,7 @@ impl ImapSession for SessionHandle {
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            let stream = self
-                .session
-                .uid_fetch(set, format.query())
-                .await
-                .map_err(ImapError::from)?;
-            let fetches: Vec<Fetch> = stream.try_collect().await?;
-            Ok(fetches
-                .iter()
-                .filter_map(|fetch| fetch_to_message(fetch, format))
-                .collect())
+            fetch_messages(&mut self.session, set, format).await
         })
     }
 
