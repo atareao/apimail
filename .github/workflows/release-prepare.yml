@@ -40,6 +40,8 @@ jobs:
           fi
       - name: Bump version with vampus
         run: vampus upgrade ${{ steps.bump.outputs.type }}
+      - name: Sync Cargo.lock with the new version
+        run: cargo update --workspace
       - name: Get new version
         id: version
         run: |

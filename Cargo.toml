@@ -9,6 +9,18 @@ readme = "README.md"
 keywords = ["email", "imap", "smtp", "axum", "api"]
 categories = ["web-programming::http-server", "email"]
 rust-version = "1.88"
+exclude = [
+    "/openspec",
+    "/plans",
+    "/.opencode",
+    "/.github",
+    "/CHANGELOG.md",
+    "/AGENTS.md",
+    "/GIT_FLOW.md",
+    "/cliff.toml",
+    "/.justfile",
+    "/.vampus.yml",
+]
 
 [dependencies]
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
