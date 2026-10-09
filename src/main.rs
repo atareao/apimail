@@ -21,7 +21,11 @@ async fn main() -> ExitCode {
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => {
-            tracing::error!("failed to start apimail: {error}");
+            tracing::error!(
+                kind = error.kind(),
+                "failed to start apimail: {}",
+                error.public_message()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -41,7 +45,11 @@ async fn main() -> ExitCode {
     let state = match AppState::from_config(&config) {
         Ok(state) => state,
         Err(error) => {
-            tracing::error!("failed to initialise application services: {error}");
+            tracing::error!(
+                kind = error.kind(),
+                "failed to initialise application services: {}",
+                error.public_message()
+            );
             return ExitCode::FAILURE;
         }
     };
