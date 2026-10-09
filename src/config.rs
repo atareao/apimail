@@ -11,6 +11,11 @@ pub const MAX_ATTACHMENT_BYTES_VAR: &str = "APIMAIL_MAX_ATTACHMENT_BYTES";
 /// Default maximum total attachment size (10 MiB) when
 /// `APIMAIL_MAX_ATTACHMENT_BYTES` is unset.
 pub const DEFAULT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+/// Environment variable holding the maximum message size to parse, in bytes.
+pub const MAX_MESSAGE_BYTES_VAR: &str = "APIMAIL_MAX_MESSAGE_BYTES";
+/// Default maximum message size (25 MiB) when `APIMAIL_MAX_MESSAGE_BYTES` is
+/// unset.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
 /// Environment variable holding the IMAP operation timeout, in seconds.
 pub const IMAP_TIMEOUT_SECS_VAR: &str = "APIMAIL_IMAP_TIMEOUT_SECS";
 /// Default IMAP operation timeout (30 s) when `APIMAIL_IMAP_TIMEOUT_SECS` is
@@ -235,6 +240,8 @@ pub struct Config {
     pub account: MailAccount,
     /// Maximum total size, in bytes, of the decoded attachments of a message.
     pub max_attachment_bytes: usize,
+    /// Maximum size, in bytes, of a message that will be fetched and parsed.
+    pub max_message_bytes: usize,
     /// Timeout applied to TCP connect, the TLS handshake and the IMAP login.
     pub imap_timeout: Duration,
 }
@@ -246,6 +253,8 @@ impl std::fmt::Debug for Config {
             .field("port", &self.port)
             .field("api_key", &"***")
             .field("account", &self.account)
+            .field("max_attachment_bytes", &self.max_attachment_bytes)
+            .field("max_message_bytes", &self.max_message_bytes)
             .field("imap_timeout", &self.imap_timeout)
             .finish()
     }
@@ -268,6 +277,14 @@ pub enum ConfigError {
         "invalid APIMAIL_MAX_ATTACHMENT_BYTES value `{value}`: expected a positive number of bytes"
     )]
     InvalidMaxAttachmentBytes {
+        /// The offending raw value.
+        value: String,
+    },
+    /// `APIMAIL_MAX_MESSAGE_BYTES` was present but not a positive integer.
+    #[error(
+        "invalid APIMAIL_MAX_MESSAGE_BYTES value `{value}`: expected a positive number of bytes"
+    )]
+    InvalidMaxMessageBytes {
         /// The offending raw value.
         value: String,
     },
@@ -302,9 +319,10 @@ impl Config {
     /// without touching the process environment.
     ///
     /// Validation runs in the order host → port → api key → mail account →
-    /// attachment limit → IMAP timeout, so an invalid server port is reported
-    /// before any missing API key or account value, an invalid attachment limit
-    /// is reported after the account, and an invalid IMAP timeout last.
+    /// attachment limit → message limit → IMAP timeout, so an invalid server
+    /// port is reported before any missing API key or account value, an invalid
+    /// attachment limit is reported after the account, an invalid message limit
+    /// after the attachment limit, and an invalid IMAP timeout last.
     pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -333,6 +351,18 @@ impl Config {
             }
             None => DEFAULT_MAX_ATTACHMENT_BYTES,
         };
+        let max_message_bytes = match lookup(MAX_MESSAGE_BYTES_VAR) {
+            Some(raw) => {
+                let parsed = raw
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidMaxMessageBytes { value: raw.clone() })?;
+                if parsed == 0 {
+                    return Err(ConfigError::InvalidMaxMessageBytes { value: raw });
+                }
+                parsed
+            }
+            None => DEFAULT_MAX_MESSAGE_BYTES,
+        };
         let imap_timeout = match lookup(IMAP_TIMEOUT_SECS_VAR) {
             Some(raw) => {
                 let parsed = raw
@@ -351,6 +381,7 @@ impl Config {
             api_key,
             account,
             max_attachment_bytes,
+            max_message_bytes,
             imap_timeout,
         })
     }
@@ -800,6 +831,60 @@ mod tests {
         match err {
             ConfigError::InvalidMaxAttachmentBytes { value } => assert_eq!(value, "abc"),
             other => panic!("expected InvalidMaxAttachmentBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_message_defaults_to_25_mib_when_absent() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(config.max_message_bytes, DEFAULT_MAX_MESSAGE_BYTES);
+        assert_eq!(DEFAULT_MAX_MESSAGE_BYTES, 25 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_message_uses_configured_value() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(MAX_MESSAGE_BYTES_VAR, "4096")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.max_message_bytes, 4096);
+    }
+
+    #[test]
+    fn max_message_zero_is_an_error() {
+        let err = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(MAX_MESSAGE_BYTES_VAR, "0")]),
+        ))
+        .expect_err("zero limit must fail");
+        assert!(
+            err.to_string().contains(MAX_MESSAGE_BYTES_VAR),
+            "the error message must name the offending variable: {err}"
+        );
+        match err {
+            ConfigError::InvalidMaxMessageBytes { value } => assert_eq!(value, "0"),
+            other => panic!("expected InvalidMaxMessageBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_message_non_numeric_is_an_error() {
+        let err = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(MAX_MESSAGE_BYTES_VAR, "abc")]),
+        ))
+        .expect_err("non-numeric limit must fail");
+        assert!(
+            err.to_string().contains(MAX_MESSAGE_BYTES_VAR),
+            "the error message must name the offending variable: {err}"
+        );
+        match err {
+            ConfigError::InvalidMaxMessageBytes { value } => assert_eq!(value, "abc"),
+            other => panic!("expected InvalidMaxMessageBytes, got {other:?}"),
         }
     }
 
