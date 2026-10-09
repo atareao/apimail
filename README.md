@@ -22,8 +22,10 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > `GET /api/messages/{uid}/attachments/{id}`)— y también se pueden
 > **actualizar banderas, mover, copiar y borrar** mensajes con
 > `PATCH /api/messages/{uid}/flags`, `POST /api/messages/{uid}/move`,
-> `POST /api/messages/{uid}/copy` y `DELETE /api/messages/{uid}`. Sigue en
-> desarrollo la operación `IDLE`/webhook.
+> `POST /api/messages/{uid}/copy` y `DELETE /api/messages/{uid}`. La **recepción en
+> tiempo real** ya está disponible con la extensión `IDLE` mediante
+> `POST /api/idle/start`, `POST /api/idle/stop` y `GET /api/idle/status`, que
+> notifican el correo nuevo a un webhook configurable.
 
 ## Requisitos
 
@@ -107,6 +109,24 @@ o no numérico provoca un **error de arranque** (menciona la variable), sin
 omite o declara a la baja el tamaño del mensaje, la segunda comprobación sobre la
 longitud realmente descargada es la que rechaza un cuerpo sobredimensionado antes
 de parsearlo.
+
+### Recepción en tiempo real (IDLE)
+
+| Variable                       | Descripción                                                       | Valor por defecto            |
+| ------------------------------ | ----------------------------------------------------------------- | ---------------------------- |
+| `APIMAIL_WEBHOOK_URL`          | URL `http`/`https` notificada al llegar correo (**opcional**)     | — (sin ella, IDLE no arranca) |
+| `APIMAIL_IDLE_MAILBOX`         | Buzón vigilado por la suscripción `IDLE`                          | `INBOX`                      |
+| `APIMAIL_WEBHOOK_TIMEOUT_SECS` | Timeout (segundos) aplicado a cada petición al webhook            | `10`                         |
+
+`APIMAIL_WEBHOOK_URL` es **opcional**: si falta (o está en blanco) la suscripción no
+puede arrancar y `POST /api/idle/start` responde `501 idle_not_configured`. Cuando se
+define, se **valida al arranque**: debe ser una URL **absoluta** con esquema `http` o
+`https` (comparado sin distinguir mayúsculas) y autoridad no vacía; cualquier otro valor,
+otro esquema o un carácter de control provoca un **error de arranque**.
+
+`APIMAIL_IDLE_MAILBOX` se recorta y, si queda en blanco, vuelve al valor por defecto
+`INBOX`. `APIMAIL_WEBHOOK_TIMEOUT_SECS` debe ser un entero **mayor que cero**; `0` o un
+valor no numérico provocan un **error de arranque**, sin *fallback* silencioso.
 
 Puertos por defecto **derivados del modo TLS** (si no se fija `..._PORT`):
 
@@ -757,6 +777,76 @@ curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
   -d '{"to":["dest@example.com"],"subject":"Hola","text":"cuerpo"}' \
   http://127.0.0.1:3000/api/messages
 ```
+
+### Recepción en tiempo real (IDLE) (protegido)
+
+Estas tres rutas controlan una suscripción `IDLE` (RFC 2177) que vigila **un** buzón
+(`APIMAIL_IDLE_MAILBOX`, por defecto `INBOX`) sobre su **propia** conexión IMAP dedicada
+—sin interferir con la sesión compartida del resto de rutas— y hace un `POST` al webhook
+configurado cada vez que llega correo nuevo. Requieren la API key.
+
+`POST /api/idle/start` arranca la suscripción. Es **idempotente**: si ya está en marcha
+devuelve el mismo cuerpo sin abrir una segunda conexión. Respuesta `200 OK` con
+`Content-Type: application/json`:
+
+```json
+{ "status": "running", "mailbox": "INBOX" }
+```
+
+`POST /api/idle/stop` detiene la suscripción. Es **idempotente**: parar una suscripción
+que no está en marcha no hace nada. Respuesta `200 OK`:
+
+```json
+{ "status": "stopped" }
+```
+
+`GET /api/idle/status` informa del estado actual. Respuesta `200 OK`:
+
+```json
+{ "status": "running", "mailbox": "INBOX", "last_error": null }
+```
+
+`status` es `"running"` o `"stopped"`; `mailbox` es el buzón vigilado; y `last_error` es
+el **código estable** del último fallo o `null`:
+
+- `null` — la última operación tuvo éxito.
+- `"imap_unavailable"` — la conexión IMAP cayó; se reintenta con backoff.
+- `"webhook_failed"` — se agotaron los reintentos de entrega al webhook.
+
+Las respuestas de `start`/`stop` son *snapshots* del mismo objeto, de modo que también
+incluyen `last_error` (con el mismo significado). Los fallos de IMAP y de webhook **no**
+devuelven código HTTP: la suscripción **sigue viva** y reconecta/reintenta.
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/idle/start
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/idle/status
+curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
+  http://127.0.0.1:3000/api/idle/stop
+```
+
+Códigos de error (modelo `{"error":...,"message":...}`):
+
+- `501` (`idle_not_configured`) — `start` sin `APIMAIL_WEBHOOK_URL`; no se abre conexión.
+- `401` (`unauthorized`) — sin API key válida.
+
+#### Notificación al webhook
+
+**Solo se notifica el correo que llega después de arrancar** la suscripción (el primer
+`UID` notificado es `UIDNEXT`); el correo ya presente en el buzón al arrancar no se
+notifica. Al detectar un mensaje nuevo se hace un `POST` con
+`Content-Type: application/json` al webhook. El payload lleva los **metadatos**
+(`mailbox`, `uid`, `uid_validity`, `flags`, `size`, `internal_date`, `envelope`) y, cuando
+el mensaje cabe en `APIMAIL_MAX_MESSAGE_BYTES` y su MIME se puede parsear, el `text`/`html`
+y la **lista de adjuntos** (`id`, `filename`, `content_type`, `size`, `inline`,
+`content_id`) —siempre **sin los bytes** de los adjuntos—; en ese caso `parsed` es `true`.
+Si no cabe en el límite o no se puede parsear, `parsed` es `false`, con `text`/`html` a
+`null` y `attachments` vacío, y solo se envían los metadatos.
+
+La entrega se reintenta de forma acotada (1 intento + 2 reintentos con espera corta): solo
+se reintentan los fallos de transporte y los estados `5xx`/`429`. La suscripción es
+*at-most-once*: el objetivo es despertar automatizaciones, no sustituir un `fetch` fiable.
 
 ## Licencia
 
