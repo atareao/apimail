@@ -188,6 +188,93 @@ error de arranque, sin *fallback* silencioso.
 > MailHog o GreenMail) pero registra un **aviso**: las credenciales viajarían en
 > claro.
 
+## Despliegue en un contenedor
+
+Además de compilarlo, apimail se puede ejecutar en un contenedor. El contenedor
+escucha en el puerto interno `3000` (`APIMAIL_PORT`) y hacia fuera se publica con
+`APIMAIL_PUBLISHED_PORT` (por defecto `3000`).
+
+### Construir y arrancar
+
+Construye la imagen con Podman (o directamente con `podman build -t apimail .` si
+prefieres prescindir de compose):
+
+```bash
+just build            # equivale a: podman compose build
+```
+
+Prepara el entorno y arranca el servicio en segundo plano:
+
+```bash
+cp .env.example .env  # y rellena los valores obligatorios
+podman compose up -d
+```
+
+Las **variables obligatorias** son las mismas que exige el binario (ver el
+apartado [Ejecución](#ejecución)): `APIMAIL_API_KEY`, `APIMAIL_IMAP_HOST`,
+`APIMAIL_IMAP_USER`, `APIMAIL_IMAP_PASSWORD`, `APIMAIL_SMTP_HOST`,
+`APIMAIL_SMTP_USER` y `APIMAIL_SMTP_PASSWORD`. El arranque sigue siendo
+**fail-closed** dentro del contenedor: sin ellas el proceso no levanta.
+
+### Volumen y cola persistente
+
+El contenedor monta un volumen con nombre en `/app/data` y fija
+`APIMAIL_QUEUE_PATH=/app/data/queue.jsonl` **por defecto**, de modo que la cola
+del webhook es **persistente** desde el primer arranque. La contrapartida es la
+que describe el apartado de la [cola de entrega duradera](#cola-de-entrega-duradera):
+ser persistente implica **reanudación** (al recrear el contenedor se notifica lo
+que llegó mientras estaba caído); sin ella la cola vive **en memoria** y cada
+recreación pierde en silencio las notificaciones encoladas. Para volver al modo
+en memoria basta con dejar `APIMAIL_QUEUE_PATH=` **en blanco** en el entorno: un
+valor vacío equivale a ausencia.
+
+### Sonda de salud y usuario
+
+`GET /api/health` es **público** (no requiere API key) y es el endpoint que usa
+el `healthcheck` del contenedor: responde `{"status":"ok","name":"apimail","version":"..."}`.
+El proceso corre como usuario no root (**uid 1000**) y `/app/data` es escribible
+por él.
+
+> **Formato de imagen y sonda.** Podman construye por defecto en formato **OCI**,
+> que **no admite** la instrucción `HEALTHCHECK` del Dockerfile: una imagen
+> construida con `podman build` «a pelo» saldría **sin** la sonda, y en silencio.
+> Las recetas de `just` ya fuerzan el formato `docker` (exportan
+> `BUILDAH_FORMAT=docker`), así que `just build`, `just dev` y `just deploy-local`
+> la conservan; si construyes a mano, añade `--format docker`. Con `compose up`
+> la sonda nunca se pierde: `compose.yml` declara su propio `healthcheck`,
+> independiente del formato de la imagen.
+
+### Imagen publicada en GHCR
+
+El proyecto publica la imagen en `ghcr.io/atareao/apimail`. Se etiqueta como
+`latest` y `sha-<7>` en cada push, y además como `vX.Y.Z` y `X.Y` cuando el push
+lleva un tag de versión. Para desplegar una imagen ya publicada **sin compilar**:
+
+```bash
+just deploy            # usa el tag latest
+just deploy vX.Y.Z     # fija un tag concreto (o sha-abc1234)
+```
+
+Las recetas de contenedor disponibles son `just dev` (levanta apimail
+reconstruyendo la imagen), `just build` (construye la imagen local), `just deploy
+[tag]` (descarga y recrea desde GHCR sin compilar), `just deploy-local` (compila
+en local y recrea) y `just health` (consulta `/api/health`). La lista completa la
+imprime `just help`.
+
+`just health` y `just deploy` respetan `APIMAIL_PUBLISHED_PORT` **si está presente
+en el entorno** (p. ej. `APIMAIL_PUBLISHED_PORT=8080 just health`); si no, asumen
+el puerto `3000`.
+
+### Plantilla de entorno
+
+`.env.example` es la plantilla lista para copiar a mano. `.env.j2` es la misma
+plantilla en **Jinja2** (variables `{{ apimail_* }}`), pensada para renderizar
+`.env` con Ansible. Ninguna de las dos contiene secretos reales.
+
+> El nivel de log **no** es configurable por variables de entorno: el binario
+> instala `tracing_subscriber::fmt()` sin `EnvFilter`, así que `RUST_LOG` no
+> tiene efecto.
+
 ## Autenticación
 
 Todas las rutas quedan protegidas **salvo** `GET /api/health`. Las peticiones
