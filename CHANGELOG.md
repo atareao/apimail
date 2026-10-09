@@ -1,4 +1,16 @@
 # Changelog
+## [0.3.1] - 2026-10-09
+
+### Bug Fixes
+
+- *(docs)* Clear the 19 rustdoc warnings and guard them in CI
+
+### Documentation
+
+- Mark PLAN-001 item 3 as released in v0.3.0
+- *(openspec)* Add rustdoc-hygiene change proposal
+- *(openspec)* Archive rustdoc-hygiene (no spec deltas)
+- Stop calling apimail a work in progress
 ## [0.3.0] - 2026-10-09
 
 ### Documentation
@@ -10,6 +22,10 @@
 ### Features
 
 - *(idle)* Deliver webhook notifications through a durable queue
+
+### Miscellaneous Tasks
+
+- Release v0.3.0
 ## [0.2.1] - 2026-10-09
 
 ### Bug Fixes
