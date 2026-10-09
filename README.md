@@ -16,8 +16,11 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > con `POST /api/messages`. La **conexión de lectura a IMAP** ya está disponible
 > mediante `GET /api/imap/status`, se pueden **listar y seleccionar buzones**
 > con `GET /api/mailboxes` y `POST /api/mailboxes/select`, y **leer y buscar
-> mensajes** con `GET /api/messages` y `GET /api/messages/{uid}`. También se
-> pueden **actualizar banderas, mover, copiar y borrar** mensajes con
+> mensajes** con `GET /api/messages` y `GET /api/messages/{uid}`, se puede
+> **parsear el MIME** del mensaje —cuerpo (`GET /api/messages/{uid}/body`) y
+> adjuntos (`GET /api/messages/{uid}/attachments` y
+> `GET /api/messages/{uid}/attachments/{id}`)— y también se pueden
+> **actualizar banderas, mover, copiar y borrar** mensajes con
 > `PATCH /api/messages/{uid}/flags`, `POST /api/messages/{uid}/move`,
 > `POST /api/messages/{uid}/copy` y `DELETE /api/messages/{uid}`. Sigue en
 > desarrollo la operación `IDLE`/webhook.
@@ -91,6 +94,19 @@ o no numérico provoca un **error de arranque** (menciona la variable), sin
 | Variable                        | Descripción                                     | Valor por defecto    |
 | ------------------------------- | ----------------------------------------------- | -------------------- |
 | `APIMAIL_MAX_ATTACHMENT_BYTES`  | Tamaño máximo total de los adjuntos (en bytes)  | `10485760` (10 MiB)  |
+
+### Parseo de mensajes entrantes
+
+| Variable                    | Descripción                                          | Valor por defecto    |
+| --------------------------- | ---------------------------------------------------- | -------------------- |
+| `APIMAIL_MAX_MESSAGE_BYTES` | Tamaño máximo del mensaje a traer y parsear (bytes)  | `26214400` (25 MiB)  |
+
+`APIMAIL_MAX_MESSAGE_BYTES` debe ser un entero **mayor que cero**; un valor `0`
+o no numérico provoca un **error de arranque** (menciona la variable), sin
+*fallback* silencioso. El límite acota sobre todo el **parseo**: si el servidor
+omite o declara a la baja el tamaño del mensaje, la segunda comprobación sobre la
+longitud realmente descargada es la que rechaza un cuerpo sobredimensionado antes
+de parsearlo.
 
 Puertos por defecto **derivados del modo TLS** (si no se fija `..._PORT`):
 
@@ -474,6 +490,117 @@ Códigos de error (modelo `{"error":...,"message":...}`):
 > perezosa (solo una conexión mientras esté viva) y los valores de búsqueda se
 > citan y escapan, rechazando `CR`/`LF`/`NUL`, para que ninguna petición pueda
 > inyectar comandos IMAP.
+
+### Cuerpo y adjuntos (protegido)
+
+Estas tres rutas actúan sobre **un único mensaje** identificado por su `uid` en
+la ruta; el buzón se pasa siempre como query `?mailbox=INBOX`. Requieren la API
+key, reutilizan la sesión IMAP perezosa y **nunca** exponen credenciales. El
+mensaje se trae con `BODY.PEEK[]` (sin fijar `\Seen`) y su MIME se parsea en
+memoria; nada se escribe a disco. El tamaño del mensaje está acotado por
+`APIMAIL_MAX_MESSAGE_BYTES`.
+
+#### Cuerpo (texto y HTML)
+
+```http
+GET /api/messages/{uid}/body?mailbox=INBOX
+```
+
+Devuelve el texto plano y el HTML **descodificados**. `text` y `html` están
+siempre presentes; cada uno es `null` cuando el mensaje no lleva esa parte y no
+puede derivarse de la otra (RFC 8621 §4.1.4).
+
+```json
+{
+  "mailbox": "INBOX",
+  "uid": 42,
+  "text": "Hola mundo",
+  "html": "<p>Hola</p>"
+}
+```
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages/42/body?mailbox=INBOX"
+```
+
+> **Seguridad:** el HTML se devuelve **sin sanear**; trátalo como contenido no
+> confiable y renderízalo de forma segura en el cliente.
+
+#### Listar adjuntos
+
+```http
+GET /api/messages/{uid}/attachments?mailbox=INBOX
+```
+
+Lista los adjuntos con sus metadatos y **sin** el contenido. Cada adjunto lleva
+un `id` posicional (0-based) estable.
+
+```json
+{
+  "mailbox": "INBOX",
+  "uid": 42,
+  "attachments": [
+    {
+      "id": 0,
+      "filename": "informe.pdf",
+      "content_type": "application/pdf",
+      "size": 13,
+      "inline": false,
+      "content_id": null
+    }
+  ]
+}
+```
+
+`filename`, `content_type` y `content_id` son `null` cuando el mensaje no los
+reporta.
+
+#### Descargar un adjunto
+
+```http
+GET /api/messages/{uid}/attachments/{id}?mailbox=INBOX
+```
+
+Devuelve el contenido **descodificado** del adjunto `id`, codificado en
+**base64** dentro del JSON (el contenido MIME no es necesariamente UTF-8, y así
+un `filename`/`content_type` hostil nunca llega a una cabecera HTTP).
+
+```json
+{
+  "mailbox": "INBOX",
+  "uid": 42,
+  "id": 0,
+  "filename": "informe.pdf",
+  "content_type": "application/pdf",
+  "size": 13,
+  "content_base64": "UERGIGNvbnRlbnQhCg=="
+}
+```
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages/42/attachments/0?mailbox=INBOX"
+```
+
+Códigos de error comunes (modelo `{"error":...,"message":...}`):
+
+- `400` (`invalid_request`) — `uid` no numérico o `0`; `id` no numérico; `mailbox`
+  ausente, en blanco o con caracteres de control (`CR`/`LF`/`NUL`). No se envía
+  ningún comando IMAP.
+- `404` (`mailbox_not_found`) — el servidor responde `NO`: el buzón no existe.
+- `404` (`message_not_found`) — el `uid` indicado no existe en el buzón.
+- `404` (`attachment_not_found`) — el `id` no corresponde a ningún adjunto.
+- `413` (`message_too_large`) — el mensaje supera `APIMAIL_MAX_MESSAGE_BYTES`.
+- `422` (`message_not_parsable`) — el mensaje existe pero su MIME no puede
+  parsearse.
+- `503` (`imap_unavailable`) — el servidor o la sesión no están disponibles.
+- `401` (`unauthorized`) — sin API key válida.
+
+> **Seguridad:** el `uid` que llega al comando IMAP procede del número validado
+> en el borde HTTP, de modo que ningún contenido MIME puede inyectar un comando.
+> El contenido de los adjuntos solo viaja dentro del cuerpo JSON, nunca en una
+> cabecera.
 
 ### Banderas, mover, copiar y borrar (protegido)
 
