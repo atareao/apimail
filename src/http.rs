@@ -269,6 +269,32 @@
 //!
 //! The `413`/`422`/`404` messages are fixed strings, never third-party error
 //! text, so no untrusted content is reflected to the client.
+//!
+//! # IDLE contract
+//!
+//! `POST /api/idle/start`, `POST /api/idle/stop` and `GET /api/idle/status` are
+//! protected by [`require_api_key`]. They control the IDLE subscription, which
+//! watches a single configured mailbox (`APIMAIL_IDLE_MAILBOX`, default `INBOX`)
+//! over its own dedicated IMAP connection and POSTs every newly arrived message
+//! to `APIMAIL_WEBHOOK_URL`, without interfering with the shared session used by
+//! the other routes.
+//!
+//! - `POST /api/idle/start` starts the subscription and returns HTTP `200`,
+//!   `Content-Type: application/json` and
+//!   `{"status":"running","mailbox":"INBOX","last_error":null}`. It is
+//!   idempotent: starting an already-running subscription returns the same body
+//!   without opening a second connection.
+//! - `POST /api/idle/stop` stops the subscription and returns HTTP `200` with
+//!   `{"status":"stopped",...}`; stopping when it is not running is a no-op.
+//! - `GET /api/idle/status` returns HTTP `200` with the current `status`
+//!   (`"running"` or `"stopped"`), the watched `mailbox` and `last_error` (a
+//!   stable code such as `"imap_unavailable"`/`"webhook_failed"`, or `null`).
+//!
+//! Failures use the shared `{"error":...,"message":...}` envelope:
+//!
+//! - `501` (`idle_not_configured`) — `start` was requested without a configured
+//!   `APIMAIL_WEBHOOK_URL`; no connection is opened.
+//! - `401` (`unauthorized`) — missing or invalid API key.
 
 use axum::body::{Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
@@ -286,6 +312,10 @@ use subtle::ConstantTimeEq;
 
 use crate::Config;
 use crate::config::TlsMode;
+use crate::idle::{
+    HttpWebhookSender, IdleConnector, IdleError, IdleSettings, IdleSupervisor, TokioIdleConnector,
+    WebhookSender,
+};
 use crate::imap::{
     Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
     MailboxStatus, Message, MessageEnvelope, ParsedMessageError, SearchCriteria, SearchDate,
@@ -349,6 +379,8 @@ pub struct AppState {
     imap: Arc<ConnectionManager>,
     /// TLS mode of the configured IMAP endpoint, for the status endpoint.
     imap_tls: TlsMode,
+    /// IDLE subscription supervisor (dedicated connection + webhook).
+    idle: Arc<IdleSupervisor>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -363,6 +395,7 @@ impl std::fmt::Debug for AppState {
             .field("max_message_bytes", &self.max_message_bytes)
             .field("imap", &"***")
             .field("imap_tls", &self.imap_tls)
+            .field("idle", &"***")
             .finish()
     }
 }
@@ -406,12 +439,56 @@ impl AppState {
 
     /// Builds the application state with both services injected.
     ///
-    /// Used by tests to exercise the HTTP layer without touching the network.
+    /// Used by tests to exercise the HTTP layer without touching the network. It
+    /// delegates to [`with_idle`](Self::with_idle) with a real
+    /// [`TokioIdleConnector`] and an [`HttpWebhookSender`], both of which are
+    /// infallible to build (their TLS/HTTP clients are resolved lazily).
     pub fn with_services(
         config: &Config,
         mailer: Arc<dyn MailSender>,
         imap_connector: Arc<dyn ImapConnector>,
     ) -> Self {
+        let idle_connector: Arc<dyn IdleConnector> = Arc::new(TokioIdleConnector::new(
+            config.account.imap.clone(),
+            config.imap_timeout,
+        ));
+        let webhook_sender: Arc<dyn WebhookSender> =
+            Arc::new(HttpWebhookSender::new(config.webhook_timeout));
+        Self::with_idle(
+            config,
+            mailer,
+            imap_connector,
+            idle_connector,
+            webhook_sender,
+        )
+    }
+
+    /// Builds the application state with every service injected.
+    ///
+    /// Used by tests to exercise the HTTP layer, including the IDLE routes,
+    /// without touching the network: the dedicated-connection factory and the
+    /// webhook client are supplied by the caller. The subscription is built from
+    /// `config` (`APIMAIL_WEBHOOK_URL`, `APIMAIL_IDLE_MAILBOX`,
+    /// `APIMAIL_WEBHOOK_TIMEOUT_SECS` and `APIMAIL_MAX_MESSAGE_BYTES`) but is not
+    /// started until `POST /api/idle/start`.
+    pub fn with_idle(
+        config: &Config,
+        mailer: Arc<dyn MailSender>,
+        imap_connector: Arc<dyn ImapConnector>,
+        idle_connector: Arc<dyn IdleConnector>,
+        webhook_sender: Arc<dyn WebhookSender>,
+    ) -> Self {
+        let idle = Arc::new(IdleSupervisor::new(
+            idle_connector,
+            webhook_sender,
+            IdleSettings {
+                mailbox: config.idle_mailbox.clone(),
+                webhook_url: config.webhook_url.clone(),
+                webhook_timeout: config.webhook_timeout,
+                max_message_bytes: config.max_message_bytes,
+            },
+            Backoff::default(),
+        ));
         Self {
             name: APP_NAME,
             version: APP_VERSION,
@@ -432,7 +509,13 @@ impl AppState {
             default_from: config.account.smtp.username.clone(),
             imap: Arc::new(ConnectionManager::new(imap_connector, Backoff::default())),
             imap_tls: config.account.imap.tls,
+            idle,
         }
+    }
+
+    /// The IDLE subscription supervisor, controlled by the `/api/idle/*` routes.
+    pub fn idle(&self) -> &IdleSupervisor {
+        &self.idle
     }
 
     /// Maximum total size, in bytes, of the decoded attachments of a message.
@@ -1887,6 +1970,64 @@ async fn send_message(
     Ok((StatusCode::OK, Json(SentResponse { status: "sent" })).into_response())
 }
 
+/// Failure mode of the IDLE control routes.
+///
+/// Only `start` can fail: it answers `501` when no webhook URL is configured and
+/// opens no connection. `stop` and `status` always succeed.
+#[derive(Debug)]
+enum IdleHttpError {
+    /// No webhook URL is configured (`501`).
+    NotConfigured,
+}
+
+impl IntoResponse for IdleHttpError {
+    fn into_response(self) -> Response {
+        let (status, error, message) = match self {
+            Self::NotConfigured => (
+                StatusCode::NOT_IMPLEMENTED,
+                "idle_not_configured",
+                "idle notifications are not configured".to_string(),
+            ),
+        };
+        (status, Json(ErrorResponse { error, message })).into_response()
+    }
+}
+
+impl From<IdleError> for IdleHttpError {
+    fn from(error: IdleError) -> Self {
+        // Explicit match (no wildcard): adding a variant to `IdleError` must be a
+        // compile error here, so a new failure mode can never be silently mapped
+        // to `NotConfigured`.
+        match error {
+            IdleError::NotConfigured => Self::NotConfigured,
+        }
+    }
+}
+
+/// `POST /api/idle/start` handler: starts the IDLE subscription.
+///
+/// Idempotent and safe against concurrent calls; the domain supervisor returns
+/// the resulting status. Without a configured webhook it reports `501` through
+/// [`IdleHttpError`].
+async fn idle_start(State(state): State<AppState>) -> Result<Response, IdleHttpError> {
+    let status = state.idle().start().await?;
+    Ok((StatusCode::OK, Json(status)).into_response())
+}
+
+/// `POST /api/idle/stop` handler: stops the IDLE subscription.
+///
+/// Idempotent: stopping a subscription that is not running is a no-op.
+async fn idle_stop(State(state): State<AppState>) -> Response {
+    let status = state.idle().stop().await;
+    (StatusCode::OK, Json(status)).into_response()
+}
+
+/// `GET /api/idle/status` handler: reports the subscription state.
+async fn idle_status(State(state): State<AppState>) -> Response {
+    let status = state.idle().status().await;
+    (StatusCode::OK, Json(status)).into_response()
+}
+
 /// Authorization middleware: rejects requests without a valid `Bearer` API key.
 async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if is_authorized(&request, &state.api_key_hash) {
@@ -1943,6 +2084,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/whoami", get(whoami))
         .route("/api/account", get(account))
         .route("/api/imap/status", get(imap_status))
+        .route("/api/idle/start", post(idle_start))
+        .route("/api/idle/stop", post(idle_stop))
+        .route("/api/idle/status", get(idle_status))
         .route("/api/mailboxes", get(list_mailboxes))
         .route("/api/mailboxes/select", post(select_mailbox))
         .route(
