@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-09
+goal: Distribuir apimail como imagen de contenedor en GHCR y arreglar las recetas de contenedor y salud del justfile copiadas de Valet
+skip_specs: true

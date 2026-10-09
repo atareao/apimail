@@ -255,9 +255,13 @@ where
         );
     }
 
+    // A blank port counts as absent, coherently with the rest of the file
+    // (`required()`, `QUEUE_PATH_VAR`, `WEBHOOK_URL_VAR`, `IDLE_MAILBOX_VAR`):
+    // orchestrators pass empty-but-present variables, and the port must then
+    // fall back to the one derived from the TLS mode.
     let port_var = format!("{prefix}_PORT");
     let port = match lookup(&port_var) {
-        Some(raw) => {
+        Some(raw) if !raw.trim().is_empty() => {
             let parsed = raw.parse::<u16>().map_err(|_| AccountError::InvalidPort {
                 name: port_var.clone(),
                 value: raw.clone(),
@@ -270,7 +274,7 @@ where
             }
             parsed
         }
-        None => tls.default_port(protocol),
+        _ => tls.default_port(protocol),
     };
 
     Ok(MailEndpoint {
@@ -889,6 +893,34 @@ mod tests {
                 }
                 other => panic!("expected InvalidPort for {value}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn blank_imap_port_counts_as_unset() {
+        // A blank port means "not configured", not "invalid": it falls back to
+        // the port derived from the TLS mode, exactly as if it were absent.
+        for value in ["", "   "] {
+            let account = MailAccount::from_lookup(&lookup_from(
+                base_entries()
+                    .into_iter()
+                    .chain([("APIMAIL_IMAP_PORT", value)]),
+            ))
+            .expect("blank imap port must count as unset");
+            assert_eq!(account.imap.port, 993);
+        }
+    }
+
+    #[test]
+    fn blank_smtp_port_counts_as_unset() {
+        for value in ["", "   "] {
+            let account =
+                MailAccount::from_lookup(&lookup_from(base_entries().into_iter().chain([
+                    ("APIMAIL_SMTP_TLS", "starttls"),
+                    ("APIMAIL_SMTP_PORT", value),
+                ])))
+                .expect("blank smtp port must count as unset");
+            assert_eq!(account.smtp.port, 587);
         }
     }
 

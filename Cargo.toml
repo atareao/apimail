@@ -20,6 +20,11 @@ exclude = [
     "/cliff.toml",
     "/.justfile",
     "/.vampus.yml",
+    "/.dockerignore",
+    "/Dockerfile",
+    "/compose.yml",
+    "/.env.j2",
+    "/.env.example",
 ]
 
 [dependencies]

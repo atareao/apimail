@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-10-09
+goal: Tratar un APIMAIL_IMAP_PORT / APIMAIL_SMTP_PORT en blanco como ausente y derivar el puerto del modo TLS

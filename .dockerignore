@@ -1,0 +1,18 @@
+# Artefactos de compilación locales.
+target/
+# Metadatos y configuración del repositorio: no son necesarios para construir.
+.git/
+.github/
+openspec/
+plans/
+.opencode/
+.vscode/
+.idea/
+# Documentación y ficheros de orquestación.
+*.md
+Dockerfile
+compose.yml
+.gitignore
+.dockerignore
+# Secretos de entorno: nunca deben viajar al contexto de build.
+/.env*

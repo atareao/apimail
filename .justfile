@@ -1,4 +1,4 @@
-# Valet - Justfile
+# apimail - Justfile
 
 # ── Desarrollo (Podman por defecto) ─────────────────────────────
 # El proyecto usa Podman para desarrollo local. Ajusta el binario
@@ -12,23 +12,28 @@
 user                    := 'atareao'
 name                    := `basename ${PWD}`
 version                 := `vampus show`
-registry                := 'docker.io'
+registry                := 'ghcr.io'
 podman_fmt_image        := '{{.Image}}'
 podman_fmt_id           := '{{.Id}}'
 podman_fmt_config_image := '{{.Config.Image}}'
 
+# Podman construye por defecto en formato OCI, que no admite la instrucción
+# HEALTHCHECK del Dockerfile y la descartaría en silencio. Forzar el formato
+# `docker` conserva la sonda de /api/health en la imagen construida con Podman.
+export BUILDAH_FORMAT := 'docker'
+
 # Levanta el servidor con frontend embebido (Podman)
 dev:
     podman compose up -d --build --force-recreate
-    @echo "Valet: http://localhost:3000"
+    @echo "apimail: http://localhost:3000"
 
 # Levanta el servidor con frontend embebido (Docker)
 dev-docker:
     docker compose up -d
-    @echo "Valet: http://localhost:3000"
+    @echo "apimail: http://localhost:3000"
 
 # ── Imagen y despliegue (GHCR) ──────────────────────────────────
-# La imagen publicada vive en ghcr.io/atareao/valet-ai. `deploy` la
+# La imagen publicada vive en ghcr.io/atareao/apimail. `deploy` la
 # descarga y recrea el servicio SIN compilar; `deploy-local` compila
 # desde el working tree. Ambos verifican /api/health y fallan con
 # código distinto de cero si el servicio no queda sano.
@@ -48,7 +53,7 @@ build:
 deploy tag="latest":
     #!/usr/bin/env bash
     set -euo pipefail
-    image="ghcr.io/atareao/valet-ai:{{tag}}"
+    image="ghcr.io/atareao/apimail:{{tag}}"
 
     echo "▶ Descargando ${image} ..."
     podman pull "${image}"
@@ -64,7 +69,7 @@ deploy tag="latest":
     # Obtén el contenedor de forma robusta desde compose (sin cablear su nombre).
     cid="$(podman compose ps -q | head -n1)"
     if [ -z "${cid}" ]; then
-        echo "❌ No hay contenedor 'valet' en ejecución tras el despliegue."
+        echo "❌ No hay contenedor 'apimail' en ejecución tras el despliegue."
         exit 1
     fi
 
@@ -94,7 +99,7 @@ deploy-local:
 
     cid="$(podman compose ps -q | head -n1)"
     if [ -z "${cid}" ]; then
-        echo "❌ No hay contenedor 'valet' en ejecución tras el despliegue."
+        echo "❌ No hay contenedor 'apimail' en ejecución tras el despliegue."
         exit 1
     fi
     echo "▶ Imagen en ejecución: $(podman inspect --format '{{ podman_fmt_config_image }}' "${cid}")"
@@ -103,16 +108,16 @@ deploy-local:
 
 # Consulta puntual del endpoint de salud (muestra el JSON)
 health:
-    curl -fsS http://127.0.0.1:3000/api/health
+    curl -fsS "http://127.0.0.1:${APIMAIL_PUBLISHED_PORT:-3000}/api/health"
 
-# (privada) Espera acotada a que /api/health reporte status ok y db connected
+# (privada) Espera acotada a que /api/health reporte status ok y name apimail
 _verify-health:
     #!/usr/bin/env bash
     set -uo pipefail
     # Se usa 127.0.0.1 y no localhost: con el backend de red `passt` localhost
     # resuelve a ::1 y la conexión falla, mientras que 127.0.0.1 funciona tanto
     # con `passt` como con `rootlessport`.
-    url="http://127.0.0.1:3000/api/health"
+    url="http://127.0.0.1:${APIMAIL_PUBLISHED_PORT:-3000}/api/health"
     attempts=30
     delay=2
 
@@ -121,7 +126,7 @@ _verify-health:
     for ((i = 1; i <= attempts; i++)); do
         if body="$(curl -fsS "${url}" 2>/dev/null)"; then
             if echo "${body}" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' \
-                && echo "${body}" | grep -Eq '"db"[[:space:]]*:[[:space:]]*"connected"'; then
+                && echo "${body}" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"apimail"'; then
                 echo "✅ Servicio sano tras ${i} intento(s)."
                 echo "   ${body}"
                 version="$(echo "${body}" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
@@ -178,8 +183,8 @@ clean:
 # Ayuda
 help:
     @echo "Comandos disponibles:"
-    @echo "  just dev           - Levanta Valet con Podman (reconstruye imagen)"
-    @echo "  just dev-docker    - Levanta Valet con Docker"
+    @echo "  just dev           - Levanta apimail con Podman (reconstruye imagen)"
+    @echo "  just dev-docker    - Levanta apimail con Docker"
     @echo "  just build         - Construye la imagen local"
     @echo "  just deploy [tag]  - Despliega la imagen de GHCR (por defecto latest)"
     @echo "  just deploy-local  - Construye en local y despliega"
