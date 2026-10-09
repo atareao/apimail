@@ -1,4 +1,15 @@
 # Changelog
+## [0.3.0] - 2026-10-09
+
+### Documentation
+
+- Mark PLAN-001 items 1 and 2 as done in v0.2.1
+- *(openspec)* Add and archive the webhook-delivery change
+- Mark PLAN-001 item 3 as done
+
+### Features
+
+- *(idle)* Deliver webhook notifications through a durable queue
 ## [0.2.1] - 2026-10-09
 
 ### Bug Fixes
@@ -9,6 +20,10 @@
 
 - Move the roadmap into plans/ and add PLAN-001.md
 - *(openspec)* Add and archive the release-hygiene change
+
+### Miscellaneous Tasks
+
+- Release v0.2.1
 ## [0.2.0] - 2026-10-09
 
 ### Bug Fixes
