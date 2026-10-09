@@ -1,4 +1,7 @@
-//! `apimail` — HTTP API skeleton for the mail service.
+//! `apimail` — an HTTP API built on Axum for a full CRUD over a mail account: read,
+//! flag and search messages over IMAP, parse MIME bodies (plain text, HTML and
+//! attachments), send outgoing mail over SMTP, and stream new-mail notifications
+//! with IDLE and an at-least-once webhook backed by a durable queue.
 
 pub mod config;
 pub mod http;

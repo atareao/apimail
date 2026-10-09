@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-09
+goal: Limpiar los 19 warnings de rustdoc, alinear AGENTS.md con el estado real y blindar el lint de documentación en CI
+skip_specs: true
