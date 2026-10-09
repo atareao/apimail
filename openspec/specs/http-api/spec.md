@@ -6,10 +6,10 @@ Expone un servidor HTTP Axum con configuración de arranque y un endpoint de sal
 ## Requirements
 
 ### Requirement: Server startup and configuration
-The service SHALL start an HTTP server bound to a configurable host and port.
+The service SHALL start an HTTP server bound to a configurable host and port, and SHALL validate its required configuration — including the API key and the mail account credentials — at startup.
 
 #### Scenario: Start with defaults
-- **WHEN** the service starts without `APIMAIL_HOST` or `APIMAIL_PORT`
+- **WHEN** the service starts with a valid `APIMAIL_API_KEY` and a complete mail account configuration and without `APIMAIL_HOST` or `APIMAIL_PORT`
 - **THEN** it binds to host `0.0.0.0` and port `3000`
 
 #### Scenario: Start with environment overrides

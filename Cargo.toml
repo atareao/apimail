@@ -8,15 +8,27 @@ repository = "https://github.com/atareao/apimail"
 readme = "README.md"
 keywords = ["email", "imap", "smtp", "axum", "api"]
 categories = ["web-programming::http-server", "email"]
+rust-version = "1.88"
 
 [dependencies]
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 axum = "0.8.9"
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
+mail-parser = { version = "0.11", features = ["full_encoding"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+serde_urlencoded = "0.7"
+sha2 = "0.10"
+subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+webpki-roots = "1"
 
 [dev-dependencies]
 http-body-util = "0.1.5"
