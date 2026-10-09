@@ -1,11 +1,11 @@
 # AGENTS.md — apimail
 
-> Proyecto en construcción. Verifica el estado real antes de asumir que algo existe.
+> Este fichero describe el estado del proyecto. Verifica siempre el estado real (ficheros, tests, tags) antes de asumir que algo existe o funciona.
 
 ## Estado actual (verificado)
 - `Cargo.toml` (Rust **edition 2024**) ya tiene las dependencias base: `axum`, `tokio`, `serde`/`serde_json`, `tracing`/`tracing-subscriber`, `thiserror`; dev: `tower`, `http-body-util`.
 - API implementada en estructura **lib + bin**: **nueve ficheros** en `src/` (`lib.rs`, `config.rs`, `http.rs`, `imap.rs`, `smtp.rs`, `mime.rs`, `idle.rs`, `queue.rs` y `main.rs`); `Config` y `MailAccount` viven en `src/config.rs`, y `build_router` en `src/http.rs`. **12** ficheros de test en `tests/` (cubren IMAP, SMTP, MIME, IDLE, la cola y el arranque).
-- Release publicada más reciente: **`v0.3.0`** (crates.io + GitHub Release). El roadmap del MVP (`plans/PLAN.md`) está **completo**.
+- Roadmap del MVP **completo** (`plans/PLAN.md`) y publicado en crates.io y GitHub Releases; para la última versión, `git tag --sort=-v:refname`.
 - Autenticación por **API key** (`APIMAIL_API_KEY`, fail-closed) y **cuenta IMAP/SMTP** configurada por entorno (fail-closed) con endpoint `GET /api/account`.
 - Existe `openspec/` (schema `spec-driven`), `README.md`, `plans/PLAN.md` (roadmap completado) y `plans/PLAN-001.md` (trabajo posterior), gitflow + CI/CD (`.github/workflows/`). No hay `frontend/`.
 
