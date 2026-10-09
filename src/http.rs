@@ -223,6 +223,52 @@
 //! Validation happens at the HTTP boundary before any command is sent; the
 //! `STORE` query is built only from the allowlist and the `UID` set is rendered
 //! from a numeric `u32`, so no request can inject IMAP commands.
+//!
+//! # MIME parsing contract
+//!
+//! `GET /api/messages/{uid}/body`, `GET /api/messages/{uid}/attachments` and
+//! `GET /api/messages/{uid}/attachments/{id}` are protected by [`require_api_key`].
+//! All three select the mailbox named by the required `mailbox` query parameter,
+//! fetch the single message identified by the numeric `uid` in the path and
+//! parse its MIME content on the existing lazily-established session; the raw
+//! source is bounded by [`AppState::max_message_bytes`] (configured through
+//! `APIMAIL_MAX_MESSAGE_BYTES`) and is never written to disk, logs or headers.
+//! The `id` is the positional attachment identifier, so `0` is valid.
+//!
+//! On success they return HTTP `200` and `Content-Type: application/json`:
+//!
+//! ```json
+//! {"mailbox":"INBOX","uid":42,"text":"...","html":"..."}
+//! {"mailbox":"INBOX","uid":42,"attachments":[
+//!   {"id":0,"filename":"informe.pdf","content_type":"application/pdf",
+//!    "size":13,"inline":false,"content_id":null}]}
+//! {"mailbox":"INBOX","uid":42,"id":0,"filename":"informe.pdf",
+//!  "content_type":"application/pdf","size":13,"content_base64":"..."}
+//! ```
+//!
+//! `text` and `html` are always present (each `null` when the message carries no
+//! such body and none can be derived, following RFC 8621 §4.1.4). The listing
+//! omits the content; only the single-attachment route returns it, base64-encoded
+//! inside the JSON body so a hostile `filename`/`content_type` can never reach an
+//! HTTP header. HTML is returned verbatim: rendering it safely is the client's
+//! responsibility.
+//!
+//! Failures use the shared `{"error":...,"message":...}` envelope:
+//!
+//! - `400` (`invalid_request`) — a non-numeric or zero `uid`, a non-numeric `id`,
+//!   a missing/blank `mailbox`, or a control character in any value; no IMAP
+//!   command is sent.
+//! - `404` (`mailbox_not_found`) — the server answered `NO` for the mailbox.
+//! - `404` (`message_not_found`) — the requested `uid` does not exist.
+//! - `404` (`attachment_not_found`) — the requested `id` matches no attachment.
+//! - `413` (`message_too_large`) — the message exceeds `APIMAIL_MAX_MESSAGE_BYTES`
+//!   and is rejected before its MIME content is parsed.
+//! - `422` (`message_not_parsable`) — the message exists but cannot be parsed.
+//! - `503` (`imap_unavailable`) — the session or server is unavailable.
+//! - `401` (`unauthorized`) — missing or invalid API key.
+//!
+//! The `413`/`422`/`404` messages are fixed strings, never third-party error
+//! text, so no untrusted content is reflected to the client.
 
 use axum::body::{Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
@@ -242,9 +288,10 @@ use crate::Config;
 use crate::config::TlsMode;
 use crate::imap::{
     Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
-    MailboxStatus, Message, MessageEnvelope, SearchCriteria, SearchDate, SystemFlag,
-    TokioImapConnector,
+    MailboxStatus, Message, MessageEnvelope, ParsedMessageError, SearchCriteria, SearchDate,
+    SystemFlag, TokioImapConnector,
 };
+use crate::mime::ParsedAttachment;
 use crate::smtp::{
     MailSender, MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage, SmtpError,
     SmtpSender,
@@ -294,6 +341,8 @@ pub struct AppState {
     mailer: Arc<dyn MailSender>,
     /// Maximum total size, in bytes, of the decoded attachments of a message.
     max_attachment_bytes: usize,
+    /// Maximum size, in bytes, of a message that will be fetched and parsed.
+    max_message_bytes: usize,
     /// Sender used when a message omits `from` (the configured SMTP user).
     default_from: String,
     /// Lazy, persistent IMAP connection manager.
@@ -311,6 +360,7 @@ impl std::fmt::Debug for AppState {
             .field("account", &self.account)
             .field("mailer", &"***")
             .field("max_attachment_bytes", &self.max_attachment_bytes)
+            .field("max_message_bytes", &self.max_message_bytes)
             .field("imap", &"***")
             .field("imap_tls", &self.imap_tls)
             .finish()
@@ -378,6 +428,7 @@ impl AppState {
             },
             mailer,
             max_attachment_bytes: config.max_attachment_bytes,
+            max_message_bytes: config.max_message_bytes,
             default_from: config.account.smtp.username.clone(),
             imap: Arc::new(ConnectionManager::new(imap_connector, Backoff::default())),
             imap_tls: config.account.imap.tls,
@@ -387,6 +438,14 @@ impl AppState {
     /// Maximum total size, in bytes, of the decoded attachments of a message.
     pub fn max_attachment_bytes(&self) -> usize {
         self.max_attachment_bytes
+    }
+
+    /// Maximum size, in bytes, of a message that will be fetched and parsed.
+    ///
+    /// Values reported or fetched above this bound are rejected before any MIME
+    /// parsing, so untrusted content cannot exhaust memory.
+    pub fn max_message_bytes(&self) -> usize {
+        self.max_message_bytes
     }
 
     /// Upper bound for the raw JSON request body of `POST /api/messages`.
@@ -744,6 +803,86 @@ impl MessageDetailResponse {
     }
 }
 
+/// JSON payload returned by a successful `GET /api/messages/{uid}/body`.
+///
+/// `text` and `html` are always present; each is `null` when the message carries
+/// no such body and none can be derived.
+#[derive(Debug, Serialize)]
+struct MessageBodyResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Unique identifier within the mailbox.
+    uid: u32,
+    /// Derived plain-text body, or `null`.
+    text: Option<String>,
+    /// Decoded HTML body, or `null`.
+    html: Option<String>,
+}
+
+/// One attachment in the `GET /api/messages/{uid}/attachments` response.
+///
+/// The content is intentionally omitted: it is only ever returned by the
+/// single-attachment route, base64-encoded inside the JSON body.
+#[derive(Debug, Serialize)]
+struct ParsedAttachmentDto {
+    /// Positional identifier within the parsed attachment list.
+    id: u32,
+    /// Decoded file name, or `null`.
+    filename: Option<String>,
+    /// MIME content type, or `null`.
+    content_type: Option<String>,
+    /// Decoded content length, in bytes.
+    size: usize,
+    /// Whether the part is marked `inline`.
+    inline: bool,
+    /// `Content-ID`, or `null`.
+    content_id: Option<String>,
+}
+
+impl From<&ParsedAttachment> for ParsedAttachmentDto {
+    fn from(attachment: &ParsedAttachment) -> Self {
+        Self {
+            id: attachment.id,
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone(),
+            size: attachment.size,
+            inline: attachment.inline,
+            content_id: attachment.content_id.clone(),
+        }
+    }
+}
+
+/// JSON payload returned by a successful `GET /api/messages/{uid}/attachments`.
+#[derive(Debug, Serialize)]
+struct AttachmentListResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Unique identifier within the mailbox.
+    uid: u32,
+    /// The message's attachments, without their content.
+    attachments: Vec<ParsedAttachmentDto>,
+}
+
+/// JSON payload returned by a successful
+/// `GET /api/messages/{uid}/attachments/{id}`.
+#[derive(Debug, Serialize)]
+struct AttachmentResponse {
+    /// Selected mailbox name.
+    mailbox: String,
+    /// Unique identifier within the mailbox.
+    uid: u32,
+    /// Positional identifier of the attachment.
+    id: u32,
+    /// Decoded file name, or `null`.
+    filename: Option<String>,
+    /// MIME content type, or `null`.
+    content_type: Option<String>,
+    /// Decoded content length, in bytes.
+    size: usize,
+    /// The attachment's decoded content, base64-encoded.
+    content_base64: String,
+}
+
 /// Query string of `GET /api/messages`, decoded loosely into optional strings.
 ///
 /// Kept as `Option<String>` for every field so the handler can validate each
@@ -1032,6 +1171,15 @@ fn parse_uid(uid: &str) -> Result<u32, MessageError> {
     Ok(uid)
 }
 
+/// Parses a positional attachment `id` from the path.
+///
+/// Unlike `uid`, `0` is a valid attachment identifier; only a non-numeric value
+/// is rejected.
+fn parse_attachment_id(id: &str) -> Result<u32, MessageError> {
+    id.parse()
+        .map_err(|_| MessageError::InvalidRequest("`id` must be a numeric identifier".to_string()))
+}
+
 /// Validates a non-blank destination mailbox.
 ///
 /// `CR`, `LF` and `NUL` are rejected at the boundary (defence in depth); the
@@ -1107,6 +1255,12 @@ enum MessageError {
     MailboxNotFound,
     /// The requested message does not exist (`404`).
     MessageNotFound,
+    /// The requested attachment does not exist (`404`).
+    AttachmentNotFound,
+    /// The message exceeds the configured parsing size limit (`413`).
+    TooLarge,
+    /// The message exists but its MIME content cannot be parsed (`422`).
+    Unparsable,
     /// The server does not announce the extension the operation needs (`501`).
     CapabilityNotSupported(String),
     /// The IMAP session or server is unavailable (`503`).
@@ -1126,6 +1280,21 @@ impl IntoResponse for MessageError {
                 StatusCode::NOT_FOUND,
                 "message_not_found",
                 "message not found".to_string(),
+            ),
+            Self::AttachmentNotFound => (
+                StatusCode::NOT_FOUND,
+                "attachment_not_found",
+                "attachment not found".to_string(),
+            ),
+            Self::TooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "message_too_large",
+                "message exceeds the configured size limit".to_string(),
+            ),
+            Self::Unparsable => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "message_not_parsable",
+                "message cannot be parsed".to_string(),
             ),
             Self::CapabilityNotSupported(message) => (
                 StatusCode::NOT_IMPLEMENTED,
@@ -1155,6 +1324,21 @@ impl From<ImapError> for MessageError {
                 Self::CapabilityNotSupported(error.public_message().to_string())
             }
             other => Self::Unavailable(other.public_message().to_string()),
+        }
+    }
+}
+
+/// Maps a [`ParsedMessageError`] to the message routes' failure model.
+///
+/// The IMAP variant reuses the existing [`From<ImapError>`] mapping; the size
+/// guard and the parser refusal become `413` and `422` respectively, each with a
+/// fixed message that never echoes third-party text.
+impl From<ParsedMessageError> for MessageError {
+    fn from(error: ParsedMessageError) -> Self {
+        match error {
+            ParsedMessageError::Imap(error) => Self::from(error),
+            ParsedMessageError::TooLarge { .. } => Self::TooLarge,
+            ParsedMessageError::Unparsable => Self::Unparsable,
         }
     }
 }
@@ -1460,6 +1644,103 @@ async fn fetch_message(
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
+/// `GET /api/messages/{uid}/body` handler: fetches the single message, parses
+/// its MIME content and returns its plain-text and HTML bodies.
+///
+/// The `uid` path parameter and the `mailbox` query parameter are validated
+/// first (shared JSON `400` envelope), so no IMAP command is sent for an invalid
+/// request. Oversized and unparsable messages are reported by the domain layer
+/// and mapped to `413`/`422`.
+async fn get_message_body(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, MessageError> {
+    let uid = parse_uid(&uid)?;
+    let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
+
+    let parsed = state
+        .imap
+        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(MessageBodyResponse {
+            mailbox,
+            uid,
+            text: parsed.text,
+            html: parsed.html,
+        }),
+    )
+        .into_response())
+}
+
+/// `GET /api/messages/{uid}/attachments` handler: fetches the single message,
+/// parses it and returns the metadata of each attachment, without their content.
+async fn list_attachments(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, MessageError> {
+    let uid = parse_uid(&uid)?;
+    let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
+
+    let parsed = state
+        .imap
+        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
+        .await?;
+
+    let response = AttachmentListResponse {
+        mailbox,
+        uid,
+        attachments: parsed
+            .attachments
+            .iter()
+            .map(ParsedAttachmentDto::from)
+            .collect(),
+    };
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// `GET /api/messages/{uid}/attachments/{id}` handler: fetches the single
+/// message, parses it and returns the decoded content of the attachment
+/// identified by the positional `id`, base64-encoded inside the JSON body.
+///
+/// The content is never reflected into an HTTP header, so a hostile `filename`
+/// or `content_type` cannot inject one.
+async fn get_attachment(
+    State(state): State<AppState>,
+    Path((uid, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, MessageError> {
+    let uid = parse_uid(&uid)?;
+    let id = parse_attachment_id(&id)?;
+    let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
+
+    let parsed = state
+        .imap
+        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
+        .await?;
+    let attachment = parsed
+        .attachment(id)
+        .ok_or(MessageError::AttachmentNotFound)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(AttachmentResponse {
+            mailbox,
+            uid,
+            id,
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone(),
+            size: attachment.size,
+            content_base64: STANDARD.encode(&attachment.content),
+        }),
+    )
+        .into_response())
+}
+
 /// `PATCH /api/messages/{uid}/flags` handler: applies flag additions/removals to
 /// a single message and returns its resulting flags.
 ///
@@ -1671,6 +1952,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/messages/{uid}/flags", patch(update_flags))
         .route("/api/messages/{uid}/move", post(move_message))
         .route("/api/messages/{uid}/copy", post(copy_message))
+        .route("/api/messages/{uid}/body", get(get_message_body))
+        .route("/api/messages/{uid}/attachments", get(list_attachments))
+        .route("/api/messages/{uid}/attachments/{id}", get(get_attachment))
         // The GET listing and the POST sending share the path; the send handler
         // enforces its own body limit (and its JSON `413` envelope), so axum's
         // default rejection must not pre-empt it.

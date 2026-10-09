@@ -32,6 +32,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::config::{Config, MailEndpoint, TlsMode};
+use crate::mime::{MimeError, ParsedMessage};
 
 /// Boxed future returned by the [`ImapSession`] and [`ImapConnector`] traits.
 ///
@@ -167,6 +168,62 @@ impl ImapError {
 impl From<FlagError> for ImapError {
     fn from(_error: FlagError) -> Self {
         Self::InvalidFlags
+    }
+}
+
+/// Errors produced while fetching and parsing a single message.
+///
+/// Every variant is stable and free of third-party error text: [`Imap`] keeps
+/// the classification of [`ImapError`] so the HTTP layer can reuse the existing
+/// mapping, [`TooLarge`] reports the size guard and [`Unparsable`] the parser's
+/// refusal.
+#[derive(Debug, thiserror::Error)]
+pub enum ParsedMessageError {
+    /// The IMAP layer failed.
+    #[error(transparent)]
+    Imap(#[from] ImapError),
+    /// The message exceeded the configured size limit.
+    #[error("message too large")]
+    TooLarge {
+        /// Reported or fetched message size, in bytes.
+        ///
+        /// `usize` (not `u32`) so the fetched length, which is a `usize`, is
+        /// never truncated when it is reported back.
+        size: usize,
+        /// Configured maximum size, in bytes.
+        limit: usize,
+    },
+    /// The message could not be parsed as MIME.
+    #[error("message cannot be parsed")]
+    Unparsable,
+}
+
+impl From<MimeError> for ParsedMessageError {
+    fn from(_error: MimeError) -> Self {
+        Self::Unparsable
+    }
+}
+
+/// Classifies whether an operation error must discard the cached session.
+///
+/// [`ConnectionManager::run_once`] is expressed over this trait so the same
+/// reconnect policy serves both the plain [`ImapError`] commands and
+/// [`fetch_parsed`](ConnectionManager::fetch_parsed), which returns a
+/// [`ParsedMessageError`].
+trait ConnectionFailure {
+    /// Whether the cached session should be dropped after this error.
+    fn is_connection(&self) -> bool;
+}
+
+impl ConnectionFailure for ImapError {
+    fn is_connection(&self) -> bool {
+        ImapError::is_connection(self)
+    }
+}
+
+impl ConnectionFailure for ParsedMessageError {
+    fn is_connection(&self) -> bool {
+        matches!(self, ParsedMessageError::Imap(error) if error.is_connection())
     }
 }
 
@@ -1286,18 +1343,19 @@ impl ConnectionManager {
     /// request reconnects. The `for<'a>` bound ties the future returned by
     /// `command` to the session borrow, which is what lets the guard be reused
     /// after the await without cloning the session.
-    async fn run_once<T, F>(&self, command: F) -> Result<T, ImapError>
+    async fn run_once<T, E, F>(&self, command: F) -> Result<T, E>
     where
-        F: for<'a> FnOnce(&'a mut Box<dyn ImapSession>) -> SendFuture<'a, Result<T, ImapError>>,
+        E: From<ImapError> + ConnectionFailure,
+        F: for<'a> FnOnce(&'a mut Box<dyn ImapSession>) -> SendFuture<'a, Result<T, E>>,
     {
         let mut guard = self.session.lock().await;
-        self.ensure_session(&mut guard).await?;
+        self.ensure_session(&mut guard).await.map_err(E::from)?;
 
         let outcome = match guard.as_mut() {
             Some(session) => command(session).await,
-            None => Err(ImapError::Unavailable(
+            None => Err(E::from(ImapError::Unavailable(
                 "no IMAP session available".to_string(),
-            )),
+            ))),
         };
 
         if let Err(error) = &outcome
@@ -1387,6 +1445,78 @@ impl ConnectionManager {
             })
         })
         .await
+    }
+
+    /// Fetches the message `uid` and parses its MIME content.
+    ///
+    /// The network work is confined to a single lock on the live session:
+    /// `SELECT` → summary `UID FETCH` (existence plus `RFC822.SIZE`) → size
+    /// guard → full `UID FETCH`, returning **only the raw bytes**. The
+    /// CPU-bound [`parse_message`](crate::mime::parse_message) runs **after**
+    /// the guard is released, so it neither occupies an async runtime worker
+    /// for a potentially large parse nor keeps the IMAP session locked (which
+    /// would block every other request that needs it meanwhile).
+    ///
+    /// # Memory bound
+    ///
+    /// The reported-size guard is only as good as the server's `RFC822.SIZE`:
+    /// if the server omits it or understates it, `async-imap` materialises the
+    /// whole `BODY.PEEK[]` response **before** the fetched length can be
+    /// checked. The limit therefore does **not** strictly cap the memory the
+    /// fetch itself allocates; the second check on `body.len()`, run outside
+    /// the lock and before any parsing, is the real defence.
+    pub async fn fetch_parsed(
+        &self,
+        mailbox: &str,
+        uid: u32,
+        max_bytes: usize,
+    ) -> Result<ParsedMessage, ParsedMessageError> {
+        let mailbox = mailbox.to_string();
+        let body = self
+            .run_once(move |session| {
+                Box::pin(async move {
+                    session.select(mailbox).await?;
+
+                    let mut summaries = session.fetch(vec![uid], FetchFormat::Summary).await?;
+                    let summary = summaries.pop().ok_or(ImapError::MessageNotFound)?;
+                    if let Some(size) = summary.size
+                        && size as usize > max_bytes
+                    {
+                        return Err(ParsedMessageError::TooLarge {
+                            size: size as usize,
+                            limit: max_bytes,
+                        });
+                    }
+
+                    let mut messages = session.fetch(vec![uid], FetchFormat::Full).await?;
+                    messages
+                        .pop()
+                        .and_then(|message| message.body)
+                        .ok_or(ImapError::MessageNotFound)
+                        .map_err(ParsedMessageError::from)
+                })
+            })
+            .await?;
+
+        // Second, authoritative guard: `RFC822.SIZE` may be missing or
+        // understated, so reject the actually fetched length too. This runs
+        // outside the session lock.
+        if body.len() > max_bytes {
+            return Err(ParsedMessageError::TooLarge {
+                size: body.len(),
+                limit: max_bytes,
+            });
+        }
+
+        // Parsing is CPU-bound and walks a large, untrusted buffer. Hand it to a
+        // blocking worker: it must not stall a runtime worker, and the IMAP lock
+        // is already released, so other requests can reuse the session now. A
+        // panic in the worker (`JoinError`) is reported as `Unparsable` rather
+        // than propagated.
+        tokio::task::spawn_blocking(move || crate::mime::parse_message(&body))
+            .await
+            .map_err(|_| ParsedMessageError::Unparsable)?
+            .map_err(ParsedMessageError::from)
     }
 
     /// Applies `add`/`remove` flags to the single message `uid` and returns the
@@ -1547,6 +1677,9 @@ mod tests {
         uids: Vec<u32>,
         /// Messages returned by `fetch`.
         messages: Vec<Message>,
+        /// When set, a `FetchFormat::Full` fetch attaches these bytes as `body`
+        /// to every returned message.
+        full_body: Option<Vec<u8>>,
         /// UID sets received by `fetch`, in call order.
         fetch_uids: Arc<Mutex<Vec<Vec<u32>>>>,
         /// Capabilities reported by `capabilities`.
@@ -1564,6 +1697,7 @@ mod tests {
                 select: SelectScript::Status(default_status()),
                 uids: Vec::new(),
                 messages: Vec::new(),
+                full_body: None,
                 fetch_uids: Arc::new(Mutex::new(Vec::new())),
                 capabilities: Capabilities::default(),
                 ops: Arc::new(Mutex::new(Vec::new())),
@@ -1578,6 +1712,7 @@ mod tests {
                 select: SelectScript::Connection,
                 uids: Vec::new(),
                 messages: Vec::new(),
+                full_body: None,
                 fetch_uids: Arc::new(Mutex::new(Vec::new())),
                 capabilities: Capabilities::default(),
                 ops: Arc::new(Mutex::new(Vec::new())),
@@ -1593,6 +1728,12 @@ mod tests {
         /// Sets the messages returned by `fetch`.
         fn with_messages(mut self, messages: Vec<Message>) -> Self {
             self.messages = messages;
+            self
+        }
+
+        /// Serves `body = Some(bytes)` for a `FetchFormat::Full` fetch.
+        fn with_full_body(mut self, body: Vec<u8>) -> Self {
+            self.full_body = Some(body);
             self
         }
 
@@ -1723,7 +1864,7 @@ mod tests {
         fn fetch(
             &mut self,
             uids: Vec<u32>,
-            _format: FetchFormat,
+            format: FetchFormat,
         ) -> SendFuture<'_, Result<Vec<Message>, ImapError>> {
             self.fetch_uids
                 .lock()
@@ -1731,12 +1872,21 @@ mod tests {
                 .push(uids.clone());
             // Only the requested messages are returned, in the scripted order, so
             // a wrong window or a missing sort in the caller is observable.
-            let messages = self
+            let mut messages: Vec<Message> = self
                 .messages
                 .iter()
                 .filter(|message| uids.contains(&message.uid))
                 .cloned()
                 .collect();
+            // The full body is only served for a `Full` fetch; a `Summary` keeps
+            // the scripted `size` and no body.
+            if format == FetchFormat::Full
+                && let Some(body) = &self.full_body
+            {
+                for message in &mut messages {
+                    message.body = Some(body.clone());
+                }
+            }
             Box::pin(async move { Ok(messages) })
         }
 
@@ -2912,6 +3062,149 @@ mod tests {
         assert!(
             ops.lock().expect("ops log poisoned").is_empty(),
             "a missing message must not be marked or expunged"
+        );
+    }
+
+    // --- MIME parsing additions (mime-parsing) ---
+
+    /// A minimal multipart message: a text body plus one decoded attachment.
+    const RFC822: &str = "\
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Parsed
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary=\"B\"
+
+--B
+Content-Type: text/plain; charset=\"utf-8\"
+
+Hello inbox
+--B
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename=\"note.txt\"
+Content-Transfer-Encoding: base64
+
+SGVsbG8=
+--B--
+";
+
+    #[tokio::test]
+    async fn fetch_parsed_returns_the_parsed_message() {
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy()
+                .with_messages(vec![Message {
+                    size: Some(RFC822.len() as u32),
+                    ..message(42)
+                }])
+                .with_full_body(RFC822.as_bytes().to_vec()),
+        )]);
+        let manager = manager(connector.clone());
+
+        let parsed = manager
+            .fetch_parsed("INBOX", 42, 1024 * 1024)
+            .await
+            .expect("the message must be parsed");
+
+        assert!(
+            parsed
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("Hello inbox")),
+            "{parsed:?}"
+        );
+        assert_eq!(parsed.attachments.len(), 1, "{parsed:?}");
+        assert_eq!(parsed.attachments[0].filename.as_deref(), Some("note.txt"));
+        assert_eq!(parsed.attachments[0].content, b"Hello");
+        assert_eq!(connector.connects(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_parsed_missing_uid_is_message_not_found() {
+        let connector = FakeConnector::scripted([Outcome::Session(FakeSession::healthy())]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .fetch_parsed("INBOX", 42, 1024)
+            .await
+            .expect_err("a missing message must fail");
+        assert!(
+            matches!(error, ParsedMessageError::Imap(ImapError::MessageNotFound)),
+            "{error:?}"
+        );
+        assert!(
+            !error.is_connection(),
+            "a missing message must keep the cached session"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_parsed_oversized_is_too_large_without_fetching_full() {
+        let fetch_uids = Arc::new(Mutex::new(Vec::new()));
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy()
+                .with_messages(vec![Message {
+                    size: Some(50),
+                    ..message(42)
+                }])
+                .with_full_body(RFC822.as_bytes().to_vec())
+                .with_fetch_uids_log(Arc::clone(&fetch_uids)),
+        )]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .fetch_parsed("INBOX", 42, 10)
+            .await
+            .expect_err("an oversized message must fail");
+        match error {
+            ParsedMessageError::TooLarge { size, limit } => {
+                assert_eq!(size, 50);
+                assert_eq!(limit, 10);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            fetch_uids.lock().expect("fetch uids log poisoned").len(),
+            1,
+            "only the Summary fetch may run: no Full fetch after a size rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_parsed_unparsable_body_is_unparsable() {
+        let connector = FakeConnector::scripted([Outcome::Session(
+            FakeSession::healthy()
+                .with_messages(vec![Message {
+                    size: Some(0),
+                    ..message(42)
+                }])
+                .with_full_body(Vec::new()),
+        )]);
+        let manager = manager(connector.clone());
+
+        let error = manager
+            .fetch_parsed("INBOX", 42, 1024)
+            .await
+            .expect_err("an empty body must fail to parse");
+        assert!(matches!(error, ParsedMessageError::Unparsable), "{error:?}");
+    }
+
+    #[test]
+    fn parsed_message_error_has_stable_messages_and_classification() {
+        let from_mime: ParsedMessageError = MimeError::Unparsable.into();
+        assert!(matches!(from_mime, ParsedMessageError::Unparsable));
+        assert_eq!(from_mime.to_string(), "message cannot be parsed");
+
+        let too_large = ParsedMessageError::TooLarge {
+            size: 50,
+            limit: 10,
+        };
+        assert_eq!(too_large.to_string(), "message too large");
+
+        assert!(!ParsedMessageError::Unparsable.is_connection());
+        assert!(!too_large.is_connection());
+        assert!(!ParsedMessageError::Imap(ImapError::MessageNotFound).is_connection());
+        assert!(
+            ParsedMessageError::Imap(ImapError::Unavailable("dead".to_string())).is_connection()
         );
     }
 }
