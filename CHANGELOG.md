@@ -1,4 +1,10 @@
 # Changelog
+## [0.3.2] - 2026-10-09
+
+### Documentation
+
+- Align the health example and PLAN-001 with reality
+- Describe what apimail actually does on crates.io
 ## [0.3.1] - 2026-10-09
 
 ### Bug Fixes
@@ -11,6 +17,10 @@
 - *(openspec)* Add rustdoc-hygiene change proposal
 - *(openspec)* Archive rustdoc-hygiene (no spec deltas)
 - Stop calling apimail a work in progress
+
+### Miscellaneous Tasks
+
+- Release v0.3.1
 ## [0.3.0] - 2026-10-09
 
 ### Documentation

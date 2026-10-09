@@ -1,6 +1,6 @@
 [package]
 name = "apimail"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "API HTTP en Rust (Axum) para gestionar una cuenta de correo: lectura IMAP, banderas y búsqueda, parseo MIME (texto, HTML y adjuntos), envío SMTP e IDLE con webhook at-least-once sobre cola durable"
 license = "MIT"
