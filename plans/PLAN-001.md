@@ -10,8 +10,9 @@ aprueba en `openspec/changes/<feature>/` **antes** de escribir código (ver `AGE
 
 ## 1. Punto de partida (v0.3.0)
 
-- **Releases publicadas**: `v0.3.0` (última), `v0.2.1`, `v0.2.0` y `v0.1.0` en crates.io y GitHub
-  Releases (binarios `x86_64` y `aarch64`).
+- **Releases publicadas** hasta el cierre de `v0.3.0`: `v0.3.0`, `v0.2.1`, `v0.2.0` y `v0.1.0` en
+  crates.io y GitHub Releases (binarios `x86_64` y `aarch64`); para la última versión,
+  `git tag --sort=-v:refname`.
 - **Roadmap completado**: `api-auth`, `mail-account`, `imap-connection`, `imap-mailboxes`,
   `imap-messages`, `imap-flags`, `mime-parsing`, `smtp-send`, `imap-idle`.
 - **12 specs** consolidadas en `openspec/specs/`; **16 changes archivados** en
