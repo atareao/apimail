@@ -186,13 +186,16 @@ impl WebhookSender for FakeWebhook {
 
 /// Builds the router with every service injected, without touching the network.
 fn app(config: &Config, connector: FakeIdleConnector, webhook: Arc<FakeWebhook>) -> Router {
-    build_router(AppState::with_idle(
-        config,
-        Arc::new(NoopMailer),
-        Arc::new(NoopImapConnector),
-        Arc::new(connector),
-        webhook,
-    ))
+    build_router(
+        AppState::with_idle(
+            config,
+            Arc::new(NoopMailer),
+            Arc::new(NoopImapConnector),
+            Arc::new(connector),
+            webhook,
+        )
+        .expect("building the app state must not fail"),
+    )
 }
 
 /// A message with the given UID and optional body.

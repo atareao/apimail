@@ -26,8 +26,13 @@ aprueba en `openspec/changes/<feature>/` **antes** de escribir código (ver `AGE
 | 1 | `release-lockfile` | `release-prepare.yml` ejecuta `cargo update --workspace` tras el bump. Verificado en CI: en el tag `v0.2.1`, `Cargo.toml` **0.2.1** == `Cargo.lock` **0.2.1**. Antes el tag arrastraba el lock en la versión anterior y cualquier `cargo` dejaba el árbol sucio al clonar. |
 | 2 | `packaging` | `exclude` en `[package]`. El paquete pasó de **142 a 26 ficheros** (1,1 MiB → 600 KiB; `crate_size` **263 KB → 129 KB**), verificado sobre el `.crate` real publicado: fuera `openspec/`, `plans/`, `.opencode/`, `.github/` y los ficheros de proceso. |
 
-Lo que queda abajo es trabajo **nuevo**: una capability de fiabilidad y dos extensiones
-opcionales.
+### Completado después de `v0.2.1` (pendiente de release)
+
+| # | Ítem | Evidencia |
+|---|---|---|
+| 3 | `webhook-delivery` | Entrega **at-least-once**: ingesta y entrega desacopladas (worker FIFO con backoff), cola **persistente opt-in** (`APIMAIL_QUEUE_PATH`, log JSONL con `fsync` y compactación atómica, permisos `0600`), **reanudación** desde el watermark y `GET /api/idle/queue`. Change archivado; 12 specs; **311 tests**. |
+
+Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 
 ---
 
@@ -37,7 +42,7 @@ opcionales.
 |---|---|---|---|---|
 | 1 | `release-lockfile` — sincronizar `Cargo.lock` al liberar | Defecto (CI) | Alta (barata) | ✅ hecho en `v0.2.1` |
 | 2 | `packaging` — reducir el paquete de crates.io | Mejora de empaquetado | Alta (barata) | ✅ hecho en `v0.2.1` |
-| 3 | `webhook-delivery` — entrega *at-least-once* con cola persistente | Capability nueva | Alta (siguiente) | ⏳ pendiente |
+| 3 | `webhook-delivery` — entrega *at-least-once* con cola persistente | Capability nueva | Alta (siguiente) | ✅ hecho (pendiente de release) |
 | 4 | `idle-scope` — `IDLE` multi-buzón / multi-cuenta | Capability nueva | Baja | ⏳ pendiente |
 | 5 | `attachment-content` — contenido de adjuntos en el payload | Extensión de `imap-idle` | Baja | ⏳ pendiente |
 
@@ -79,9 +84,8 @@ opcionales.
 
 ## 3. Secuencia recomendada
 
-1. **#3 `webhook-delivery`** — el de mayor valor real (fiabilidad de la notificación). Requiere
-   spec propia y **modificar** el requisito de `imap-idle` que prohíbe escribir a disco.
-2. **#4** y **#5** — cuando haya necesidad real; hoy son *Fuera de alcance* conscientes.
+1. **#4 `idle-scope`** y **#5 `attachment-content`** — cuando haya necesidad real; hoy son
+   *Fuera de alcance* conscientes.
 
 ---
 

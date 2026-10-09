@@ -379,11 +379,10 @@ impl ImapConnector for FakeConnector {
 
 /// Builds the router with both services injected, without touching the network.
 fn app(config: Config, connector: FakeConnector) -> Router {
-    build_router(AppState::with_services(
-        &config,
-        Arc::new(NoopMailer),
-        Arc::new(connector),
-    ))
+    build_router(
+        AppState::with_services(&config, Arc::new(NoopMailer), Arc::new(connector))
+            .expect("building the app state must not touch the network"),
+    )
 }
 
 /// Builds the router with the default config.

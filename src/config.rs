@@ -1,5 +1,6 @@
 //! Application configuration loaded from the environment.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Default bind host when `APIMAIL_HOST` is unset.
@@ -33,6 +34,17 @@ pub const WEBHOOK_TIMEOUT_SECS_VAR: &str = "APIMAIL_WEBHOOK_TIMEOUT_SECS";
 /// Default webhook request timeout (10 s) when `APIMAIL_WEBHOOK_TIMEOUT_SECS`
 /// is unset.
 pub const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 10;
+/// Environment variable holding the optional durable queue file path.
+pub const QUEUE_PATH_VAR: &str = "APIMAIL_QUEUE_PATH";
+/// Environment variable holding the maximum number of pending notifications.
+pub const QUEUE_MAX_ITEMS_VAR: &str = "APIMAIL_QUEUE_MAX_ITEMS";
+/// Default maximum number of pending notifications (1000) when
+/// `APIMAIL_QUEUE_MAX_ITEMS` is unset.
+pub const DEFAULT_QUEUE_MAX_ITEMS: usize = 1000;
+/// Environment variable holding the maximum live bytes of the queue.
+pub const QUEUE_MAX_BYTES_VAR: &str = "APIMAIL_QUEUE_MAX_BYTES";
+/// Default maximum live bytes (64 MiB) when `APIMAIL_QUEUE_MAX_BYTES` is unset.
+pub const DEFAULT_QUEUE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// TLS mode negotiated with a mail endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +297,13 @@ pub struct Config {
     pub max_attachment_bytes: usize,
     /// Maximum size, in bytes, of a message that will be fetched and parsed.
     pub max_message_bytes: usize,
+    /// Optional path to the durable notification queue file; `None` keeps the
+    /// queue in memory only.
+    pub queue_path: Option<PathBuf>,
+    /// Maximum number of pending notifications kept by the queue.
+    pub queue_max_items: usize,
+    /// Maximum live bytes held by the pending notifications.
+    pub queue_max_bytes: u64,
     /// Webhook URL notified when the IDLE subscription sees a new message, or
     /// `None` when the subscription cannot be started.
     pub webhook_url: Option<String>,
@@ -305,6 +324,9 @@ impl std::fmt::Debug for Config {
             .field("account", &self.account)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .field("max_message_bytes", &self.max_message_bytes)
+            .field("queue_path", &self.queue_path)
+            .field("queue_max_items", &self.queue_max_items)
+            .field("queue_max_bytes", &self.queue_max_bytes)
             .field("webhook_url", &self.webhook_url)
             .field("idle_mailbox", &self.idle_mailbox)
             .field("webhook_timeout", &self.webhook_timeout)
@@ -338,6 +360,18 @@ pub enum ConfigError {
         "invalid APIMAIL_MAX_MESSAGE_BYTES value `{value}`: expected a positive number of bytes"
     )]
     InvalidMaxMessageBytes {
+        /// The offending raw value.
+        value: String,
+    },
+    /// `APIMAIL_QUEUE_MAX_ITEMS` was present but not a positive integer.
+    #[error("invalid APIMAIL_QUEUE_MAX_ITEMS value `{value}`: expected a positive number of items")]
+    InvalidQueueMaxItems {
+        /// The offending raw value.
+        value: String,
+    },
+    /// `APIMAIL_QUEUE_MAX_BYTES` was present but not a positive integer.
+    #[error("invalid APIMAIL_QUEUE_MAX_BYTES value `{value}`: expected a positive number of bytes")]
+    InvalidQueueMaxBytes {
         /// The offending raw value.
         value: String,
     },
@@ -392,6 +426,12 @@ impl ConfigError {
             Self::InvalidMaxMessageBytes { .. } => {
                 "invalid APIMAIL_MAX_MESSAGE_BYTES: expected a positive number of bytes".to_string()
             }
+            Self::InvalidQueueMaxItems { .. } => {
+                "invalid APIMAIL_QUEUE_MAX_ITEMS: expected a positive number of items".to_string()
+            }
+            Self::InvalidQueueMaxBytes { .. } => {
+                "invalid APIMAIL_QUEUE_MAX_BYTES: expected a positive number of bytes".to_string()
+            }
             Self::InvalidWebhookUrl { .. } => {
                 "invalid APIMAIL_WEBHOOK_URL: expected an absolute http or https URL".to_string()
             }
@@ -414,6 +454,8 @@ impl ConfigError {
             Self::MissingApiKey => "missing_api_key",
             Self::InvalidMaxAttachmentBytes { .. } => "invalid_max_attachment_bytes",
             Self::InvalidMaxMessageBytes { .. } => "invalid_max_message_bytes",
+            Self::InvalidQueueMaxItems { .. } => "invalid_queue_max_items",
+            Self::InvalidQueueMaxBytes { .. } => "invalid_queue_max_bytes",
             Self::InvalidWebhookUrl { .. } => "invalid_webhook_url",
             Self::InvalidWebhookTimeout { .. } => "invalid_webhook_timeout",
             Self::InvalidImapTimeout { .. } => "invalid_imap_timeout",
@@ -440,13 +482,14 @@ impl Config {
     /// without touching the process environment.
     ///
     /// Validation runs in the order host → port → api key → mail account →
-    /// attachment limit → message limit → webhook url → idle mailbox → webhook
-    /// timeout → IMAP timeout, so an invalid server port is reported before any
-    /// missing API key or account value, an invalid attachment limit is reported
-    /// after the account, an invalid message limit after the attachment limit, an
-    /// invalid webhook url after the message limit, an invalid idle mailbox after
-    /// the webhook url, an invalid webhook timeout after the idle mailbox, and an
-    /// invalid IMAP timeout last.
+    /// attachment limit → message limit → queue path → queue item limit → queue
+    /// byte limit → webhook url → idle mailbox → webhook timeout → IMAP timeout,
+    /// so an invalid server port is reported before any missing API key or
+    /// account value, an invalid attachment limit is reported after the account,
+    /// an invalid message limit after the attachment limit, an invalid queue limit
+    /// after the message limit, an invalid webhook url after the queue limits, an
+    /// invalid idle mailbox after the webhook url, an invalid webhook timeout
+    /// after the idle mailbox, and an invalid IMAP timeout last.
     pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -486,6 +529,36 @@ impl Config {
                 parsed
             }
             None => DEFAULT_MAX_MESSAGE_BYTES,
+        };
+        // A blank queue path counts as absent. Usability is checked when the
+        // queue is built, not here: no I/O happens while loading configuration.
+        let queue_path = match lookup(QUEUE_PATH_VAR) {
+            Some(raw) if !raw.trim().is_empty() => Some(PathBuf::from(raw.trim())),
+            _ => None,
+        };
+        let queue_max_items = match lookup(QUEUE_MAX_ITEMS_VAR) {
+            Some(raw) => {
+                let parsed = raw
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidQueueMaxItems { value: raw.clone() })?;
+                if parsed == 0 {
+                    return Err(ConfigError::InvalidQueueMaxItems { value: raw });
+                }
+                parsed
+            }
+            None => DEFAULT_QUEUE_MAX_ITEMS,
+        };
+        let queue_max_bytes = match lookup(QUEUE_MAX_BYTES_VAR) {
+            Some(raw) => {
+                let parsed = raw
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidQueueMaxBytes { value: raw.clone() })?;
+                if parsed == 0 {
+                    return Err(ConfigError::InvalidQueueMaxBytes { value: raw });
+                }
+                parsed
+            }
+            None => DEFAULT_QUEUE_MAX_BYTES,
         };
         // A blank value counts as absent, coherently with `required()`: an
         // empty string means "not configured", not an invalid URL.
@@ -528,11 +601,22 @@ impl Config {
             account,
             max_attachment_bytes,
             max_message_bytes,
+            queue_path,
+            queue_max_items,
+            queue_max_bytes,
             webhook_url,
             idle_mailbox,
             webhook_timeout,
             imap_timeout,
         })
+    }
+
+    /// Queue limits derived from the queue configuration.
+    pub fn queue_limits(&self) -> crate::queue::QueueLimits {
+        crate::queue::QueueLimits {
+            max_items: self.queue_max_items,
+            max_bytes: self.queue_max_bytes,
+        }
     }
 }
 
@@ -1294,6 +1378,20 @@ mod tests {
                 "APIMAIL_MAX_MESSAGE_BYTES",
             ),
             (
+                ConfigError::InvalidQueueMaxItems {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_queue_max_items",
+                "APIMAIL_QUEUE_MAX_ITEMS",
+            ),
+            (
+                ConfigError::InvalidQueueMaxBytes {
+                    value: LEAKED_VALUE.into(),
+                },
+                "invalid_queue_max_bytes",
+                "APIMAIL_QUEUE_MAX_BYTES",
+            ),
+            (
                 ConfigError::InvalidWebhookUrl {
                     value: LEAKED_VALUE.into(),
                 },
@@ -1386,5 +1484,125 @@ mod tests {
                 "unexpected kind for {variable}"
             );
         }
+    }
+
+    #[test]
+    fn queue_path_absent_or_blank_is_none() {
+        for value in [None, Some(""), Some("   "), Some("\t")] {
+            let config = Config::from_lookup(lookup_from(
+                base_entries()
+                    .into_iter()
+                    .chain(value.map(|v| (QUEUE_PATH_VAR, v))),
+            ))
+            .expect("a blank queue path must be treated as absent");
+            assert!(
+                config.queue_path.is_none(),
+                "a blank queue path must be absent, got {:?}",
+                config.queue_path
+            );
+        }
+    }
+
+    #[test]
+    fn queue_path_is_loaded_trimmed() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(QUEUE_PATH_VAR, "  /var/lib/apimail/queue.jsonl  ")]),
+        ))
+        .expect("valid config");
+        assert_eq!(
+            config.queue_path,
+            Some(PathBuf::from("/var/lib/apimail/queue.jsonl"))
+        );
+    }
+
+    #[test]
+    fn queue_max_items_defaults_to_1000() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(config.queue_max_items, DEFAULT_QUEUE_MAX_ITEMS);
+        assert_eq!(DEFAULT_QUEUE_MAX_ITEMS, 1000);
+    }
+
+    #[test]
+    fn queue_max_items_uses_configured_value() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(QUEUE_MAX_ITEMS_VAR, "17")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.queue_max_items, 17);
+    }
+
+    #[test]
+    fn queue_max_items_zero_or_non_numeric_is_an_error() {
+        for value in ["0", "abc"] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries()
+                    .into_iter()
+                    .chain([(QUEUE_MAX_ITEMS_VAR, value)]),
+            ))
+            .expect_err("an invalid item limit must fail");
+            assert!(
+                err.to_string().contains(QUEUE_MAX_ITEMS_VAR),
+                "the error message must name the variable: {err}"
+            );
+            match err {
+                ConfigError::InvalidQueueMaxItems { value: got } => assert_eq!(got, value),
+                other => panic!("expected InvalidQueueMaxItems for {value:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn queue_max_bytes_defaults_to_64_mib() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert_eq!(config.queue_max_bytes, DEFAULT_QUEUE_MAX_BYTES);
+        assert_eq!(DEFAULT_QUEUE_MAX_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn queue_max_bytes_uses_configured_value() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(QUEUE_MAX_BYTES_VAR, "4096")]),
+        ))
+        .expect("valid config");
+        assert_eq!(config.queue_max_bytes, 4096);
+    }
+
+    #[test]
+    fn queue_max_bytes_zero_or_non_numeric_is_an_error() {
+        for value in ["0", "abc"] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries()
+                    .into_iter()
+                    .chain([(QUEUE_MAX_BYTES_VAR, value)]),
+            ))
+            .expect_err("an invalid byte limit must fail");
+            assert!(
+                err.to_string().contains(QUEUE_MAX_BYTES_VAR),
+                "the error message must name the variable: {err}"
+            );
+            match err {
+                ConfigError::InvalidQueueMaxBytes { value: got } => assert_eq!(got, value),
+                other => panic!("expected InvalidQueueMaxBytes for {value:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn queue_limits_reflect_the_configuration() {
+        let config = Config::from_lookup(lookup_from(
+            base_entries()
+                .into_iter()
+                .chain([(QUEUE_MAX_ITEMS_VAR, "23"), (QUEUE_MAX_BYTES_VAR, "2048")]),
+        ))
+        .expect("valid config");
+        let limits = config.queue_limits();
+        assert_eq!(limits.max_items, 23);
+        assert_eq!(limits.max_bytes, 2048);
     }
 }

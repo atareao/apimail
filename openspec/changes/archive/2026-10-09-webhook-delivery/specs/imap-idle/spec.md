@@ -1,47 +1,12 @@
-# imap-idle Specification
+# Spec Delta
 
 ## Purpose
-Suscribirse al buzón con la extensión `IDLE` sobre una conexión IMAP dedicada y notificar a un
-webhook configurable cada correo nuevo, con sus metadatos y su contenido MIME parseado
-(texto, HTML y metadatos de adjuntos), sin interferir con el resto de rutas de la API.
 
-## Requirements
+Ajustar `imap-idle` para que las notificaciones dejen de entregarse en línea y pasen por la cola
+duradera de `webhook-delivery`, y para que la suscripción reanude su punto de arranque desde el
+watermark guardado cuando la cola es persistente.
 
-### Requirement: IDLE subscription control
-The service SHALL expose protected routes to start, stop and inspect the IDLE subscription, which watches a single configured mailbox on a dedicated IMAP connection and notifies a configured webhook about newly arrived messages.
-
-#### Scenario: Subscription is started
-- **WHEN** `POST /api/idle/start` is requested with a valid API key and a webhook URL is configured
-- **THEN** the response status is `200`
-- **AND** the body reports `status` = `"running"` and the watched `mailbox`
-- **AND** a dedicated IMAP connection is established for the subscription
-
-#### Scenario: Start is idempotent
-- **WHEN** `POST /api/idle/start` is requested while the subscription is already running
-- **THEN** the response status is `200` with the same body and no second connection is opened
-
-#### Scenario: Subscription is stopped
-- **WHEN** `POST /api/idle/stop` is requested with a valid API key
-- **THEN** the response status is `200` with `status` = `"stopped"`
-- **AND** the subscription stops and its dedicated connection is closed within a bounded time (a `DONE` is sent on the normal IDLE timeout path)
-
-#### Scenario: Stop is idempotent
-- **WHEN** `POST /api/idle/stop` is requested while the subscription is not running
-- **THEN** the response status is `200` with `status` = `"stopped"`
-
-#### Scenario: Status is reported
-- **WHEN** `GET /api/idle/status` is requested with a valid API key
-- **THEN** the response status is `200`
-- **AND** the body reports `status` (`"running"` or `"stopped"`), the watched `mailbox` and `last_error` (`null` or a stable code)
-
-#### Scenario: Subscription cannot start without a webhook
-- **WHEN** `POST /api/idle/start` is requested and no webhook URL is configured
-- **THEN** the response status is `501`
-- **AND** the body is `{"error":"idle_not_configured","message":"..."}`
-
-#### Scenario: Unauthenticated IDLE control
-- **WHEN** any IDLE route is requested without a valid API key
-- **THEN** the response status is `401`
+## MODIFIED Requirements
 
 ### Requirement: New-message notification
 
@@ -92,25 +57,6 @@ arrived while the service was down are still notified.
 
 - **WHEN** a new message cannot be parsed
 - **THEN** the payload reports `parsed` = `false` with `text` and `html` `null` and an empty `attachments` array
-
-### Requirement: Dedicated connection and resilience
-The subscription SHALL use its own IMAP connection, separate from the session used by the other routes, so it never blocks them; SHALL re-issue IDLE at least every 29 minutes; SHALL reconnect with backoff when the connection fails; and SHALL keep running until stopped.
-
-#### Scenario: The subscription does not block the other routes
-- **WHEN** the subscription is running and another route is requested
-- **THEN** the other route runs on the shared session and is not blocked by the idling connection
-
-#### Scenario: IDLE is re-issued periodically
-- **WHEN** the bounded IDLE wait elapses without a change
-- **THEN** the subscription ends IDLE (`DONE`) and issues it again
-
-#### Scenario: A dropped connection is replaced
-- **WHEN** the dedicated connection fails
-- **THEN** the subscription reconnects with backoff and resumes watching the mailbox
-
-#### Scenario: A webhook failure does not stop the subscription
-- **WHEN** the webhook cannot be reached and the bounded retries are exhausted
-- **THEN** `last_error` is set to a stable code, no third-party error text is exposed and the subscription keeps running
 
 ### Requirement: Bounded, side-effect-free handling of untrusted content
 
