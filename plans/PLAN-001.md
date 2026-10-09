@@ -1,6 +1,6 @@
 # PLAN-001.md — apimail
 
-Trabajo planificado a partir de **`v0.2.1`**. El roadmap original (`plans/PLAN.md`) está
+Trabajo planificado a partir de **`v0.3.0`**. El roadmap original (`plans/PLAN.md`) está
 **completado**: las 9 capabilities se implementaron, revisaron y publicaron.
 
 Este documento no sustituye a las specs de OpenSpec: cada ítem que toque código se detalla y
@@ -8,15 +8,15 @@ aprueba en `openspec/changes/<feature>/` **antes** de escribir código (ver `AGE
 
 ---
 
-## 1. Punto de partida (v0.2.1)
+## 1. Punto de partida (v0.3.0)
 
-- **Releases publicadas**: `v0.2.1` (última), `v0.2.0` y `v0.1.0` en crates.io y GitHub Releases
-  (binarios `x86_64` y `aarch64`).
+- **Releases publicadas**: `v0.3.0` (última), `v0.2.1`, `v0.2.0` y `v0.1.0` en crates.io y GitHub
+  Releases (binarios `x86_64` y `aarch64`).
 - **Roadmap completado**: `api-auth`, `mail-account`, `imap-connection`, `imap-mailboxes`,
   `imap-messages`, `imap-flags`, `mime-parsing`, `smtp-send`, `imap-idle`.
-- **11 specs** consolidadas en `openspec/specs/`; **15 changes archivados** en
+- **12 specs** consolidadas en `openspec/specs/`; **16 changes archivados** en
   `openspec/changes/archive/`; sin changes activos.
-- **Calidad**: 270 tests, `clippy --all-targets -- -D warnings` en cero, `fmt` limpio.
+- **Calidad**: 311 tests, `clippy --all-targets -- -D warnings` en cero, `fmt` limpio.
 - `development` y `main` sincronizadas.
 
 ### Completado en `v0.2.1` (change `release-hygiene`, `skip_specs`)
@@ -26,11 +26,11 @@ aprueba en `openspec/changes/<feature>/` **antes** de escribir código (ver `AGE
 | 1 | `release-lockfile` | `release-prepare.yml` ejecuta `cargo update --workspace` tras el bump. Verificado en CI: en el tag `v0.2.1`, `Cargo.toml` **0.2.1** == `Cargo.lock` **0.2.1**. Antes el tag arrastraba el lock en la versión anterior y cualquier `cargo` dejaba el árbol sucio al clonar. |
 | 2 | `packaging` | `exclude` en `[package]`. El paquete pasó de **142 a 26 ficheros** (1,1 MiB → 600 KiB; `crate_size` **263 KB → 129 KB**), verificado sobre el `.crate` real publicado: fuera `openspec/`, `plans/`, `.opencode/`, `.github/` y los ficheros de proceso. |
 
-### Completado después de `v0.2.1` (pendiente de release)
+### Completado en `v0.3.0`
 
 | # | Ítem | Evidencia |
 |---|---|---|
-| 3 | `webhook-delivery` | Entrega **at-least-once**: ingesta y entrega desacopladas (worker FIFO con backoff), cola **persistente opt-in** (`APIMAIL_QUEUE_PATH`, log JSONL con `fsync` y compactación atómica, permisos `0600`), **reanudación** desde el watermark y `GET /api/idle/queue`. Change archivado; 12 specs; **311 tests**. |
+| 3 | `webhook-delivery` | Entrega **at-least-once**: ingesta y entrega desacopladas (worker FIFO con backoff), cola **persistente opt-in** (`APIMAIL_QUEUE_PATH`, log JSONL con `fsync` y compactación atómica, permisos `0600`), **reanudación** desde el watermark y `GET /api/idle/queue`. Change archivado; 12 specs; **311 tests**. Publicado como **v0.3.0** (crates.io + GitHub Release; paquete de **28 ficheros**). |
 
 Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 
@@ -42,7 +42,7 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 |---|---|---|---|---|
 | 1 | `release-lockfile` — sincronizar `Cargo.lock` al liberar | Defecto (CI) | Alta (barata) | ✅ hecho en `v0.2.1` |
 | 2 | `packaging` — reducir el paquete de crates.io | Mejora de empaquetado | Alta (barata) | ✅ hecho en `v0.2.1` |
-| 3 | `webhook-delivery` — entrega *at-least-once* con cola persistente | Capability nueva | Alta (siguiente) | ✅ hecho (pendiente de release) |
+| 3 | `webhook-delivery` — entrega *at-least-once* con cola persistente | Capability nueva | Alta (siguiente) | ✅ hecho en `v0.3.0` |
 | 4 | `idle-scope` — `IDLE` multi-buzón / multi-cuenta | Capability nueva | Baja | ⏳ pendiente |
 | 5 | `attachment-content` — contenido de adjuntos en el payload | Extensión de `imap-idle` | Baja | ⏳ pendiente |
 
