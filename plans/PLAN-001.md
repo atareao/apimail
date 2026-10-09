@@ -46,6 +46,7 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 | 3 | `webhook-delivery` — entrega *at-least-once* con cola persistente | Capability nueva | Alta (siguiente) | ✅ hecho en `v0.3.0` |
 | 4 | `idle-scope` — `IDLE` multi-buzón / multi-cuenta | Capability nueva | Baja | ⏳ pendiente |
 | 5 | `attachment-content` — contenido de adjuntos en el payload | Extensión de `imap-idle` | Baja | ⏳ pendiente |
+| 6 | `container-image` — despliegue contenedorizado | Infraestructura de distribución | Alta | 🚧 en curso |
 
 ### 3. `webhook-delivery` — entrega *at-least-once* con cola persistente
 
@@ -80,6 +81,22 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
   memoria (parseo acotado).
 - **Alternativa**: que el receptor descargue el adjunto con
   `GET /api/messages/{uid}/attachments/{id}` (ya existe); evaluar si compensa el ítem.
+
+### 6. `container-image` — despliegue contenedorizado
+
+- **Qué**: poder ejecutar y distribuir apimail como imagen de contenedor, sin compilarlo ni
+  montar el *unit* de systemd a mano. Incluye el `Dockerfile` multi-stage, `compose.yml`,
+  `.dockerignore`, la plantilla `.env.j2` (Jinja2) y su equivalente `.env.example`, el workflow
+  `.github/workflows/image.yml` que publica en GHCR (**solo `linux/amd64`**), una sección de
+  despliegue en el `README.md` y el arreglo de las recetas de contenedor y salud del `.justfile`
+  (que hoy apuntan a la imagen y el contrato de salud de otro proyecto).
+- **Por qué**: la distribución actual solo ofrece binario (GitHub Releases) y crate (crates.io);
+  desplegar en un servidor obligaba a compilar y configurar el servicio a mano, y el `.justfile`
+  heredado no aplicaba a apimail.
+- **Estado**: 🚧 **en curso** — change
+  [`container-image`](../openspec/changes/container-image/); se marca como hecho al fusionar.
+- **Impacto**: infraestructura de distribución y documentación; **no** toca el crate (sin cambios
+  de API, configuración ni Rust). Sin *BREAKING*.
 
 ---
 

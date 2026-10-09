@@ -1,0 +1,52 @@
+services:
+  apimail:
+    image: ghcr.io/atareao/apimail:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apimail
+    restart: unless-stopped
+    ports:
+      # El puerto interno es fijo (3000); el del host se controla con una
+      # variable propia de Compose para no confundirlo con `APIMAIL_PORT`.
+      - "${APIMAIL_PUBLISHED_PORT:-3000}:3000"
+    # Volumen con nombre, no bind mount: así el `chown` de /app/data hecho en
+    # la imagen se conserva y no hay que alinear el uid en el host.
+    volumes:
+      - apimail_data:/app/data
+    # Lista explícita: es exactamente la que lee la aplicación (src/config.rs).
+    # No se usa `env_file` a propósito, para no filtrar variables ajenas.
+    environment:
+      - APIMAIL_HOST=0.0.0.0
+      - APIMAIL_PORT=3000
+      - APIMAIL_API_KEY=${APIMAIL_API_KEY}
+      - APIMAIL_IMAP_HOST=${APIMAIL_IMAP_HOST}
+      - APIMAIL_IMAP_USER=${APIMAIL_IMAP_USER}
+      - APIMAIL_IMAP_PASSWORD=${APIMAIL_IMAP_PASSWORD}
+      - APIMAIL_IMAP_PORT=${APIMAIL_IMAP_PORT:-}
+      - APIMAIL_IMAP_TLS=${APIMAIL_IMAP_TLS:-implicit}
+      - APIMAIL_SMTP_HOST=${APIMAIL_SMTP_HOST}
+      - APIMAIL_SMTP_USER=${APIMAIL_SMTP_USER}
+      - APIMAIL_SMTP_PASSWORD=${APIMAIL_SMTP_PASSWORD}
+      - APIMAIL_SMTP_PORT=${APIMAIL_SMTP_PORT:-}
+      - APIMAIL_SMTP_TLS=${APIMAIL_SMTP_TLS:-implicit}
+      - APIMAIL_IMAP_TIMEOUT_SECS=${APIMAIL_IMAP_TIMEOUT_SECS:-30}
+      - APIMAIL_MAX_ATTACHMENT_BYTES=${APIMAIL_MAX_ATTACHMENT_BYTES:-10485760}
+      - APIMAIL_MAX_MESSAGE_BYTES=${APIMAIL_MAX_MESSAGE_BYTES:-26214400}
+      - APIMAIL_WEBHOOK_URL=${APIMAIL_WEBHOOK_URL:-}
+      - APIMAIL_IDLE_MAILBOX=${APIMAIL_IDLE_MAILBOX:-INBOX}
+      - APIMAIL_WEBHOOK_TIMEOUT_SECS=${APIMAIL_WEBHOOK_TIMEOUT_SECS:-10}
+      # Cola persistente por defecto: sobrevive a la recreación del contenedor.
+      # Un valor en blanco (`APIMAIL_QUEUE_PATH=`) la devuelve a memoria.
+      - APIMAIL_QUEUE_PATH=${APIMAIL_QUEUE_PATH-/app/data/queue.jsonl}
+      - APIMAIL_QUEUE_MAX_ITEMS=${APIMAIL_QUEUE_MAX_ITEMS:-1000}
+      - APIMAIL_QUEUE_MAX_BYTES=${APIMAIL_QUEUE_MAX_BYTES:-67108864}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  apimail_data:

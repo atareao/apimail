@@ -1,1 +1,5 @@
 /target
+
+# Entorno (secretos). El repo solo versiona las plantillas .env.example y .env.j2
+.env
+.env.local
