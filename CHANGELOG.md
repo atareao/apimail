@@ -1,4 +1,16 @@
 # Changelog
+## [0.4.2] - 2026-10-10
+
+### Bug Fixes
+
+- Hacer reproducible el build de la imagen
+
+### Documentation
+
+- Cerrar image-publish-resilience con la verificación del release
+- Proponer builds reproducibles en la imagen
+- Precisar el alcance de la verificación y sus límites
+- Cerrar y archivar el change reproducible-image
 ## [0.4.1] - 2026-10-10
 
 ### Bug Fixes
@@ -10,6 +22,10 @@
 - Proponer el endurecimiento de la publicación de la imagen
 - Registrar el dry-run verde del pipeline de imagen
 - Precisar qué prueba la verificación del artefacto publicado
+
+### Miscellaneous Tasks
+
+- Release v0.4.1
 ## [0.4.0] - 2026-10-09
 
 ### Bug Fixes
