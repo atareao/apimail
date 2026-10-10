@@ -97,8 +97,13 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 - **Por qué**: la distribución actual solo ofrece binario (GitHub Releases) y crate (crates.io);
   desplegar en un servidor obligaba a compilar y configurar el servicio a mano, y el `.justfile`
   heredado no aplicaba a apimail.
-- **Estado**: 🚧 **en curso** — change
-  [`container-image`](../openspec/changes/container-image/); se marca como hecho al fusionar.
+- **Estado**: ✅ **completado** — change `container-image` **archivado**
+  (`openspec/changes/archive/2026-10-09-container-image`); imagen publicada en GHCR
+  (`linux/amd64`) y **desplegada en producción** (`v0.4.3`, digest
+  `sha256:0f95967ed8d2b7f6461b57fbfe717e16e284adff11b32a2687a8319b7cef5176`).
+  El arreglo del `.justfile` quedó **a medias**: las recetas de contenedor y salud sí se
+  adaptaron a apimail, pero sobrevivieron las `frontend-*` (el proyecto no tiene
+  `frontend/`); se retiran en la limpieza posterior.
 - **Impacto**: infraestructura de distribución y documentación; **no** toca el crate (sin cambios
   de API, configuración ni Rust). Sin *BREAKING*.
 

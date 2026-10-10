@@ -27,6 +27,11 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > `POST /api/idle/start`, `POST /api/idle/stop` y `GET /api/idle/status`, que
 > notifican el correo nuevo a un webhook configurable.
 
+> **Referencia exhaustiva de la API**: [`docs/API.md`](docs/API.md) describe cada ruta,
+> sus parámetros y los cuerpos de petición y respuesta **campo a campo**, más la matriz
+> completa de códigos de estado y de códigos `error`. Este README es la **guía de uso**
+> (arranque, variables de entorno, despliegue y ejemplos rápidos).
+
 ## Requisitos
 
 - **Rust edition 2024** (se recomienda una toolchain reciente; el proyecto se
@@ -314,6 +319,10 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/whoami
 ```
 
 ## Endpoints
+
+Los ejemplos de esta sección son **guía de uso**. La referencia **campo a campo** —todos los
+parámetros, todos los campos de cada respuesta y la matriz completa de códigos `error`— está en
+[`docs/API.md`](docs/API.md).
 
 ### Salud (público)
 

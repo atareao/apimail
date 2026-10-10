@@ -24,8 +24,8 @@ Antes de escribir/editar código, `just check-spec` debe confirmar un change pro
 Artefactos OpenSpec: `proposal.md` → `specs/<capability>/spec.md` → `design.md` → `tasks.md` (headings/`SHALL` en inglés, prosa en español). Los `## Requirement`/`#### Scenario` del delta deben copiar EXACTAMENTE el header de la spec destino, o `openspec archive` falla. Consolida con `openspec archive <feature>`; las specs resultantes viven en `openspec/specs/<capability>/`.
 
 ## Gotchas del task runner (`just`)
-- El `.justfile` fue **copiado de otro proyecto ("Valet")**. Las recetas `dev`, `dev-docker`, `build`, `push`, `deploy`, `deploy-local`, `health`, `check-all` y todas las `frontend-*` referencian cosas que **no existen aquí** (`docker-compose.yml`, `frontend/`, `ghcr.io/atareao/valet-ai`, `vampus show`). **No las ejecutes** hasta que se cree esa infraestructura.
-- Recetas fiables hoy: `just test`, `just clippy`, `just fmt`, `just check-spec`.
+- El `.justfile` está **adaptado a apimail**: las recetas de contenedor y salud usan `ghcr.io/atareao/apimail` y el `compose.yml` real (existen `Dockerfile`, `.dockerignore`, `.env.example` y `.env.j2`), y la versión de la imagen se resuelve con `vampus show` (`vampus` instalado + `.vampus.yml`). Las recetas heredadas `frontend-*` se **retiraron** (el proyecto no tiene `frontend/`). `dev`/`build`/`push`/`deploy*` usan **podman** (instalado aquí); `dev-docker` requiere **docker** (no instalado en esta máquina).
+- Recetas fiables hoy: `just test`, `just clippy`, `just fmt`, `just check-spec` y `just check-all` (encadena los tres primeros).
 
 ## Comandos
 - Tests: `just test` == `cargo test`
