@@ -3,6 +3,10 @@
 > **RED ya capturado**: la evidencia de los 4 fallos y del paquete GHCR inexistente (sección 1) se
 > recogió antes de implementar; el resto de tareas quedan pendientes de aprobación e implementación.
 
+> **Cierre**: todas las tareas están hechas; ya **no** queda ninguna acción manual del usuario. Lo
+> único abierto es la **5.5** —`latest` ≠ `v0.4.1` por digests, **consecuencia de la decisión 2**—,
+> una **decisión de diseño** candidata a un **change aparte** (no bloquea este).
+
 ## 1. RED — Reproducir y documentar el fallo (evidencia)
 
 - [x] 1.1 Confirmar que el workflow `Image` **ha fallado 4 veces seguidas** y que la imagen **nunca
@@ -126,21 +130,51 @@
     `sha256:9e174dfd7c896b5b5ec76c8072c2f6a2a9bcc8c68dfeb70294348b0fa3a5ade5`) y
     «Published image ghcr.io/atareao/apimail:sha-4a39141 is pullable and healthy».
     **Se publicó solo `sha-4a39141`**: `latest` **no** se movió, como documenta el change.
-- [ ] 4.2 **El propio merge del arreglo a `main` dispara `Image`** (el diff incluye un `.yml`, que
+- [x] 4.2 **El propio merge del arreglo a `main` dispara `Image`** (el diff incluye un `.yml`, que
   **no** está en `paths-ignore`); adjuntar el run disparado.
-- [ ] 4.3 El run termina **verde publicando `latest`** (y `sha-<7>`; `vX.Y.Z`/`X.Y` si el merge trae
+  - Evidencia: run **38026923522** (`main`, commit `45c4355`) → **success**, publicó y verificó
+    `latest` y `sha-45c4355` (`Build succeeded on attempt 1`). El run duplicado disparado por el
+    **merge** (commit `c61adc5`) quedó **`completed/cancelled`** por el `concurrency` → los dos pushes
+    al mismo `main` colapsaron en uno.
+- [x] 4.3 El run termina **verde publicando `latest`** (y `sha-<7>`; `vX.Y.Z`/`X.Y` si el merge trae
   tag); adjuntar el run.
-- [ ] 4.4 Comprobar que el paso de verificación post-push **descarga cada tag publicado** y repite
+  - Evidencia: run **38026924672** (tag `v0.4.1`) → **success**, publicó y verificó **`v0.4.1`**,
+    **`0.4`** y **`latest`**. El tag `v0.4.1` = `45c4355` = `origin/main`; `Cargo.toml`, `Cargo.lock` y
+    `.vampus.yml` en `origin/main` están en **0.4.1**; `development` quedó **sincronizado** (0 commits
+    por delante de `main`). `Release` (run `38026924682`, ref `v0.4.1`) → **success**: `publish`
+    (crates.io) y `release` (GitHub Release) verdes, con `x86_64` y `aarch64`; crates.io
+    `max_version = 0.4.1` (publicado `2026-10-10T05:17:43Z`), docs.rs 0.4.1 → HTTP `302` (construyendo)
+    y GitHub Release `v0.4.1` con `apimail-x86_64-unknown-linux-gnu.tar.gz` (3.332.436 B) y
+    `apimail-aarch64-unknown-linux-gnu.tar.gz` (3.371.400 B).
+- [x] 4.4 Comprobar que el paso de verificación post-push **descarga cada tag publicado** y repite
   el *health check* sobre la imagen descargada.
-- [ ] 4.5 Arrancar la imagen descargada con las variables ficticias y confirmar **`RestartCount 0`**
+  - Evidencia: el paso `Verify the published image is pullable and healthy` quedó **verde en ambos
+    runs**, con `Published image ghcr.io/atareao/apimail:{v0.4.1,0.4,latest}` (tag `38026924672`) y
+    `{latest,sha-45c4355}` (`main` `38026923522`). **Alcance documentado** (ver `design.md`): resuelve
+    el tag contra GHCR y comprueba el **digest servido**; **no** descarga blobs en el mismo runner
+    (`Status: Image is up to date`). **Observación abierta (bajo impacto)**: **0 líneas `CACHED`** en
+    los tres runs (dry-run `38025457014`, tag `38026924672`, main `38026923522`) → la caché de GHA
+    (`--cache-to type=gha`) **no parece efectiva**; solo afecta al tiempo de build (≈3 min) y las
+    banderas son **idénticas** a las del paso anterior.
+- [x] 4.5 Arrancar la imagen descargada con las variables ficticias y confirmar **`RestartCount 0`**
   y `/api/health` sano.
-- [ ] 4.6 **Nota (decisión del usuario)**: los alias `v0.4.0`/`0.4` **no pueden recuperarse nunca**:
+  - Evidencia: el propio workflow arrancó **cada tag publicado** y todos reportaron «pullable and
+    healthy» (health check de `status`/`name`/`version` sobre la imagen publicada). **Matiz**: el
+    chequeo de **`RestartCount 0`** sobre una copia **descargada localmente** **no** puede hacerse
+    mientras el paquete siga **privado** → queda ligado a la tarea **5.4**. **Matiz cerrado**: el
+    `RestartCount 0` sobre una copia descargada localmente sí se pudo comprobar tras hacer público el
+    paquete — ver **5.4**.
+- [x] 4.6 **Nota (decisión del usuario)**: los alias `v0.4.0`/`0.4` **no pueden recuperarse nunca**:
   el workflow deriva los alias de la **versión del tag que se empuja** (`minor="${version%.*}"`), así
   que `v0.4.0` solo lo habría producido un run del tag `v0.4.0` con el workflow **viejo** (imposible:
   `gh run rerun` y `workflow_dispatch --ref v0.4.0` usan ese árbol). La única vía de tener alias
   inmutables es una **release nueva** (`v0.4.1`, que publicaría `latest`, `0.4` y `v0.4.1`). El
   `latest` se recupera con el merge del arreglo. **Condición**: si se corta `v0.4.1`, el commit del
   arreglo debe ser **`🐛 fix:`** para que el bump sea **patch** (no `feat`, que sería minor).
+  - Evidencia: la condición se cumplió: el commit del arreglo es **`🐛 fix:`**, así que el bump fue
+    **patch** y la release salió como **`v0.4.1`**. Los alias `v0.4.0`/`0.4` siguen siendo
+    irrecuperables (el workflow deriva los alias del tag empujado y el árbol de `v0.4.0` lleva el
+    workflow viejo); `latest` quedó correcto.
 
 ## 5. Cierre
 
@@ -162,6 +196,9 @@
     host resuelto; la prueba del espejo son las mediciones del `design.md`), la cancelación real de
     `concurrency` (no se pueden lanzar dos runs), la visibilidad del paquete por API (`403`, falta
     `read:packages`) y `shellcheck` (no instalado; se usó `bash -n`).
+    **Confirmado en los tres runs** (`38025457014` dry-run, `38026924672` tag, `38026923522` main):
+    **0 líneas `CACHED`** → la caché de GHA no parece efectiva; solo afecta al tiempo de build y las
+    banderas son idénticas a las del paso anterior.
 - [x] 5.2 Marcar tareas y `openspec validate image-publish-resilience --strict`.
   - Evidencia: `openspec validate image-publish-resilience --strict` → `Change 'image-publish-resilience'
     is valid` (`exit=0`), con `skip_specs` informado (`skip_specs is set in .openspec.yaml: change
@@ -170,8 +207,31 @@
 - [x] 5.3 PR del change (`fix/image-publish-resilience` → `development`; la release
   `development` → `main` arrastra el `.yml` y dispara la verificación de 4.2).
   - Evidencia: **PR #36** (`fix/image-publish-resilience` → `development`), con **CI en verde**.
-- [ ] 5.4 **Verificación externa definitiva**: con el paquete de GHCR **público**, `podman pull
+- [x] 5.4 **Verificación externa definitiva**: con el paquete de GHCR **público**, `podman pull
   ghcr.io/atareao/apimail:latest` **anónimo** desde la máquina de desarrollo (con `docker logout`/
   sin credenciales) → es la prueba de que un tercero puede descargar la imagen, y cierra la
   limitación del paso de verificación (que no ejercita la descarga de blobs). Requiere que el usuario
   cambie la visibilidad del paquete (manual).
+  - Evidencia: `podman logout ghcr.io` y `podman pull --authfile` con un authfile **vacío**
+    (`{"auths":{}}`) → **`exit=0`**. **Descarga real**: antes del pull había **0** imágenes `apimail`
+    locales; el pull copió blobs
+    (`Copying blob sha256:20df1fb0640a7cdee99b6e6b719246c85359a99b7e88265f5ddcf59425a2846d`) → cierra
+    el hueco que la revisión señaló (el paso del workflow no ejercitaba la descarga). Imagen **14,8
+    MB**; `ghcr.io/atareao/apimail@sha256:258c5e8d…`. Se ejecutó la imagen descargada: `/api/health` →
+    **`{"status":"ok","name":"apimail","version":"0.4.1"}`**, `uid=1000`, `whoami=apimail` y
+    **`RestartCount 0`**. Listado **anónimo** de tags:
+    `["sha-4a39141","v0.4.1","0.4","latest","sha-45c4355"]`. Esto cierra también el matiz de la
+    **4.5** (el `RestartCount 0` sobre una copia descargada localmente ya está hecho).
+- [ ] 5.5 **Hallazgo nuevo (bajo impacto, no bloquea)**: `latest` y `v0.4.1` **no son el mismo digest**
+  aunque ambos son el commit `45c4355`. Medido en el registro por consulta **anónima**:
+  `v0.4.1` = `0.4` = `sha256:fa73b4cf…` (build del run del **tag**, `38026924672`) frente a
+  `latest` = `sha-45c4355` = `sha256:258c5e8d…` (build del run de **main**, `38026923522`). Son **dos
+  builds en paralelo** (~20 s de diferencia) y el **último en empujar gana** `latest`. Las dos imágenes
+  **no son reproducibles**: difieren en el config (`80ad2382…` vs `04390a62…`), en `created`
+  (`05:19:20Z` vs `05:17:58Z`) y en los **digests de las capas** (las capas embeben mtimes). Impacto:
+  cosmético (mismo código; ambas reportan `version 0.4.1`) más un build redundante por release
+  (~3 min de CI) y algo de almacenamiento duplicado. Candidatos: (i) grupo `concurrency` **global** con
+  `cancel-in-progress: false` (hace determinista quién gana `latest`, pero el resultado sigue
+  dependiendo del orden), (ii) builds reproducibles (`--rewrite-timestamp` / `SOURCE_DATE_EPOCH`) para
+  que el mismo commit dé el mismo digest, (iii) no disparar `Image` en el push del commit de release.
+  **Requiere decisión del usuario**: si se aborda, va en un change aparte (este ya cumplió su objetivo).

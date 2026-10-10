@@ -176,6 +176,13 @@
 - *Riesgo*: si el paquete GHCR es **privado**, `docker pull` requiere el `GITHUB_TOKEN` ya usado en
   el login (presente en el workflow). *Seguimiento*: la visibilidad del paquete es una tarea manual
   aparte, fuera de alcance.
+- *Hallazgo (bajo impacto, **consecuencia de la decisión 2**)*: `latest` y `v0.4.1` **no son el mismo
+  digest** (`sha256:258c5e8d…` vs `sha256:fa73b4cf…`) aunque ambos son el commit `45c4355`: el grupo
+  de `concurrency` **por `ref`** permite deliberadamente que la build de `main` y la del **tag** corran
+  en **paralelo** (dos builds, ~20 s de diferencia) y **gana `latest` el último en empujar**. Las dos
+  imágenes **no son reproducibles** (difieren en config, `created` y los **digests de las capas**, que
+  embeben mtimes). Impacto **cosmético** (mismo código, ambas `version 0.4.1`) más un build redundante
+  y almacenamiento duplicado. Se registra como **tarea 5.5**; si se aborda, va en un **change aparte**.
 
 ## Migration Plan
 
