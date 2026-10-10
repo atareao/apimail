@@ -51,27 +51,55 @@
 
 ## 3. Verificación estática del YAML
 
-- [ ] 3.1 Pasar `actionlint` (`/tmp/opencode/actionlint`, **1.7.12**) sobre el `image.yml` arreglado →
+- [x] 3.1 Pasar `actionlint` (`/tmp/opencode/actionlint`, **1.7.12**) sobre el `image.yml` arreglado →
   `exit=0` (el baseline ya estaba verde, luego cualquier hallazgo es de este change).
-- [ ] 3.2 Extraer los bloques `run:` y pasarles **`bash -n`** (`shellcheck` no está instalado en la máquina;
+  - Evidencia: `/tmp/opencode/actionlint .github/workflows/image.yml` → **`exit=0`**, sin hallazgos
+    (re-ejecutado **tras** el refinamiento del punto 1).
+- [x] 3.2 Extraer los bloques `run:` y pasarles **`bash -n`** (`shellcheck` no está instalado en la máquina;
   se documenta).
+  - Evidencia: **`shellcheck` no instalado** (`command -v shellcheck` → sin resultado). Tras el cambio del
+    punto 1 hay **7** bloques `run:` (se añadió el del enforcement) y **todos** pasan **`bash -n` → `rc=0`**.
 
 ## 4. Verificación empírica
 
-- [ ] 4.1 **Positiva (en CI)**: **dos `workflow_dispatch` sobre el MISMO commit** → el **segundo** pasa el
+- [x] 4.1 **Positiva (en CI)**: **dos `workflow_dispatch` sobre el MISMO commit** → el **segundo** pasa el
   enforcement e imprime `Reproducibility OK: …`, y el pipeline sigue **verde** (*smoke test*, uid 1000,
   publish, verificación **post-push**). Adjuntar el run y la línea de coincidencia.
-- [ ] 4.2 **Negativa (en CI, la importante: ver la alarma sonar)**: en una **rama de usar y tirar** (nunca
+  - Evidencia: commit `78003b0`. Dispatch **#1** `38032838386`: el ancla no existía → **reintentos reales**
+    (`Reference … is not published yet (attempt 1/3)`, `2/3`) y luego «No published reference … nothing to
+    compare» → **verde**. Dispatch **#2** `38033025358`:
+    `Reproducibility OK: ghcr.io/atareao/apimail:sha-78003b0 matches the freshly built image
+    (sha256:2f40532521ee74300d7987477c26aca3ba46c35b1892e8fbff05e0b873e12e84)` → **verde**. *Smoke test*, uid
+    1000, publish y verificación **post-push** = `success` en ambos.
+- [x] 4.2 **Negativa (en CI, la importante: ver la alarma sonar)**: en una **rama de usar y tirar** (nunca
   fusionada) apuntar el enforcement a una referencia **conocida y distinta** (p. ej. `reference` forzada a
   `sha-7f20753`, config `sha256:1360236702532ca10a598765b4fc69d8be1405ccfc3fd6edaf5a32508aa532b4`) y
   construir un commit nuevo → el paso **`exit 1`** y el job **rojo**, **sin publicar nada**. Adjuntar el run
   rojo. **Borrar** la rama después (es *scaffolding* de prueba, **no** se fusiona).
-- [ ] 4.3 **Regresión de alcance**: confirmar por `git diff` que solo cambia `image.yml` en lo previsto
+  - Evidencia: run **`38033290178`** (rama scratch `scratch/enforcement-negative`, **ya borrada**): el paso
+    `Enforce reproducibility…` = **`failure`** con
+    `##[error]Reproducibility broken: ghcr.io/atareao/apimail:sha-7f20753 is sha256:1360236702532ca10a598765b4fc69d8be1405ccfc3fd6edaf5a32508aa532b4 but this build produced sha256:ddc56f4a0e01620b8b71542ce25ab5c2458e9d7a9387463d8dc14653c021b0eb`;
+    los pasos **`Tag and publish the verified image`** y **`Verify the published image is pullable and
+    healthy`** quedaron **`skipped`**; el tag del commit scratch (`manifests/sha-9fc3aba`) → **HTTP 404** ⇒
+    **no se publicó nada**. La rama scratch se **borró** (scaffolding, **no** se fusiona).
+- [x] 4.3 **Regresión de alcance**: confirmar por `git diff` que solo cambia `image.yml` en lo previsto
   (el paso nuevo + el `sha-<7>` de los tags) y que triggers/`permissions`/`concurrency`/resto de pasos siguen
   igual; `git diff --name-only -- Dockerfile compose.yml src tests` → **vacío**.
+  - Evidencia: `git diff --name-only` → solo `.github/workflows/image.yml`, `README.md` y los `.md` del
+    change; `git diff --name-only -- Dockerfile compose.yml src tests` → **vacío**; `md5sum Dockerfile
+    compose.yml` = `cdbc362a4228499034d1c17a43592194` y `faf5c9b6a5cd31d0494b71331eb6a959` (intactos).
 
 ## 5. Cierre
 
-- [ ] 5.1 Marcar tareas y `openspec validate reproducibility-enforcement --strict`.
+- [x] 5.1 Revisión **independiente** del change (agente `general`, adversarial) + `openspec validate
+  reproducibility-enforcement --strict`; `rust-reviewer` **no procede** (el change no toca Rust).
+  - Evidencia: verdicto **mergeable tal cual**, **sin defectos bloqueantes**. Comprobado por la revisora: el
+    `local_id` **es** el `.config.digest` remoto (misma magnitud → la comparación es correcta); `actionlint=0`;
+    `bash -n=0`; y el caso de **cancelación** cubierto **sin estado *torn***. Hallazgos y **destino**: el
+    **falso verde del ancla-índice** → **corregido aquí** (**fail-closed**); el **blind spot de compresión** →
+    **residual mayor** documentado (endurecimiento por manifest/OCI **pendiente de decisión**); **short-sha de
+    28 bits**, «**ambos builds igual de mal**» y divergencia **entre commits** → **residuales documentados**;
+    «**o se cancela**» y la **precisión config-vs-manifest** → **documentados**. `openspec validate
+    reproducibility-enforcement --strict` → **válido** (`exit=0`).
 - [ ] 5.2 PR del change (`reproducibility-enforcement` → `development`; la release `development` → `main`
   arrastra el `.yml` y pone el enforcement en producción).

@@ -54,47 +54,67 @@
        reference="${IMAGE}:sha-${short_sha}"
        local_id="$(docker image inspect --format '{{.Id}}' apimail:ci)"
 
-       # Lee el config digest ya publicado del mismo commit. Reintenta SOLO cuando el ancla
-       # aún no está: en el flujo de release los runs de main y del tag arrancan casi a la vez
-       # y el hermano puede estar empujando justo ahora.
-       remote_id=""
+       # Lee el manifest ya publicado del mismo commit. Reintenta SOLO mientras no
+       # resuelve: en el flujo de release los runs de main y del tag arrancan casi a
+       # la vez y el hermano puede estar empujando justo ahora.
+       raw=""
        for attempt in 1 2 3; do
-         remote_id="$(docker buildx imagetools inspect "${reference}" --raw 2>/dev/null \
-           | jq -r '.config.digest' 2>/dev/null || true)"
-         if [ -n "${remote_id}" ] && [ "${remote_id}" != "null" ]; then
+         raw="$(docker buildx imagetools inspect "${reference}" --raw 2>/dev/null || true)"
+         if [ -n "${raw}" ]; then
            break
          fi
          if [ "${attempt}" -lt 3 ]; then
-           echo "Reference ${reference} not published yet (attempt ${attempt}/3); retrying in 10s"
+           echo "Reference ${reference} is not published yet (attempt ${attempt}/3); retrying in 10s"
            sleep 10
          fi
        done
 
-       if [ -z "${remote_id}" ] || [ "${remote_id}" = "null" ]; then
-         echo "No published reference ${reference} after retries; nothing to compare (first build of this commit)."
+       if [ -z "${raw}" ]; then
+         echo "No published reference ${reference} after retries: nothing to compare (first build of this commit)"
          exit 0
        fi
+
+       remote_id="$(printf '%s' "${raw}" | jq -r '.config.digest // empty' 2>/dev/null || true)"
+       if [ -z "${remote_id}" ]; then
+         echo "::error::${reference} exists but carries no single-platform manifest config: refusing to publish without comparing"
+         exit 1
+       fi
+
        if [ "${local_id}" != "${remote_id}" ]; then
          echo "::error::Reproducibility broken: ${reference} is ${remote_id} but this build produced ${local_id}"
          exit 1
        fi
+
        echo "Reproducibility OK: ${reference} matches the freshly built image (${local_id})"
    ```
    **Colocación**: tras el `login` (necesita credenciales para leer GHCR) y antes de publicar (si falla,
    **no se empuja nada**).
    **Espera acotada cuando falta el ancla**: la lectura se **reintenta 3 veces con 10 s** (máx ~30 s) y
-   **solo** mientras la referencia **no existe** — en el caso normal la primera lectura es válida y el
-   bucle hace `break` (no se paga la espera). Motivo: en el flujo de release los runs de `main` (que publica
-   `sha-<7>`) y del **tag** (que compara) arrancan con **segundos** de diferencia y tardan lo mismo (~3 min),
-   así que sin la espera la comparación sería **una moneda al aire**. *Coste*: hasta ~30 s, y **solo** cuando
-   el ancla falta.
+   **solo** mientras la referencia **no resuelve** — en el caso normal la primera lectura es válida y el
+   bucle hace `break` (no se paga la espera; tampoco se espera por un índice). Motivo: en el flujo de release
+   los runs de `main` (que publica `sha-<7>`) y del **tag** (que compara) arrancan con **segundos** de
+   diferencia y tardan lo mismo (~3 min), así que sin la espera la comparación sería **una moneda al aire**.
+   *Coste*: hasta ~30 s, y **solo** cuando el ancla falta.
    **Robustez del bucle**: si el registro devuelve error, la lectura sale vacía y **se reintenta** (no rompe
    el build); si el registro está inaccesible, el `push` posterior **fallará de todos modos**, así que **no
    se enmascara** nada.
-   **Fail-open solo** cuando **no hay** referencia del commit tras los reintentos (primer build de ese
-   commit: **no** hay nada que comparar). **Fail-closed** cuando existe y **difiere** (`exit 1`).
-   `short_sha` se calcula en shell (nada de `${{ }}` dentro del `run:`); la comparación es de **config
-   digest**, que el propio paso de build ya imprime como `Image id:`.
+   **Fail-open** cuando **no hay** referencia del commit tras los reintentos (primer build de ese commit:
+   **no** hay nada que comparar). **Fail-closed** en **dos** casos: (i) existe y **difiere** (`exit 1`); (ii)
+   existe pero **no es un manifest simple** —p. ej. un **índice multi-arch**— y no se puede extraer
+   `.config.digest` (`// empty` sale vacío) → `exit 1`: **no se publica sin comparar**. (Antes de este
+   refinamiento, el caso (ii) caía por el camino de «no existe» y quedaba **fail-open silencioso**: un **falso
+   verde latente**; ahora el bucle solo espera mientras **no resuelve** y un ancla no comparable se trata como
+   fail-closed.)
+   **Cobertura (argumento confirmado por la revisión, trazando las ordenaciones)**: como **ambos** runs
+   ejecutan el enforcement **antes** de publicar, el **segundo** en ejecutarse **siempre** encuentra el ancla
+   del primero (persiste en el registry) ⇒ **no se puede publicar `latest = A` con `vX.Y.Z = B` en silencio**.
+   El `fail-open` solo se da si el ancla **aún no existe**, y en ese caso el **otro** run compara.
+   `short_sha` se calcula en shell (nada de `${{ }}` dentro del `run:`).
+   **Precisión de magnitudes (no confundir)**: el enforcement compara **config digests** —el `Image id` que el
+   paso de build imprime, p. ej. `8b3a550c…`—; el digest **autoritativo** del artefacto es el del **manifest**
+   —lo que devuelve la cabecera `docker-content-digest`, p. ej. `12e895cd…`—. En los documentos del change se
+   citan **ambos**: los `Image id` en la verificación empírica y los `docker-content-digest` al hablar del
+   artefacto publicado. **Difieren** porque el manifest cubre, además del config, las **capas comprimidas**.
 2. **`sha-<7>` también en los eventos de tag**: en el `case` de `Tag and publish`, la rama de tag pasa de
    `("${version}" "${minor#v}" "latest")` a `("${version}" "${minor#v}" "latest" "sha-${short_sha}")`. Así
    **todo** build (push a `main`, tag `vX.Y.Z` y `workflow_dispatch`) publica el ancla inmutable por commit,
@@ -133,9 +153,16 @@
   **espera acotada** (3 reintentos × 10 s ≈ 30 s, **solo** cuando falta el ancla) da tiempo al run hermano a
   publicarla; con `sha-<7>` en **ambos** eventos, el que llega segundo **sí** compara en el caso normal.
 - *Resto de incertidumbre (dicho tal cual)*: la red de seguridad **no es total**. Si el run hermano tarda
-  **más** que esa ventana (~30 s) —o si su **build falla**—, la comparación **no ocurre** y el enforcement
+  **más** que esa ventana (~30 s) —o si su **build falla** **o se cancela**—, la comparación **no ocurre** y el enforcement
   queda **fail-open en esa ejecución**. No se pretende cobertura completa: se pretende **no quedarse callado
   en el caso normal** (release `main` + tag, casi simultáneos).
+- *Riesgos residuales que el enforcement **no** detecta (enumerados por la revisión)*: **(a)** divergencia
+  **solo de compresión** (config digest **igual**, manifest **distinto**) —el **mayor**—, aceptada a
+  propósito; el endurecimiento por **manifest**/OCI (comparar el `docker-content-digest`) queda como opcional
+  **no implementado**; **(b)** **colisión de short-sha** (7 hex = **28 bits**) → dos commits distintos
+  podrían compartir ancla; **(c)** una regresión que afecte **por igual** a los **dos** builds del mismo
+  commit (**ambos «mal» pero idénticos**: solo se compara el **2.º** contra el **1.º**); **(d)** divergencia
+  entre **commits distintos** (fuera de alcance por definición).
 - *Riesgo*: el paso añade una **llamada a GHCR** y, si el registro está caído, podría leer vacío y
   **fail-open** (no romper el build). *Aceptación*: se prefiere no bloquear un release legítimo por un
   fallo de lectura; el fallo **real** (digest distinto) sí rompe.
