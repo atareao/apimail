@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-10-10
+goal: Exponer las capacidades ya existentes de apimail como un servidor MCP opcional (stdio y Streamable HTTP) reutilizando la API key actual, sin ampliar el alcance ni cambiar el build por defecto
