@@ -846,8 +846,9 @@ Códigos de error comunes (modelo `{"error":...,"message":...}`):
 - `404` (`mailbox_not_found`) — el servidor responde `NO`: el buzón no existe.
 - `404` (`message_not_found`) — el `uid` indicado no existe. La existencia del
   mensaje se comprueba **antes** que la capacidad del servidor.
-- `501` (`capability_not_supported`) — el servidor no anuncia `MOVE`/`UIDPLUS`
-  para la operación pedida.
+- `501` (`capability_not_supported`) — **solo** en `move` (el servidor no anuncia ni
+  `MOVE` ni `UIDPLUS`) y en `delete` (no anuncia `UIDPLUS`). `flags` y `copy` **nunca**
+  devuelven `501`: `UID STORE` y `UID COPY` no dependen de ninguna extensión.
 - `503` (`imap_unavailable`) — el servidor o la sesión no están disponibles.
 - `401` (`unauthorized`) — sin API key válida.
 
@@ -911,14 +912,14 @@ devuelve el mismo cuerpo sin abrir una segunda conexión. Respuesta `200 OK` con
 `Content-Type: application/json`:
 
 ```json
-{ "status": "running", "mailbox": "INBOX" }
+{ "status": "running", "mailbox": "INBOX", "last_error": null }
 ```
 
 `POST /api/idle/stop` detiene la suscripción. Es **idempotente**: parar una suscripción
 que no está en marcha no hace nada. Respuesta `200 OK`:
 
 ```json
-{ "status": "stopped" }
+{ "status": "stopped", "mailbox": "INBOX", "last_error": null }
 ```
 
 `GET /api/idle/status` informa del estado actual. Respuesta `200 OK`:
