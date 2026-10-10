@@ -160,6 +160,57 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Enforce reproducibility against the published reference
+        env:
+          IMAGE: ghcr.io/atareao/apimail
+        run: |
+          set -euo pipefail
+
+          short_sha="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          reference="${IMAGE}:sha-${short_sha}"
+          local_id="$(docker image inspect --format '{{.Id}}' apimail:ci)"
+
+          # `sha-<7>` es la referencia inmutable de este mismo commit: si este build no
+          # produce exactamente la misma imagen, el `latest` que publicaríamos
+          # divergiría de los alias inmutables (el fallo que dejó `latest != v0.4.1`).
+          # Se corta aquí, antes de empujar nada.
+          #
+          # Se reintenta SOLO mientras el ancla no existe: en el flujo de release los
+          # runs de `main` y del tag arrancan con segundos de diferencia y tardan lo
+          # mismo, así que el hermano puede estar publicándola justo ahora.
+          #
+          # Un ancla que resuelve pero NO es un manifest simple (p. ej. un índice
+          # multi-arch) se trata como fail-closed: no se publica sin poder comparar.
+          raw=""
+          for attempt in 1 2 3; do
+            raw="$(docker buildx imagetools inspect "${reference}" --raw 2>/dev/null || true)"
+            if [ -n "${raw}" ]; then
+              break
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Reference ${reference} is not published yet (attempt ${attempt}/3); retrying in 10s"
+              sleep 10
+            fi
+          done
+
+          if [ -z "${raw}" ]; then
+            echo "No published reference ${reference} after retries: nothing to compare (first build of this commit)"
+            exit 0
+          fi
+
+          remote_id="$(printf '%s' "${raw}" | jq -r '.config.digest // empty' 2>/dev/null || true)"
+          if [ -z "${remote_id}" ]; then
+            echo "::error::${reference} exists but carries no single-platform manifest config: refusing to publish without comparing"
+            exit 1
+          fi
+
+          if [ "${local_id}" != "${remote_id}" ]; then
+            echo "::error::Reproducibility broken: ${reference} is ${remote_id} but this build produced ${local_id}"
+            exit 1
+          fi
+
+          echo "Reproducibility OK: ${reference} matches the freshly built image (${local_id})"
+
       - name: Tag and publish the verified image
         env:
           IMAGE: ghcr.io/atareao/apimail
@@ -177,14 +228,15 @@ jobs:
               ;;
             push)
               if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-                # Release tag vX.Y.Z -> vX.Y.Z, X.Y and latest.
+                # Release tag vX.Y.Z -> vX.Y.Z, X.Y, latest and the immutable per-commit
+                # anchor (so every build leaves something for the enforcement to compare).
                 version="${GITHUB_REF_NAME}"
                 if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                   echo "::error::Unexpected release tag format: ${version}"
                   exit 1
                 fi
                 minor="${version%.*}"
-                tags=("${version}" "${minor#v}" "latest")
+                tags=("${version}" "${minor#v}" "latest" "sha-${short_sha}")
               else
                 # Push to main -> latest and the short-sha tag.
                 tags=("latest" "sha-${short_sha}")
