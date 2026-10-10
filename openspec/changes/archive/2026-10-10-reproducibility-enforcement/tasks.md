@@ -101,5 +101,8 @@
     28 bits**, «**ambos builds igual de mal**» y divergencia **entre commits** → **residuales documentados**;
     «**o se cancela**» y la **precisión config-vs-manifest** → **documentados**. `openspec validate
     reproducibility-enforcement --strict` → **válido** (`exit=0`).
-- [ ] 5.2 PR del change (`reproducibility-enforcement` → `development`; la release `development` → `main`
+- [x] 5.2 PR del change (`reproducibility-enforcement` → `development`; la release `development` → `main`
   arrastra el `.yml` y pone el enforcement en producción).
+  - Evidencia: **PR #41** (`feat/reproducibility-enforcement` → `development`); el `.yml` viaja a `main` en
+    la próxima release, donde el enforcement entra en **producción** y se publica además el ancla `sha-<7>`
+    del release.
