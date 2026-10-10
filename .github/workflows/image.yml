@@ -34,6 +34,24 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
 
+      - name: Pin the build timestamp for reproducible layers
+        run: |
+          set -euo pipefail
+
+          # SOURCE_DATE_EPOCH fija `created`/`history` del config (BuildKit >= 0.11). La
+          # anotación org.opencontainers.image.created solo la normalizan los exportadores
+          # OCI; el exportador `docker` de aquí publica un manifest schema2 SIN
+          # anotaciones, así que el efecto real es sobre `created`/`history` del config.
+          # Va al entorno de los pasos siguientes, que es donde buildx lo lee para
+          # propagarlo como build arg.
+          epoch="$(git log -1 --pretty=%ct)"
+          if [ -z "${epoch}" ]; then
+            echo "::error::no se pudo leer el timestamp del commit (git log -1 --pretty=%ct)"
+            exit 1
+          fi
+          echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=${epoch} (commit $(git rev-parse --short HEAD))"
+
       - name: Build image without publishing
         run: |
           set -euo pipefail
@@ -41,17 +59,29 @@ jobs:
           # A `uses:` step cannot be retried, so the build runs from the shell to
           # survive transient registry/network failures. The flags mirror what the
           # docker/build-push-action step used to pass.
+          #
+          # `--output type=docker` es lo mismo que `--load`; `rewrite-timestamp=true`
+          # añade la normalización de las fechas de los ficheros de las capas al
+          # SOURCE_DATE_EPOCH (BuildKit >= 0.13). Sin ella, dos builds del mismo commit
+          # producían digestos distintos: era el único no-determinismo que quedaba.
           wait_s=10
           for attempt in 1 2 3; do
             echo "Build attempt ${attempt}/3"
             if docker buildx build \
                  --platform linux/amd64 \
                  --tag apimail:ci \
-                 --load \
+                 --output type=docker,rewrite-timestamp=true \
                  --cache-from type=gha \
                  --cache-to type=gha,mode=max \
                  .; then
               echo "Build succeeded on attempt ${attempt}"
+              # Evidencia auditable por run: el id es el digest del config, que incluye
+              # rootfs.diff_ids (hash de las capas descomprimidas) y por eso sí distingue
+              # los builds no reproducibles medidos (los dos del commit 45c4355 tenían
+              # diff_ids distintos). No es la comprobación completa: el digest autoritativo
+              # es el del manifest, que también cubre la compresión de las capas y lo
+              # imprimen el push y el paso de verificación post-push.
+              echo "Image id: $(docker image inspect --format '{{.Id}}' apimail:ci)"
               exit 0
             fi
             if [ "${attempt}" -lt 3 ]; then

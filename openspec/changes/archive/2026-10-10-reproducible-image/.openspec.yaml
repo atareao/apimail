@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-10
+goal: Hacer reproducibles los builds de la imagen en CI (mismo commit ⇒ mismo digest) fijando SOURCE_DATE_EPOCH al timestamp del commit y normalizando las fechas de las capas con el exportador docker (rewrite-timestamp)
+skip_specs: true
