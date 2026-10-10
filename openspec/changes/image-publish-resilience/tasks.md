@@ -144,9 +144,34 @@
 
 ## 5. Cierre
 
-- [ ] 5.1 Revisión **independiente** del change (agente `general`, adversarial) + `actionlint`;
+- [x] 5.1 Revisión **independiente** del change (agente `general`, adversarial) + `actionlint`;
   `rust-reviewer` **no procede** (el change no toca Rust). La verificación fuerte es el run real
   end-to-end (sección 4).
-- [ ] 5.2 Marcar tareas y `openspec validate image-publish-resilience --strict`.
-- [ ] 5.3 PR del change (`fix/image-publish-resilience` → `development`; la release
+  - Evidencia: verdicto de la revisión adversarial independiente → **mergeable tal cual**, sin bugs
+    bloqueantes ni regresiones. Comprobado en el diff: las **8 líneas borradas** son exactamente el
+    `with:` del paso `docker/build-push-action@v7`; el bucle de reintentos **no** tiene falso verde
+    (el `if` exime de `set -e`, `exit 0` al éxito, **2** esperas exactas de 10 s y 30 s, `exit 1` tras
+    3 fallos); el handoff por `image-tags.txt` es correcto; **no hay ninguna interpolación `${{ … }}`
+    dentro de bloques `run:`** (todo va entre comillas vía env de shell); `workflow_dispatch` publica
+    solo `sha-<7>` y **nunca** mueve `latest` (confirmado en el run: un único digest empujado);
+    `permissions` intacto. Hallazgos de severidad **baja** (sin corrección de código): (a) la
+    verificación post-push **no descarga blobs** — documentado en `design.md`; (b) no hay traza de que
+    `--cache-to type=gha,mode=max` poblara la caché en ese run, pero las banderas son **idénticas** a
+    las del paso anterior y no rompen el build (solo rendimiento). **No verificable** por la revisión
+    (y por qué): que el espejo sirviera las base en ese run (el log imprime nombres lógicos, no el
+    host resuelto; la prueba del espejo son las mediciones del `design.md`), la cancelación real de
+    `concurrency` (no se pueden lanzar dos runs), la visibilidad del paquete por API (`403`, falta
+    `read:packages`) y `shellcheck` (no instalado; se usó `bash -n`).
+- [x] 5.2 Marcar tareas y `openspec validate image-publish-resilience --strict`.
+  - Evidencia: `openspec validate image-publish-resilience --strict` → `Change 'image-publish-resilience'
+    is valid` (`exit=0`), con `skip_specs` informado (`skip_specs is set in .openspec.yaml: change
+    declares no spec-level behavior changes, zero deltas accepted`); **16/24** tareas marcadas en ese
+    momento (las 4.2–4.6 y 5.4 quedan pendientes de la release).
+- [x] 5.3 PR del change (`fix/image-publish-resilience` → `development`; la release
   `development` → `main` arrastra el `.yml` y dispara la verificación de 4.2).
+  - Evidencia: **PR #36** (`fix/image-publish-resilience` → `development`), con **CI en verde**.
+- [ ] 5.4 **Verificación externa definitiva**: con el paquete de GHCR **público**, `podman pull
+  ghcr.io/atareao/apimail:latest` **anónimo** desde la máquina de desarrollo (con `docker logout`/
+  sin credenciales) → es la prueba de que un tercero puede descargar la imagen, y cierra la
+  limitación del paso de verificación (que no ejercita la descarga de blobs). Requiere que el usuario
+  cambie la visibilidad del paquete (manual).

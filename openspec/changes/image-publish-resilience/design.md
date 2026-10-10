@@ -111,14 +111,30 @@
    nada más.
 4. **Auto-verificación del artefacto publicado**: añadir un paso **tras** el push que, para **cada
    tag publicado**, ejecute `docker pull "${IMAGE}:${tag}"` y vuelva a correr el *health check*
-   contra la imagen descargada, con las mismas variables ficticias del *smoke test*. El workflow
-   **SHALL** fallar si algún tag no se puede descargar o si la imagen descargada no responde
+   contra esa imagen, con las mismas variables ficticias del *smoke test*. Orden del paso: **parar y
+   eliminar** el contenedor del *smoke test* (`apimail-ci`) → `docker pull` de cada tag → arrancar la
+   imagen → *health check* → limpiar. El `stop`/`rm` es imprescindible porque ambos usan el puerto
+   **3000** y, si no, el segundo `docker run` falla por puerto ocupado.
+
+   **Alcance real de la prueba (sin sobreprometer)**: el `pull` corre en el **mismo runner** que
+   acaba de construir y empujar esa imagen, así que las capas ya son locales y el log muestra
+   `Status: Image is up to date for ghcr.io/atareao/apimail:<tag>`: **no descarga blobs**; lo que
+   hace es **resolver el tag contra GHCR y comprobar que el digest servido coincide con el artefacto
+   empujado**. Lo que **sí** detecta: que el push **no ocurrió**, que el digest servido **no
+   coincide** con el construido, que el **tag no existe** en el registro y que el
+   **registro/autenticación fallan**; además, arranca la imagen y comprueba `status == "ok"`,
+   `name == "apimail"` y la `version` esperada. Lo que **no** ejercita: la **descarga de blobs desde
+   un almacén vacío** (las capas ya están en ese runner). Forzar una descarga real exigiría un
+   **runner limpio** — un segundo job con `needs:` —; se documenta como **limitación conocida** y
+   **no** se implementa ahora, para no ampliar el alcance aprobado. La prueba **definitiva** de que
+   un tercero puede descargarla es un `pull` **anónimo** desde la máquina de desarrollo con el
+   paquete de GHCR **público** (hoy es privado por defecto); queda como **seguimiento** (tarea 5.4).
+
+   El workflow **SHALL** fallar si algún tag no se puede resolver o si el digest servido no
+   corresponde al artefacto publicado, y **SHALL** fallar si esa imagen no responde
    `status == "ok"`, `name == "apimail"` y la `version` esperada. Es el único punto que **no puede
    comprobarse desde fuera** cuando el paquete GHCR es privado (hoy: `404`), así que la verificación
-   tiene que vivir dentro del propio workflow. Orden del paso: **parar y eliminar** el contenedor del
-   *smoke test* (`apimail-ci`) → `docker pull` de cada tag → arrancar la imagen **descargada** →
-   *health check* → limpiar. El `stop`/`rm` es imprescindible porque ambos usan el puerto **3000** y,
-   si no, el segundo `docker run` falla por puerto ocupado.
+   tiene que vivir dentro del propio workflow.
 
 ## Alternatives Considered
 
@@ -190,8 +206,13 @@
 - **End-to-end (merge a `main`)**: el merge del arreglo a `main` dispara `Image`; el run **SHALL**
   terminar **verde** publicando `latest`, y el contenedor de la imagen descargada **SHALL** quedar
   con `RestartCount 0`.
-- El paso de verificación post-push **SHALL** descargar cada tag publicado y repetir el *health
-  check* sobre la imagen descargada.
+- El paso de verificación post-push **SHALL** resolver cada tag publicado contra GHCR y comprobar
+  que el digest servido corresponde al artefacto empujado, y **SHALL** arrancar esa imagen y
+  verificar `status`/`name`/`version`. **Alcance**: como corre en el **mismo runner**, las capas son
+  locales (`Status: Image is up to date`) → **no** ejercita la descarga de blobs; forzarla requeriría
+  un **runner limpio** (segundo job con `needs:`), que **no** se implementa ahora. La prueba
+  definitiva de descarga por un tercero es un `pull` **anónimo** con el paquete GHCR **público**
+  (seguimiento, tarea 5.4).
 - Comprobación del espejo: `HEAD` a `mirror.gcr.io/v2/library/{alpine,rust}/manifests/...` → **200**,
   **build real** de `alpine:3.21` desde el espejo correcto y `rust:1.98.1-alpine3.21` con `linux/amd64`
   presente (ya medido, ver Context).
