@@ -48,6 +48,8 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 | 5 | `attachment-content` — contenido de adjuntos en el payload | Extensión de `imap-idle` | Baja | ⏳ pendiente |
 | 6 | `container-image` — despliegue contenedorizado | Infraestructura de distribución | Alta | 🚧 en curso |
 | 7 | `manifest-digest` — comprobar el digest del manifiesto en el enforcement | Endurecimiento de CI | Media | ⏳ pendiente (sin propuesta) |
+| 8 | `mcp-server` — exponer la API como servidor MCP | Capability nueva / distribución | Media | ⏳ pendiente → `plans/PLAN-002.md` |
+| 9 | `openapi` — especificación OpenAPI + UI de documentación | Documentación / distribución | Media | ⏳ pendiente → `plans/PLAN-003.md` |
 
 ### 3. `webhook-delivery` — entrega *at-least-once* con cola persistente
 
