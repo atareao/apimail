@@ -144,7 +144,12 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 - **Posible arreglo** (a decidir, no aprobado): tratar una lista vacía como sospechosa
   (reintentar una vez y/o registrarla en el log). Es un cambio de comportamiento, así que
   requiere spec.
-- **Estado**: ⏳ pendiente; sin propuesta ni rama.
+- **Decisión (2026-10-10)**: se **cierra sin intervención** en producción. Se descarta la prueba
+  dirigida (cortar el socket IMAP ocioso) porque la condición observada —la primera llamada
+  tras horas de sesión ociosa— no es reproducible a voluntad y un resultado negativo no
+  aportaría evidencia concluyente. Se retoma **solo** si la respuesta vacía vuelve a
+  observarse, entonces con datos frescos.
+- **Estado**: ⏳ **registrado y cerrado**; sin propuesta ni rama.
 
 ## 3. Secuencia recomendada
 
