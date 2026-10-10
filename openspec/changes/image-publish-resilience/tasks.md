@@ -112,12 +112,20 @@
 
 ## 4. Verificación end-to-end
 
-- [ ] 4.1 **Dry-run del pipeline arreglado con `workflow_dispatch` sobre la rama** (antes del merge a
+- [x] 4.1 **Dry-run del pipeline arreglado con `workflow_dispatch` sobre la rama** (antes del merge a
   `main`): `gh workflow run image.yml --ref fix/image-publish-resilience`. En ese caso el `case`
   publica **solo** `sha-<7>` y **nunca** mueve `latest`, así que no hay release ni artefacto mutable.
   Debe terminar **verde**: prueba en un solo run el espejo (`buildkitd-config-inline`), los
   reintentos, el smoke test, la verificación de uid 1000, el push y la verificación del publicado.
-  - Evidencia: el run y su conclusión.
+  - Evidencia: run **38025457014** (`workflow_dispatch` sobre `fix/image-publish-resilience`),
+    conclusión **success** y los **8 pasos en verde**. El log de `Set up Docker Buildx` muestra el
+    buildkitd aplicado: `"buildkitd.toml": "[registry]\n[registry.'docker.io']\nmirrors = ['mirror.gcr.io']\n"`.
+    El build **no** necesitó reintentos: `Build succeeded on attempt 1` (`attempt 1/3`), sin `429`.
+    Smoke test: `version 0.4.0`; uid 1000 verificado. El paso nuevo verificó el **publicado**:
+    `ghcr.io/atareao/apimail:sha-4a39141` descargado (digest
+    `sha256:9e174dfd7c896b5b5ec76c8072c2f6a2a9bcc8c68dfeb70294348b0fa3a5ade5`) y
+    «Published image ghcr.io/atareao/apimail:sha-4a39141 is pullable and healthy».
+    **Se publicó solo `sha-4a39141`**: `latest` **no** se movió, como documenta el change.
 - [ ] 4.2 **El propio merge del arreglo a `main` dispara `Image`** (el diff incluye un `.yml`, que
   **no** está en `paths-ignore`); adjuntar el run disparado.
 - [ ] 4.3 El run termina **verde publicando `latest`** (y `sha-<7>`; `vX.Y.Z`/`X.Y` si el merge trae
