@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-10
+goal: Imponer la reproducibilidad de la imagen en CI — un paso que compara el config digest del build contra el ya publicado del mismo commit y falla si diverge, más sha-<7> como ancla inmutable también en los eventos de tag
+skip_specs: true

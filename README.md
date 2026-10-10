@@ -246,9 +246,11 @@ por él.
 
 ### Imagen publicada en GHCR
 
-El proyecto publica la imagen en `ghcr.io/atareao/apimail`. Se etiqueta como
-`latest` y `sha-<7>` en cada push, y además como `vX.Y.Z` y `X.Y` cuando el push
-lleva un tag de versión. Para desplegar una imagen ya publicada **sin compilar**:
+El proyecto publica la imagen en `ghcr.io/atareao/apimail`. `sha-<7>` (el ancla
+inmutable por commit) se publica en **todos** los builds —push a `main`, push con
+tag de versión y ejecución manual—; además, un push a `main` etiqueta `latest`, y
+un push con tag de versión etiqueta `vX.Y.Z`, `X.Y` y `latest`. Para desplegar una
+imagen ya publicada **sin compilar**:
 
 ```bash
 just deploy            # usa el tag latest
