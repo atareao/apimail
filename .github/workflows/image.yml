@@ -38,9 +38,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # SOURCE_DATE_EPOCH fija `created`/`history` del config y la anotación
-          # org.opencontainers.image.created (BuildKit >= 0.11). Va al entorno de los
-          # pasos siguientes, que es donde buildx lo lee para propagarlo como build arg.
+          # SOURCE_DATE_EPOCH fija `created`/`history` del config (BuildKit >= 0.11). La
+          # anotación org.opencontainers.image.created solo la normalizan los exportadores
+          # OCI; el exportador `docker` de aquí publica un manifest schema2 SIN
+          # anotaciones, así que el efecto real es sobre `created`/`history` del config.
+          # Va al entorno de los pasos siguientes, que es donde buildx lo lee para
+          # propagarlo como build arg.
           epoch="$(git log -1 --pretty=%ct)"
           if [ -z "${epoch}" ]; then
             echo "::error::no se pudo leer el timestamp del commit (git log -1 --pretty=%ct)"
@@ -72,9 +75,12 @@ jobs:
                  --cache-to type=gha,mode=max \
                  .; then
               echo "Build succeeded on attempt ${attempt}"
-              # Evidencia auditable por run: el id de la imagen es el digest del config,
-              # que es justo lo que distingue dos builds del mismo commit cuando no son
-              # reproducibles. Debe coincidir entre runs del mismo commit.
+              # Evidencia auditable por run: el id es el digest del config, que incluye
+              # rootfs.diff_ids (hash de las capas descomprimidas) y por eso sí distingue
+              # los builds no reproducibles medidos (los dos del commit 45c4355 tenían
+              # diff_ids distintos). No es la comprobación completa: el digest autoritativo
+              # es el del manifest, que también cubre la compresión de las capas y lo
+              # imprimen el push y el paso de verificación post-push.
               echo "Image id: $(docker image inspect --format '{{.Id}}' apimail:ci)"
               exit 0
             fi

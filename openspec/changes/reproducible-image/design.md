@@ -27,8 +27,9 @@
   como bandera (control de parseo: la página menciona `provenance` 21×, `cache-to` 14×, `load` 28×).
   `rewrite-timestamp` es una **opción del exportador** (`--output type=docker,rewrite-timestamp=true`,
   por defecto `false`). BuildKit **≥0.11** normaliza `created`/`history` y la anotación
-  `org.opencontainers.image.created`; **≥0.13** cubre **además las fechas de los ficheros de las
-  capas** —justo lo que falta—.
+  `org.opencontainers.image.created` (la anotación **solo aplica a exportadores OCI**; el exportador
+  `docker` publica un manifest **schema2 sin anotaciones**); **≥0.13** cubre **además las fechas de los
+  ficheros de las capas** —justo lo que falta—.
 - **Patrón oficial (referencia)** (docs.docker.com/build/ci/github-actions/reproducible-builds/): paso
   `Get Git commit timestamps` → `echo "TIMESTAMP=$(git log -1 --pretty=%ct)" >> $GITHUB_ENV`, y el
   build con `env: SOURCE_DATE_EPOCH: ${{ env.TIMESTAMP }}`. **Desviación** (ver Decisión 1): ese
@@ -68,9 +69,10 @@
        echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
    ```
    Así `SOURCE_DATE_EPOCH` queda en el **entorno de los pasos siguientes**, que es donde buildx lo lee
-   para propagarlo como build arg. Fija `created`/`history` y la anotación
-   `org.opencontainers.image.created` (BuildKit ≥0.11), pero **por sí solo** —con el exportador
-   `type=docker`— **no** toca las fechas de los ficheros de las capas; de eso se encarga la decisión 2.
+   para propagarlo como build arg. Fija `created`/`history` del config (BuildKit ≥0.11) y —**solo con
+   exportadores OCI**— la anotación `org.opencontainers.image.created` (el exportador `docker` de aquí
+   publica un manifest **schema2 sin anotaciones**), pero **por sí solo** **no** toca las fechas de los
+   ficheros de las capas; de eso se encarga la decisión 2.
    **Desviación deliberada del patrón oficial** (ver Context): los docs de Docker proponen una
    variable intermedia `TIMESTAMP` más `env: SOURCE_DATE_EPOCH: ${{ env.TIMESTAMP }}` en el paso de
    build, pero ese snippet es un **artefacto de `docker/build-push-action`**. Aquí el build es un paso
@@ -85,9 +87,15 @@
    de las capas** (BuildKit ≥0.13). Se conservan `--platform linux/amd64`, `--tag apimail:ci` y
    `--cache-from/to`. La decisión 1 **sin** la 2 no bastaría; la 2 **sin** la 1 normalizaría a un
    epoch fijo en vez de al timestamp del commit.
-3. **Una línea de evidencia por run**: tras el build, imprimir el id (y tamaño) de la imagen:
+3. **Una línea de evidencia por run**: tras el build, imprimir el id de la imagen:
    `docker image inspect --format '{{.Id}}' apimail:ci`. **No es lógica, es trazabilidad**: deja el id
-   en el log para poder comparar runs sin cambiar la semántica del workflow.
+   en el log para poder comparar runs sin cambiar la semántica del workflow. **Precisión**: ese id es
+   el digest del **config**, que incluye `rootfs.diff_ids` (hash de las capas **descomprimidas**); por
+   eso **sí** discrimina los builds no reproducibles medidos (los dos del commit `45c4355` tenían
+   configs `80ad2382…` vs `04390a62…`, con `diff_ids` distintos —esa era exactamente la diferencia de
+   mtimes—). Pero **no** es la comprobación **completa**: el digest autoritativo es el del **manifest**,
+   que además cubre la **compresión** de las capas y lo imprimen el `push` y el paso de verificación
+   **post-push**.
 
 ## Alternatives Considered
 
@@ -118,6 +126,18 @@
   efecto observable es el mismo (imagen `apimail:ci` local) más la normalización de fechas.
 - *Riesgo*: los builds **locales** (`podman`/`compose`) siguen **no** siendo reproducibles.
   *Aceptación*: non-goal explícito (otro motor; compose no pasa estas banderas).
+- *Riesgo (inputs mutables más allá de BuildKit)*: el `Dockerfile` referencia las bases por **tag**
+  (`rust:1.98.1-alpine3.21`, `alpine:3.21`), **no** por digest, así que el **mismo commit dará otro
+  digest si un tag base se mueve**. La garantía vale mientras no cambien BuildKit ni los **digests** de
+  las bases (hoy los logs resuelven `alpine@sha256:ce64758a…` y `rust@sha256:da8d60ba…`). Fijar los
+  digests de las bases sería un cambio del `Dockerfile` ⇒ **fuera de alcance**.
+- *Riesgo / hallazgo de la revisión (severidad media)*: el workflow **audita** la reproducibilidad pero
+  **no la impone**: **no** hay ningún paso que **falle** si los digests divergen. Si un cambio futuro
+  (BuildKit, base, …) la rompiera, `latest` se sobrescribiría con otro digest, la verificación
+  post-push seguiría **verde** (solo comprueba salud) y CI quedaría **verde mientras `latest` ≠
+  `vX.Y.Z`**. *Corrección mínima propuesta*: antes del push, comparar contra el digest ya publicado del
+  tag inmutable `sha-<7>` y fallar si difiere. *Decisión*: **no** se implementa en este change (es una
+  capacidad nueva, merece su propio change); queda como **seguimiento**.
 
 ## Migration Plan
 
@@ -136,10 +156,19 @@
   `https://ghcr.io/token?scope=repository:atareao/apimail:pull&service=ghcr.io`, leyendo la cabecera
   `docker-content-digest` **antes** del segundo dispatch y **después**; si cambia, el segundo build
   produjo **otra** imagen ⇒ **falla**.
+- **Evidencia que refuerza la prueba (confirmada por la revisión)**: los dos runs fueron **en frío**
+  (**0** líneas `CACHED`; `#15 DONE 117.1s` y `78.2s`), así que la coincidencia de digests **no** es un
+  artefacto de caché; el `created` del config publicado es la **fecha del commit**
+  (`2026-10-10T06:03:37Z`), **no** la del run (el segundo corrió a las 06:07); el `HEALTHCHECK` del
+  `Dockerfile` **sobrevive** al exportador `type=docker`; y el manifest publicado es **schema2 sin**
+  attestations de provenance (por eso su digest depende solo de config + capas).
 - **Inferencia honesta y explícita**: el run de `main` y el del **tag** construyen **el mismo
   commit**, así que probar «un commit ⇒ un digest» **implica** que sus salidas **coinciden** ⇒
   **`latest` ≡ `v0.4.1`**. Pero eso **no se podrá re-verificar hasta la próxima release** (no se
   fuerza una release para probarlo); se dice tal cual.
+- **Límite de la inferencia**: `latest ≡ vX.Y.Z` **no** se ha ejercitado en el escenario **paralelo**
+  `main`+tag (los dos dispatches fueron sobre el **mismo `ref`**, serializados por `concurrency`); lo
+  que sustenta la inferencia es que el **evento no afecta al build** (el `case` decide **solo tags**).
 - Todo lo demás **SHALL** seguir verde: *smoke test*, verificación de uid 1000, push y verificación
   **post-push** del artefacto publicado.
 - **Verificación local cruzada** (opcional, barata y disponible): `podman build` con las banderas

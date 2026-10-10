@@ -1,8 +1,8 @@
 # Tasks
 
 > **RED ya capturado**: el no-determinismo (mismo commit `45c4355` ⇒ **digests distintos** pese a
-> **contenido idéntico**) se midió antes de implementar (sección 1); el resto de tareas quedan
-> pendientes de aprobación e implementación.
+> **contenido idéntico**) se midió antes de implementar (sección 1). El change está **aprobado e
+> implementado** y su verificación empírica salió **verde**; solo quedan las tareas de **cierre** (§6).
 
 ## 1. RED — Baseline medido (evidencia)
 
@@ -70,31 +70,74 @@
 
 ## 3. Verificación estática del YAML
 
-- [ ] 3.1 Pasar `actionlint` (`/tmp/opencode/actionlint`, **1.7.12**) sobre el `image.yml` arreglado →
+- [x] 3.1 Pasar `actionlint` (`/tmp/opencode/actionlint`, **1.7.12**) sobre el `image.yml` arreglado →
   `exit=0` (el baseline ya estaba verde, luego cualquier hallazgo es de este change).
-- [ ] 3.2 Extraer los bloques `run:` y pasarles **`bash -n`** (`shellcheck` no está instalado en la
+  - Evidencia: `/tmp/opencode/actionlint .github/workflows/image.yml` → **`exit=0`**, sin hallazgos.
+- [x] 3.2 Extraer los bloques `run:` y pasarles **`bash -n`** (`shellcheck` no está instalado en la
   máquina; se documenta).
+  - Evidencia: **`shellcheck` no instalado** (`command -v shellcheck` → sin resultado); los **6**
+    bloques `run:` extraídos a `/tmp/opencode/wf2/*.sh` pasan `bash -n` → **todos OK**.
 
 ## 4. Verificación empírica
 
-- [ ] 4.1 **Prueba fuerte**: dos `workflow_dispatch` sobre el **MISMO commit**; el tag `sha-<7>` debe
+- [x] 4.1 **Prueba fuerte**: dos `workflow_dispatch` sobre el **MISMO commit**; el tag `sha-<7>` debe
   resolver al **mismo digest**. Medirlo de forma **anónima** (`GHCR /v2/…/manifests/<tag>` con token de
   `ghcr.io/token`, cabecera `docker-content-digest`) **antes** del segundo dispatch y **después**; si
   cambia, **falla**. Adjuntar los digests.
-- [ ] 4.2 **Inferencia `latest` ≡ `vX.Y.Z`** (documentar, sin forzar release): como `main` y el tag
-  construyen el **mismo commit**, «un commit ⇒ un digest» implica que coinciden; **no** se re-verifica
-  hasta la próxima release.
-- [ ] 4.3 Confirmar que **todo lo demás sigue verde**: *smoke test*, verificación de uid 1000, push y
+  - Evidencia: commit `7f20753` (rama `feat/reproducible-image`), **dos dispatches** → en ambos
+    `SOURCE_DATE_EPOCH=1791612217 (commit 7f20753)` y `Image id:` (digest del config) **idéntico**:
+    `sha256:1360236702532ca10a598765b4fc69d8be1405ccfc3fd6edaf5a32508aa532b4` (runs `38029626408` y
+    `38029820836`, ambos **success**). El digest del tag `sha-7f20753` en GHCR (consulta **anónima**,
+    cabecera `docker-content-digest`) es **el mismo antes y después** del 2.º dispatch:
+    `sha256:caa6591d7552a5ad58de6c0a0294a34937adcae6075569edd18c79c18bdfbdb7` → el tag **no se movió**;
+    si el segundo build hubiese producido otra imagen, GHCR habría servido **otro** digest y la prueba
+    habría **fallado**. **Contraste con el RED** (sección 1): sin el arreglo, dos builds del commit
+    `45c4355` dieron `sha256:fa73b4cf…` (tag) ≠ `sha256:258c5e8d…` (main).
+- [x] 4.2 **Inferencia `latest` ≡ `vX.Y.Z`** (documentada, sin forzar release): como `main` y el tag
+  construyen el **mismo commit**, «un commit ⇒ un digest» **implica** que coinciden; **no** se
+  re-verifica en una release real dentro de este change (no se fuerza una release para probarlo).
+  - Evidencia: el **evento no afecta al build**: en `image.yml` el `case` de `${GITHUB_EVENT_NAME}`
+    decide **solo los tags** publicados; **no** hay ningún paso de build dependiente del evento. Y
+    `SOURCE_DATE_EPOCH` depende **solo** del commit (`git log -1 --pretty=%ct`): en los dos dispatches
+    vale `1791612217` para `7f20753`, con independencia del evento. Por tanto, un push a `main` y un
+    push del tag del **mismo** commit construyen la **misma** imagen. *(No se prueba contra una release
+    real aquí.)*
+- [x] 4.3 Confirmar que **todo lo demás sigue verde**: *smoke test*, verificación de uid 1000, push y
   verificación **post-push** del artefacto publicado.
-- [ ] 4.4 **(Opcional) verificación local cruzada**: `podman build` con las banderas equivalentes de
+  - Evidencia: `gh run view <id> --json jobs` en **ambos** runs → **todos** los pasos `success`
+    (14 entradas: 10 del job + `Post …` + `Complete job`), incluidos `Pin the build timestamp for
+    reproducible layers`, `Build image without publishing`, `Smoke test the built image`,
+    `Verify unprivileged user and writable data volume`, `Log in to GitHub Container Registry`,
+    `Tag and publish the verified image` y `Verify the published image is pullable and healthy`
+    (lista **idéntica** en `38029626408` y `38029820836`).
+- [x] 4.4 **(Opcional) verificación local cruzada**: `podman build` con las banderas equivalentes de
   buildah (`--source-date-epoch` / `--rewrite-timestamp`) para comprobar que el **`Dockerfile` no
   necesita cambios** y que dos builds locales coinciden; si la versión no lo soporta, documentarlo como
   **no verificable** por esa vía.
+  - Evidencia: **sí** está soportado localmente — `buildah 1.45.1` expone `--rewrite-timestamp` y
+    `--source-date-epoch` en `buildah build --help` —, pero **no** se ejecutó un build local completo
+    del proyecto (≈5–10 min por build en frío). Motivo: la comparación de rootfs (sección 1) ya descartó
+    otro no-determinismo, y la **prueba fuerte se ha hecho en CI**, con el **mismo toolchain** que
+    produce el artefacto real. **El `Dockerfile` no necesitó cambios** (verificado **por inspección**:
+    nada en él depende de fechas).
 
 ## 5. Revisión independiente
 
-- [ ] 5.1 Revisión **adversarial** del change (agente `general`) + `actionlint`; `rust-reviewer`
+- [x] 5.1 Revisión **adversarial** del change (agente `general`) + `actionlint`; `rust-reviewer`
   **no procede** (el change no toca Rust). La verificación fuerte es la prueba empírica (sección 4).
+  - Evidencia: revisión adversarial independiente (agente `general`) → **verdicto: mergeable tal
+    cual**, **sin defectos bloqueantes**. Comprobado por la revisora: los dos runs fueron **en frío**
+    (0 líneas `CACHED`) y coincidieron **config**, **capas** y **manifest**; el `HEALTHCHECK` **se
+    preserva** con el exportador `type=docker`; **no** hay interpolación `${{ … }}` en bloques `run:`;
+    el bucle de reintentos queda **intacto**; y el **alcance** se respetó (solo `image.yml`). Hallazgos
+    **no bloqueantes**, ya incorporados aquí: (i) el workflow **audita pero no impone** la
+    reproducibilidad → **seguimiento**; (ii) las **bases por tag** son mutables → limitación
+    reconocida; (iii) precisión de la **anotación OCI** (schema2 sin anotaciones) y del **alcance del
+    `Image id`**. **Dos observaciones no aceptadas**, con motivo: (1) «el `Image id` no discrimina los
+    mtimes» → **medida en contra**: los `diff_ids` del config **sí** difieren entre los dos builds
+    históricos (`5f023324…` vs `f21e7fc2…`), luego el id sí los distingue; (2) «código antes de la
+    aprobación» → parte de un estado del fichero **ya superado**: el código se escribió **después**
+    del «adelante» del usuario; queda aclarado.
 
 ## 6. Cierre
 

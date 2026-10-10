@@ -53,6 +53,10 @@ aplicación **no se tocan**. Tres puntos:
   commit — sigue igual, ahora **inofensivo**).
 - **No** se fija la versión de **BuildKit** ni `compatibility-version` (la asamblea afecta al digest
   **entre** versiones de BuildKit).
+- **No** se fijan los **digests de las bases** (el `Dockerfile` las referencia por **tag** → el mismo
+  commit daría otro digest si un tag base se mueve) ni se **impone** la reproducibilidad con un paso
+  que falle al divergir. Ambas son limitaciones reconocidas (ver `design.md`); la segunda queda como
+  **seguimiento**.
 
 ## Capabilities
 
