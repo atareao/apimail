@@ -50,6 +50,7 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 | 7 | `manifest-digest` — comprobar el digest del manifiesto en el enforcement | Endurecimiento de CI | Media | ⏳ pendiente (sin propuesta) |
 | 8 | `mcp-server` — exponer la API como servidor MCP | Capability nueva / distribución | Media | ⏳ pendiente → `plans/PLAN-002.md` |
 | 9 | `openapi` — especificación OpenAPI + UI de documentación | Documentación / distribución | Media | ⏳ pendiente → `plans/PLAN-003.md` |
+| 10 | `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes` | Defecto (intermitente, no reproducido) | Media | ⏳ pendiente (sin propuesta) |
 
 ### 3. `webhook-delivery` — entrega *at-least-once* con cola persistente
 
@@ -113,6 +114,32 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
   — deterministas por nivel, no aleatorios.
 - **Estado**: ⏳ **no aprobado**; sin propuesta ni rama. Requiere un change en `openspec/changes/`
   antes de escribir código.
+
+### 10. `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes`
+
+- **Qué**: en producción, `GET /api/mailboxes` devolvió **una vez** `200` con
+  `{"mailboxes":[]}` (2026-10-10), cuando la cuenta tiene **5** buzones (`INBOX`, `Drafts`,
+  `Sent`, `Trash`, `Spam`).
+- **Por qué importa**: un `200` con la lista vacía es indistinguible de «la cuenta no tiene
+  buzones». Un cliente puede darlo por cierto y actuar en consecuencia (p. ej. no archivar
+  al no encontrar buzón destino) **sin ver ningún error**.
+- **Evidencia**: la llamada vacía fue la **primera** tras horas de contenedor levantado
+  (sesión IMAP ociosa). Las **2** llamadas inmediatamente siguientes devolvieron la lista
+  completa y un *burst* posterior de **40** llamadas dio **40/40** con 5 buzones
+  (**0** vacías). **No reproducido**.
+- **Análisis del código** (hecho): `list_mailboxes` → `run_once` → `ensure_session` +
+  `session.list(None, Some("*"))` (`LIST "" "*"`), con `map_err(...)?` y `try_collect()`
+  que **propagan** los errores: no hay ninguna rama que traduzca un error a lista vacía.
+  El `[]` solo puede proceder de (a) una respuesta `OK` del servidor sin ningún `* LIST`
+  (protocolo correcto: «no hay buzones») o (b) un *stream* de respuestas que termina sin
+  elementos (p. ej. `EOF` de una conexión muerta) sin error. **No se ha determinado cuál.**
+- **Qué haría falta**: instrumentar la capa IMAP (`RUST_LOG` en nivel *debug*) para capturar
+  el intercambio `LIST` crudo, y/o intentar reproducirlo cortando la conexión TCP ociosa.
+  **No** se ha intervenido la red de producción para probarlo.
+- **Posible arreglo** (a decidir, no aprobado): tratar una lista vacía como sospechosa
+  (reintentar una vez y/o registrarla en el log). Es un cambio de comportamiento, así que
+  requiere spec.
+- **Estado**: ⏳ pendiente; sin propuesta ni rama.
 
 ## 3. Secuencia recomendada
 
