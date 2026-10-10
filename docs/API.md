@@ -192,6 +192,344 @@ Notas de límites relevantes para la API:
 
 ---
 
+## Recetas y casos de uso
+
+Estas recetas son **flujos de uso** que combinan rutas ya documentadas más abajo; no
+introducen endpoints nuevos. Todas asumen las convenciones generales: URL base
+`http://127.0.0.1:3000` y la cabecera `Authorization: Bearer <clave>`. El `uid` es un
+identificador **por buzón**: es estable dentro de un buzón (nunca se renumera; su
+validez la acota `uid_validity`) y se obtiene listando con `GET /api/messages`.
+Los errores de estas rutas usan el **envoltorio de error** habitual
+(`{"error":...,"message":...}`); la excepción, como en el resto de la API, son las
+respuestas por defecto de axum para ruta desconocida (`404`) y método no permitido
+(`405`) (ver *Rutas y métodos no soportados*).
+
+### Listar los correos no leídos
+
+- **Objetivo**: obtener la lista de los mensajes no leídos de un buzón.
+- **Endpoint**: `GET /api/messages?mailbox=INBOX&unseen=true`
+
+- **Parámetros (query)**: `mailbox` obligatorio (no vacío; sin `CR`/`LF`/`NUL`); `unseen`
+  opcional (`true`/`false`; **alias** de `seen`: `unseen=true` ⇒ `seen=false`; si se envían
+  ambos deben concordar, si no → `400`); `limit` opcional (`1..=200`, por defecto `50`);
+  `offset` opcional (`>= 0`, por defecto `0`). Otros filtros útiles: `from`, `to`, `subject`,
+  `text`, `since`, `before`, `flagged`.
+- `unseen=true` se traduce al criterio IMAP `UNSEEN`; `seen=false` es equivalente.
+
+**Ejemplo `curl`**
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages?mailbox=INBOX&unseen=true&limit=20"
+```
+
+**Respuesta 2xx (200)** — `total` es el **número total de coincidencias** de la búsqueda,
+es decir, el conteo de no leídos.
+
+```json
+{
+  "mailbox": "INBOX",
+  "total": 7,
+  "limit": 20,
+  "offset": 0,
+  "messages": [
+    {
+      "uid": 42,
+      "seq": 42,
+      "flags": [],
+      "size": 2048,
+      "internal_date": "2026-10-08T12:00:00+00:00",
+      "envelope": {
+        "from": [{ "name": "Alice", "address": "alice@example.com" }],
+        "to": [{ "name": null, "address": "bob@example.com" }],
+        "cc": [],
+        "subject": "hi",
+        "date": "Wed, 08 Oct 2026 11:00:00 +0000",
+        "message_id": "<id@example.com>"
+      }
+    }
+  ]
+}
+```
+
+**Errores que importan**
+
+| HTTP | error | Cuándo |
+| --- | --- | --- |
+| `400` | `invalid_request` | `mailbox` ausente/blank; booleano distinto de `true`/`false`; `limit` fuera de `1..=200`; `offset` no numérico; `seen`/`unseen` contradictorios; caracteres de control; *query* malformada |
+| `401` | `unauthorized` | clave ausente o inválida |
+| `404` | `mailbox_not_found` | el servidor responde `NO` |
+| `503` | `imap_unavailable` | sesión o servidor no disponibles |
+
+**Ojo con**
+
+- `limit` tiene un máximo de `200`: para cubrir `total` hay que **paginar** con `offset`
+  (`offset += limit`) hasta agotar las coincidencias.
+- El campo `unseen` de `POST /api/mailboxes/select` **no es un conteo** (es el número de
+  secuencia del primer mensaje no visto); para contar no leídos usa el `total` de esta búsqueda.
+
+---
+
+### Obtener el cuerpo de un correo
+
+- **Objetivo**: descargar el texto plano y el HTML de un mensaje concreto.
+- **Endpoint**: `GET /api/messages/{uid}/body?mailbox=INBOX`
+
+- El mensaje se descarga con `BODY.PEEK[]`, así que **leer no fija `\Seen`** (leer no marca
+  el mensaje como leído).
+- El tamaño se acota con `APIMAIL_MAX_MESSAGE_BYTES` (por defecto `26214400`, 25 MiB).
+
+**Ejemplo `curl`**
+
+```bash
+curl -fsS -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages/42/body?mailbox=INBOX"
+```
+
+**Respuesta 2xx (200)** — `text` y `html` son `string|null` (`null` si no hay parte mostrable
+ni derivable).
+
+```json
+{ "mailbox": "INBOX", "uid": 42, "text": "Hola mundo", "html": "<p>Hola</p>" }
+```
+
+**Errores que importan**
+
+| HTTP | error | Cuándo |
+| --- | --- | --- |
+| `400` | `invalid_request` | `uid` no numérico o `0`; `mailbox` ausente/blank o con caracteres de control (**no se envía ningún comando IMAP**) |
+| `401` | `unauthorized` | clave ausente o inválida |
+| `404` | `mailbox_not_found` | el servidor responde `NO` |
+| `404` | `message_not_found` | el `uid` no existe |
+| `413` | `message_too_large` | el mensaje supera `APIMAIL_MAX_MESSAGE_BYTES` |
+| `422` | `message_not_parsable` | el MIME del mensaje no puede parsearse |
+| `503` | `imap_unavailable` | sesión o servidor no disponibles |
+
+**Ojo con**
+
+- El HTML se devuelve **sin sanear**: trátalo como contenido no confiable.
+- Como leer no fija `\Seen`, si quieres marcarlo como leído hay que hacerlo explícitamente
+  (ver *Marcar un correo como leído*).
+- Para metadatos/cabeceras o el mensaje completo en base64 usa `GET /api/messages/{uid}`;
+  para adjuntos, `GET /api/messages/{uid}/attachments` y `GET /api/messages/{uid}/attachments/{id}`.
+
+---
+
+### Marcar un correo como leído
+
+- **Objetivo**: fijar la bandera `\Seen` (o quitarla para marcar como no leído).
+- **Endpoint**: `PATCH /api/messages/{uid}/flags?mailbox=INBOX`
+
+- **Leído**: cuerpo `{"add":["\\Seen"]}`. **No leído**: `{"remove":["\\Seen"]}`.
+- Aplica `UID STORE` y relee las banderas resultantes con `UID FETCH`; la existencia del
+  mensaje se comprueba antes. **Idempotente** respecto al estado final.
+- `add` y `remove` son arrays de string **opcionales** (por defecto `[]`); al menos uno debe
+  ser no vacío; ninguna bandera puede estar a la vez en `add` y `remove`; se canonicalizan y
+  deduplican.
+- Allowlist (el nombre se acepta sin distinguir mayúsculas, pero el `\` inicial es
+  **obligatorio**): `\Seen`, `\Answered`, `\Flagged`, `\Draft`, `\Deleted`.
+
+**Ejemplo `curl`**
+
+```bash
+curl -fsS -X PATCH -H "Authorization: Bearer una-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"add":["\\Seen"]}' \
+  "http://127.0.0.1:3000/api/messages/42/flags?mailbox=INBOX"
+```
+
+**Respuesta 2xx (200)** — `flags` son las banderas resultantes tras el `STORE`.
+
+```json
+{ "mailbox": "INBOX", "uid": 42, "flags": ["\\Seen"] }
+```
+
+**Errores que importan**
+
+| HTTP | error | Cuándo |
+| --- | --- | --- |
+| `400` | `invalid_request` | `uid` no numérico o `0`; `mailbox` ausente/blank o con caracteres de control; JSON malformado; actualización vacía; bandera desconocida; misma bandera en `add` y `remove` |
+| `401` | `unauthorized` | clave ausente o inválida |
+| `404` | `mailbox_not_found` | el servidor responde `NO` |
+| `404` | `message_not_found` | el `uid` no existe |
+| `503` | `imap_unavailable` | sesión o servidor no disponibles |
+
+**Ojo con**
+
+- Otras banderas útiles: `\Flagged` (destacado), `\Answered` (respondido), `\Draft`, `\Deleted`.
+- Esta ruta actúa sobre **un único `uid`**; no hay lote (ver *Operaciones en lote (masivas)*).
+
+---
+
+### Borrar un correo
+
+- **Objetivo**: eliminar (purgar) un mensaje de un buzón.
+- **Endpoint**: `DELETE /api/messages/{uid}?mailbox=INBOX`
+
+- Marca el mensaje `\Deleted` con `UID STORE` y lo purga **solo a él** con `UID EXPUNGE`;
+  exige que el servidor anuncie `UIDPLUS` (si no, `501 capability_not_supported` y **nunca**
+  un `EXPUNGE` global). La existencia del mensaje se comprueba **antes** que la capacidad.
+  **No** es idempotente.
+
+**Ejemplo `curl`**
+
+```bash
+curl -fsS -X DELETE -H "Authorization: Bearer una-clave-secreta" \
+  "http://127.0.0.1:3000/api/messages/42?mailbox=INBOX"
+```
+
+**Respuesta 2xx (200)** — `status` es siempre `"deleted"`.
+
+```json
+{ "mailbox": "INBOX", "uid": 42, "status": "deleted" }
+```
+
+**Errores que importan**
+
+| HTTP | error | Cuándo |
+| --- | --- | --- |
+| `400` | `invalid_request` | `uid` no numérico o `0`; `mailbox` ausente/blank o con caracteres de control |
+| `401` | `unauthorized` | clave ausente o inválida |
+| `404` | `mailbox_not_found` | el servidor responde `NO` |
+| `404` | `message_not_found` | el `uid` no existe |
+| `501` | `capability_not_supported` | el servidor no anuncia `UIDPLUS` |
+| `503` | `imap_unavailable` | sesión o servidor no disponibles |
+
+**Ojo con**
+
+- **No** mueve a la papelera: purga el mensaje en ese buzón. Si quieres un borrado
+  recuperable, muévelo con `POST /api/messages/{uid}/move` a un buzón de papelera (p. ej. `Trash`).
+- Un segundo intento sobre el mismo `uid` devuelve `404 message_not_found`.
+
+---
+
+### Archivar un correo
+
+- **Objetivo**: sacar un mensaje de `INBOX` a un buzón de archivo.
+- **Endpoint**: `POST /api/messages/{uid}/move?mailbox=INBOX`
+
+- **No existe un endpoint ni una bandera de «archivar»**: la allowlist de banderas es
+  cerrada y no incluye ninguna `\Archived`. Archivar equivale a **mover** el mensaje a un
+  buzón de archivo.
+- Usa `UID MOVE` cuando el servidor anuncia `MOVE`; si anuncia `UIDPLUS` pero no `MOVE`,
+  emula el movimiento con `UID COPY` + `UID STORE +FLAGS.SILENT (\Deleted)` + `UID EXPUNGE`
+  (copia, marca y expurga, en ese orden). Si no anuncia ninguna → `501 capability_not_supported`
+  **sin enviar ningún comando**. La existencia del mensaje se comprueba **antes** que la
+  capacidad. **No** es idempotente.
+- `uid` (path) y `mailbox` (query, origen) son obligatorios; el cuerpo `to` es obligatorio
+  (buzón destino no vacío tras `trim`, sin `CR`/`LF`/`NUL`).
+
+**Ejemplo `curl`**
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer una-clave-secreta" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"Archive"}' \
+  "http://127.0.0.1:3000/api/messages/42/move?mailbox=INBOX"
+```
+
+**Respuesta 2xx (200)** — `status` es siempre `"moved"`.
+
+```json
+{ "mailbox": "INBOX", "uid": 42, "to": "Archive", "status": "moved" }
+```
+
+**Errores que importan**
+
+| HTTP | error | Cuándo |
+| --- | --- | --- |
+| `400` | `invalid_request` | `uid` no numérico o `0`; `mailbox` o `to` ausentes/blank o con caracteres de control; JSON malformado |
+| `401` | `unauthorized` | clave ausente o inválida |
+| `404` | `mailbox_not_found` | el servidor responde `NO` |
+| `404` | `message_not_found` | el `uid` no existe |
+| `501` | `capability_not_supported` | el servidor no anuncia ni `MOVE` ni `UIDPLUS` |
+| `503` | `imap_unavailable` | sesión o servidor no disponibles |
+
+**Ojo con**
+
+- El buzón destino **debe existir ya**: la API no expone gestión de buzones (no hay
+  `CREATE`/renombrar/borrar). Si el destino no existe, el servidor responde `NO` →
+  `404 mailbox_not_found`. Descubre los nombres con `GET /api/mailboxes`
+  (`mailboxes[]{name, delimiter, attributes}`); si la cuenta no tiene buzón de archivo,
+  créalo antes con un cliente de correo.
+- Para **copiar** sin sacarlo del origen usa `POST /api/messages/{uid}/copy` → 200
+  `{mailbox,uid,to,status:"copied"}`; `copy` **nunca** produce `501` (`UID COPY` no requiere
+  extensión).
+
+---
+
+### Operaciones en lote (masivas)
+
+- **Objetivo**: aplicar una misma operación a muchos mensajes.
+- **Endpoint**: no existe; todas las mutaciones son **por `uid`**.
+
+- **No existe ningún endpoint masivo ni de *uid set***. Todas las mutaciones actúan sobre un
+  único `uid`: `PATCH /api/messages/{uid}/flags`, `POST /api/messages/{uid}/move`,
+  `POST /api/messages/{uid}/copy` y `DELETE /api/messages/{uid}`.
+- Las **lecturas** sí van en bloque: `GET /api/messages` devuelve una página (hasta `limit`,
+  máx. `200`, por defecto `50`) y `GET /api/messages/{uid}` un mensaje.
+- Un lote es, por tanto, **N peticiones, una por `uid`**. Patrón recomendado: (1) hacer una
+  **instantánea** de los `uid` con la búsqueda, paginando `offset += limit` mientras
+  `offset + mensajes_devueltos <= total`; (2) recorrer la instantánea.
+- La instantánea es segura porque los `uid` son **estables** dentro de un buzón (no se
+  renumera); en cambio, paginar con `offset` **mientras** se muta el buzón puede saltarse o
+  repetir elementos.
+- La API usa **una única sesión IMAP compartida protegida por un `Mutex`**, así que las
+  operaciones que hablan con IMAP se **serializan**: lanzar muchas peticiones en paralelo no
+  acelera el conjunto y provoca contención; lo razonable es ir secuencialmente. No hay
+  *rate limit* documentado.
+- Al no haber transacción, el lote puede quedar a medias: maneja el error **por `uid`**
+  (`404 message_not_found` si ya se movió/borró, `501 capability_not_supported`,
+  `503 imap_unavailable`). El `PATCH` de banderas **sí** es idempotente; `move`, `copy` y
+  `delete` **no** lo son (reintentar un `delete` da `404`).
+
+**Ejemplo `bash`** — marcar como leídos todos los no leídos (requiere `jq`).
+
+```bash
+# Dependencia: jq. Primero toma una instantánea de los uid no leídos; luego los marca uno a uno.
+BASE="http://127.0.0.1:3000"
+AUTH="Authorization: Bearer una-clave-secreta"
+MAILBOX="INBOX"
+LIMIT=200
+OFFSET=0
+UIDS=""
+
+# 1) Instantánea: paginar la búsqueda hasta cubrir `total`.
+while true; do
+  PAGE=$(curl -fsS -H "$AUTH" \
+    "$BASE/api/messages?mailbox=$MAILBOX&unseen=true&limit=$LIMIT&offset=$OFFSET")
+  UIDS="$UIDS $(echo "$PAGE" | jq -r '.messages[].uid')"
+  TOTAL=$(echo "$PAGE" | jq -r '.total')
+  COUNT=$(echo "$PAGE" | jq -r '.messages | length')
+  OFFSET=$((OFFSET + COUNT))
+  [ "$OFFSET" -ge "$TOTAL" ] && break
+  [ "$COUNT" -eq 0 ] && break
+done
+
+# 2) Actuar: una petición por uid (secuencial; la sesión IMAP es compartida).
+for UID in $UIDS; do
+  curl -fsS -X PATCH -H "$AUTH" \
+    -H "Content-Type: application/json" \
+    -d '{"add":["\\Seen"]}' \
+    "$BASE/api/messages/$UID/flags?mailbox=$MAILBOX"
+done
+```
+
+**Errores que importan**
+
+- El lote no es transaccional: cualquier petición puede fallar con `404 message_not_found`
+  (ya movido o borrado), `501 capability_not_supported` o `503 imap_unavailable`; procésalos
+  **por `uid`**.
+
+**Ojo con**
+
+- No paralelices: la sesión IMAP compartida serializa las operaciones, así que la concurrencia
+  solo añade contención.
+- `offset` puede saltarse o repetir elementos si se muta el buzón durante la paginación:
+  captura primero la lista de `uid`.
+
+---
+
 ## Endpoints
 
 ### `GET /api/health`
@@ -441,6 +779,10 @@ curl -fsS -H "Authorization: Bearer una-clave-secreta" \
   "flags": ["\\Seen", "\\Flagged"]
 }
 ```
+
+> El campo `unseen` de esta respuesta es el **número de secuencia del primer mensaje no
+> visto** (código `UNSEEN` de IMAP), **no un conteo** de no leídos. Para contar los no
+> leídos usa `GET /api/messages?unseen=true` y lee su `total`.
 
 **Códigos de estado**
 
@@ -770,6 +1112,10 @@ curl -fsS -X DELETE -H "Authorization: Bearer una-clave-secreta" \
 - **Descripción**: añade y/o quita banderas con `UID STORE`; las banderas
   resultantes se leen con un `UID FETCH`. La existencia del mensaje se comprueba
   antes de enviar el `STORE`. Idempotente respecto al estado final de las banderas.
+- **`\Seen` es la bandera de «leído»**: añadirla marca el mensaje como leído y quitarla
+  lo marca como no leído. **Leer el cuerpo con `GET /api/messages/{uid}/body` no la fija**
+  (usa `BODY.PEEK`), así que hay que marcarla explícitamente. Ver la receta
+  *Marcar un correo como leído*.
 - **Parámetros**
 
 | Nombre | Ubicación | Tipo | Obligatorio | Restricciones | Por defecto |
