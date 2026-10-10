@@ -47,6 +47,7 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 | 4 | `idle-scope` — `IDLE` multi-buzón / multi-cuenta | Capability nueva | Baja | ⏳ pendiente |
 | 5 | `attachment-content` — contenido de adjuntos en el payload | Extensión de `imap-idle` | Baja | ⏳ pendiente |
 | 6 | `container-image` — despliegue contenedorizado | Infraestructura de distribución | Alta | 🚧 en curso |
+| 7 | `manifest-digest` — comprobar el digest del manifiesto en el enforcement | Endurecimiento de CI | Media | ⏳ pendiente (sin propuesta) |
 
 ### 3. `webhook-delivery` — entrega *at-least-once* con cola persistente
 
@@ -99,6 +100,17 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
   de API, configuración ni Rust). Sin *BREAKING*.
 
 ---
+
+### 7. `manifest-digest` — endurecer el enforcement contra el residual de compresión
+
+- **Qué**: comprobar el **digest del manifiesto** (no solo que dos builds coincidan) para cubrir el
+  residual documentado del change `reproducibility-enforcement`: dos builds con el mismo contenido
+  pueden producir manifiestos con digest distinto si cambia el nivel o la biblioteca de compresión.
+- **Por qué**: se demostró en local que `gzip -1` y `gzip -9` producen capas de tamaño distinto
+  (payload de 20 MiB: 4.246.405 B vs 2.918.641 B) y, por tanto, manifiestos con digest distinto
+  — deterministas por nivel, no aleatorios.
+- **Estado**: ⏳ **no aprobado**; sin propuesta ni rama. Requiere un change en `openspec/changes/`
+  antes de escribir código.
 
 ## 3. Secuencia recomendada
 
