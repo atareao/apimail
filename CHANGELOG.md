@@ -1,4 +1,17 @@
 # Changelog
+## [0.4.3] - 2026-10-10
+
+### Bug Fixes
+
+- Imponer la reproducibilidad del build antes de publicar
+- Tratar como fallo un ancla que no se puede comparar
+
+### Documentation
+
+- Proponer el enforcement de la reproducibilidad
+- Registrar la verificación y los residuales del enforcement
+- Cerrar y archivar el change reproducibility-enforcement
+- Documentar el despliegue en producción y los pendientes
 ## [0.4.2] - 2026-10-10
 
 ### Bug Fixes
@@ -11,6 +24,10 @@
 - Proponer builds reproducibles en la imagen
 - Precisar el alcance de la verificación y sus límites
 - Cerrar y archivar el change reproducible-image
+
+### Miscellaneous Tasks
+
+- Release v0.4.2
 ## [0.4.1] - 2026-10-10
 
 ### Bug Fixes
