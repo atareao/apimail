@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-09
+goal: Hacer resiliente la publicación de la imagen en GHCR frente al 429 anónimo de Docker Hub (espejo en buildkit, concurrency, reintentos y verificación del artefacto publicado)
+skip_specs: true

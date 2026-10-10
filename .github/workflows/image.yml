@@ -15,6 +15,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   image:
     name: Build, verify and publish image
@@ -25,16 +29,39 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       - name: Build image without publishing
-        uses: docker/build-push-action@v7
-        with:
-          push: false
-          load: true
-          tags: apimail:ci
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          set -euo pipefail
+
+          # A `uses:` step cannot be retried, so the build runs from the shell to
+          # survive transient registry/network failures. The flags mirror what the
+          # docker/build-push-action step used to pass.
+          wait_s=10
+          for attempt in 1 2 3; do
+            echo "Build attempt ${attempt}/3"
+            if docker buildx build \
+                 --platform linux/amd64 \
+                 --tag apimail:ci \
+                 --load \
+                 --cache-from type=gha \
+                 --cache-to type=gha,mode=max \
+                 .; then
+              echo "Build succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "::warning::Build attempt ${attempt} failed; retrying in ${wait_s}s"
+              sleep "${wait_s}"
+              wait_s=$(( wait_s * 3 ))
+            fi
+          done
+          echo "::error::Build failed after 3 attempts"
+          exit 1
 
       - name: Smoke test the built image
         run: |
@@ -139,10 +166,67 @@ jobs:
               ;;
           esac
 
+          : > image-tags.txt
           for tag in "${tags[@]}"; do
+            printf '%s\n' "${tag}" >> image-tags.txt
             docker tag apimail:ci "${IMAGE}:${tag}"
           done
 
           for tag in "${tags[@]}"; do
             docker push "${IMAGE}:${tag}"
           done
+
+      - name: Verify the published image is pullable and healthy
+        env:
+          IMAGE: ghcr.io/atareao/apimail
+        run: |
+          set -euo pipefail
+
+          expected_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ -z "${expected_version}" ]; then
+            echo "::error::Could not read the version from Cargo.toml"
+            exit 1
+          fi
+
+          # The smoke-test container still holds port 3000; free it before running
+          # the image that was actually published.
+          docker rm -f apimail-ci > /dev/null 2>&1 || true
+
+          while read -r tag; do
+            [ -n "${tag}" ] || continue
+            echo "::group::Verifying ${IMAGE}:${tag}"
+            docker pull "${IMAGE}:${tag}"
+
+            docker run -d --name apimail-published -p 3000:3000 \
+              -e APIMAIL_API_KEY=ci \
+              -e APIMAIL_IMAP_HOST=imap.invalid \
+              -e APIMAIL_IMAP_USER=ci@invalid \
+              -e APIMAIL_IMAP_PASSWORD=ci \
+              -e APIMAIL_SMTP_HOST=smtp.invalid \
+              -e APIMAIL_SMTP_USER=ci@invalid \
+              -e APIMAIL_SMTP_PASSWORD=ci \
+              "${IMAGE}:${tag}"
+
+            healthy=0
+            for attempt in $(seq 1 15); do
+              http_code="$(curl -s -o /tmp/published-health.json -w '%{http_code}' http://127.0.0.1:3000/api/health || true)"
+              body="$(cat /tmp/published-health.json 2>/dev/null || true)"
+              if [ "${http_code}" = "200" ] \
+                && printf '%s' "${body}" | jq -e --arg v "${expected_version}" \
+                     '.status == "ok" and .name == "apimail" and .version == $v' > /dev/null 2>&1; then
+                healthy=1
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "${healthy}" != "1" ]; then
+              echo "::error::Published image ${IMAGE}:${tag} did not pass the health check"
+              docker logs apimail-published || true
+              exit 1
+            fi
+
+            echo "Published image ${IMAGE}:${tag} is pullable and healthy"
+            docker rm -f apimail-published > /dev/null 2>&1 || true
+            echo "::endgroup::"
+          done < image-tags.txt
