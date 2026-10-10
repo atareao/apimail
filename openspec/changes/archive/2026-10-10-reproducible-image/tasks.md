@@ -141,6 +141,17 @@
 
 ## 6. Cierre
 
-- [ ] 6.1 Marcar tareas y `openspec validate reproducible-image --strict`.
-- [ ] 6.2 PR del change (`reproducible-image` → `development`; la release `development` → `main`
+- [x] 6.1 Marcar tareas y `openspec validate reproducible-image --strict`.
+  - Evidencia: `openspec validate reproducible-image --strict` → **válido** (`exit=0`); **18/18**
+    tareas marcadas. Verificación **sobre el artefacto final** (`a5edfb4`): run de cierre
+    **`38030297220`** → **14/14 pasos `success`** (`Build succeeded on attempt 1`) y **segundo build
+    del mismo commit** (**`38030485882`**) con el **mismo** `Image id`
+    (`sha256:73b5aa82052e3aacd0d114af7690f6e96b219b09cf0442429dc0ff12b8ed12a3`) y el digest del tag
+    `sha-a5edfb4` en GHCR (medido **anónimamente**) **sin moverse**:
+    `sha256:f1f68ee38bf860f93a53fd576ba54864f6c906e45cdf8a4d54aeb83886e92e8c`. Coherencia: el id de
+    `a5edfb4` **difiere** del de `7f20753` (`13602367…`) porque son **commits distintos** → distinto
+    `SOURCE_DATE_EPOCH` (el digest depende del **commit**, no del run).
+- [x] 6.2 PR del change (`reproducible-image` → `development`; la release `development` → `main`
   arrastra el `.yml` y dispara la verificación empírica en CI).
+  - Evidencia: **PR #39** (`feat/reproducible-image` → `development`); el `.yml` viaja a `main` en la
+    próxima release, que es donde se podrá confirmar `latest ≡ vX.Y.Z` de forma **externa**.
