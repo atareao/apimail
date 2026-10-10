@@ -1,4 +1,15 @@
 # Changelog
+## [0.4.1] - 2026-10-10
+
+### Bug Fixes
+
+- Publicar la imagen pese al límite anónimo de Docker Hub
+
+### Documentation
+
+- Proponer el endurecimiento de la publicación de la imagen
+- Registrar el dry-run verde del pipeline de imagen
+- Precisar qué prueba la verificación del artefacto publicado
 ## [0.4.0] - 2026-10-09
 
 ### Bug Fixes
@@ -19,6 +30,7 @@
 ### Miscellaneous Tasks
 
 - Keep the container infra out of the published crate
+- Release v0.4.0
 ## [0.3.2] - 2026-10-09
 
 ### Documentation
