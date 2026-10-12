@@ -27,6 +27,11 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > `POST /api/idle/start`, `POST /api/idle/stop` y `GET /api/idle/status`, que
 > notifican el correo nuevo a un webhook configurable.
 
+> **Referencia exhaustiva de la API**: [`docs/API.md`](docs/API.md) describe cada ruta,
+> sus parámetros y los cuerpos de petición y respuesta **campo a campo**, más la matriz
+> completa de códigos de estado y de códigos `error`. Este README es la **guía de uso**
+> (arranque, variables de entorno, despliegue y ejemplos rápidos).
+
 ## Requisitos
 
 - **Rust edition 2024** (se recomienda una toolchain reciente; el proyecto se
@@ -314,6 +319,10 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/whoami
 ```
 
 ## Endpoints
+
+Los ejemplos de esta sección son **guía de uso**. La referencia **campo a campo** —todos los
+parámetros, todos los campos de cada respuesta y la matriz completa de códigos `error`— está en
+[`docs/API.md`](docs/API.md).
 
 ### Salud (público)
 
@@ -846,8 +855,9 @@ Códigos de error comunes (modelo `{"error":...,"message":...}`):
 - `404` (`mailbox_not_found`) — el servidor responde `NO`: el buzón no existe.
 - `404` (`message_not_found`) — el `uid` indicado no existe. La existencia del
   mensaje se comprueba **antes** que la capacidad del servidor.
-- `501` (`capability_not_supported`) — el servidor no anuncia `MOVE`/`UIDPLUS`
-  para la operación pedida.
+- `501` (`capability_not_supported`) — **solo** en `move` (el servidor no anuncia ni
+  `MOVE` ni `UIDPLUS`) y en `delete` (no anuncia `UIDPLUS`). `flags` y `copy` **nunca**
+  devuelven `501`: `UID STORE` y `UID COPY` no dependen de ninguna extensión.
 - `503` (`imap_unavailable`) — el servidor o la sesión no están disponibles.
 - `401` (`unauthorized`) — sin API key válida.
 
@@ -911,14 +921,14 @@ devuelve el mismo cuerpo sin abrir una segunda conexión. Respuesta `200 OK` con
 `Content-Type: application/json`:
 
 ```json
-{ "status": "running", "mailbox": "INBOX" }
+{ "status": "running", "mailbox": "INBOX", "last_error": null }
 ```
 
 `POST /api/idle/stop` detiene la suscripción. Es **idempotente**: parar una suscripción
 que no está en marcha no hace nada. Respuesta `200 OK`:
 
 ```json
-{ "status": "stopped" }
+{ "status": "stopped", "mailbox": "INBOX", "last_error": null }
 ```
 
 `GET /api/idle/status` informa del estado actual. Respuesta `200 OK`:

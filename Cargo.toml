@@ -12,6 +12,7 @@ rust-version = "1.88"
 exclude = [
     "/openspec",
     "/plans",
+    "/docs",
     "/.opencode",
     "/.github",
     "/CHANGELOG.md",

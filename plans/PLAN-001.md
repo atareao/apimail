@@ -48,6 +48,9 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 | 5 | `attachment-content` — contenido de adjuntos en el payload | Extensión de `imap-idle` | Baja | ⏳ pendiente |
 | 6 | `container-image` — despliegue contenedorizado | Infraestructura de distribución | Alta | 🚧 en curso |
 | 7 | `manifest-digest` — comprobar el digest del manifiesto en el enforcement | Endurecimiento de CI | Media | ⏳ pendiente (sin propuesta) |
+| 8 | `mcp-server` — exponer la API como servidor MCP | Capability nueva / distribución | Media | ⏳ pendiente → `plans/PLAN-002.md` |
+| 9 | `openapi` — especificación OpenAPI + UI de documentación | Documentación / distribución | Media | ⏳ pendiente → `plans/PLAN-003.md` |
+| 10 | `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes` | Defecto (intermitente) | Media | ✅ resuelto (sin publicar) — change `imap-session-liveness`, PR #50 |
 
 ### 3. `webhook-delivery` — entrega *at-least-once* con cola persistente
 
@@ -94,8 +97,13 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 - **Por qué**: la distribución actual solo ofrece binario (GitHub Releases) y crate (crates.io);
   desplegar en un servidor obligaba a compilar y configurar el servicio a mano, y el `.justfile`
   heredado no aplicaba a apimail.
-- **Estado**: 🚧 **en curso** — change
-  [`container-image`](../openspec/changes/container-image/); se marca como hecho al fusionar.
+- **Estado**: ✅ **completado** — change `container-image` **archivado**
+  (`openspec/changes/archive/2026-10-09-container-image`); imagen publicada en GHCR
+  (`linux/amd64`) y **desplegada en producción** (`v0.4.3`, digest
+  `sha256:0f95967ed8d2b7f6461b57fbfe717e16e284adff11b32a2687a8319b7cef5176`).
+  El arreglo del `.justfile` quedó **a medias**: las recetas de contenedor y salud sí se
+  adaptaron a apimail, pero sobrevivieron las `frontend-*` (el proyecto no tiene
+  `frontend/`); se retiran en la limpieza posterior.
 - **Impacto**: infraestructura de distribución y documentación; **no** toca el crate (sin cambios
   de API, configuración ni Rust). Sin *BREAKING*.
 
@@ -111,6 +119,53 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
   — deterministas por nivel, no aleatorios.
 - **Estado**: ⏳ **no aprobado**; sin propuesta ni rama. Requiere un change en `openspec/changes/`
   antes de escribir código.
+
+### 10. `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes`
+
+- **Qué**: en producción, `GET /api/mailboxes` devolvió **una vez** `200` con
+  `{"mailboxes":[]}` (2026-10-10), cuando la cuenta tiene **5** buzones (`INBOX`, `Drafts`,
+  `Sent`, `Trash`, `Spam`).
+- **Por qué importa**: un `200` con la lista vacía es indistinguible de «la cuenta no tiene
+  buzones». Un cliente puede darlo por cierto y actuar en consecuencia (p. ej. no archivar
+  al no encontrar buzón destino) **sin ver ningún error**.
+- **Evidencia**: la llamada vacía fue la **primera** tras horas de contenedor levantado
+  (sesión IMAP ociosa). Las **2** llamadas inmediatamente siguientes devolvieron la lista
+  completa y un *burst* posterior de **40** llamadas dio **40/40** con 5 buzones
+  (**0** vacías). **(actualizado 2026-10-12)** Volvió a observarse, y esta vez se reprodujo.
+- **Análisis del código** (hecho): `list_mailboxes` → `run_once` → `ensure_session` +
+  `session.list(None, Some("*"))` (`LIST "" "*"`), con `map_err(...)?` y `try_collect()`
+  que **propagan** los errores: no hay ninguna rama que traduzca un error a lista vacía.
+  El `[]` solo puede proceder de (a) una respuesta `OK` del servidor sin ningún `* LIST`
+  (protocolo correcto: «no hay buzones») o (b) un *stream* de respuestas que termina sin
+  elementos (p. ej. `EOF` de una conexión muerta) sin error. **Se determinó que era (b).**
+- **Reproducción (2026-10-12)**: con un servidor de mentira (par que cierra a medias, FIN sin
+  RST, contra `async-imap` 0.12) se comprobó que el cierre limpio del par **con el buffer vacío**
+  produce `Poll::Ready(None)` en `do_poll_next` (`src/imap_stream.rs`), y que los parsers
+  `parse_noop`, `parse_mailbox`, `parse_ids` y `parse_mailboxes` —bucles `while let Some(...)`
+  que terminan en `Ok`— confunden ese fin de stream con «el servidor no mandó nada»: `noop →
+  Ok(())`, `select → Ok(exists=0)`, `uid_search → Ok(0 uids)`. La sonda de `ensure_session` era
+  `session.noop()` (`src/imap.rs`), cuyo `Ok(())` no prueba nada. Evidencia de producción: la
+  primera llamada devolvió `200` con **65 bytes** (`total: 0`, 06:30:11), el `WARN discarding dead
+  IMAP session` apareció a continuación, y la reconexión devolvió **9 correos** (4973 bytes,
+  06:30:59).
+- **Arreglo (2026-10-12)**: sonda de vida honesta (`SessionHandle::noop` pasa por
+  `run_command_and_check_ok("NOOP")`, de modo que el truncado da `Error::ConnectionLost`, ya
+  clasificado como error de conexión, y la zombi se descarta y reconecta) más una **defensa en
+  profundidad** (vía 2a: `confirm_liveness_for_empty` revalida la vida cuando el resultado de
+  datos es vacío o por defecto). La vía (b) —un segundo parser de IMAP— se descartó por exigir
+  reimplementar el parseo de `async-imap`; la race residual queda declarada en `design.md`
+  (incluidos `fetch`/`store`/`uid_expunge`). Detallado y aprobado en el change
+  `imap-session-liveness`; PR **#50** (`fix/imap-session-liveness` → `development`).
+- **Decisión (2026-10-10)**: se **cierra sin intervención** en producción. Se descarta la prueba
+  dirigida (cortar el socket IMAP ocioso) porque la condición observada —la primera llamada
+  tras horas de sesión ociosa— no es reproducible a voluntad y un resultado negativo no
+  aportaría evidencia concluyente. Se retoma **solo** si la respuesta vacía vuelve a
+  observarse, entonces con datos frescos.
+- **(actualizado 2026-10-12)**: la respuesta vacía **volvió a ocurrir**, así que se retomó según
+  lo acordado y quedó corregido por el change `imap-session-liveness` (PR #50). El bloque de
+  decisión anterior se conserva como registro de lo que se decidió entonces.
+- **Estado**: ✅ **resuelto**; change `imap-session-liveness` (PR #50), **pendiente de publicar**
+  (sin versión de release todavía).
 
 ## 3. Secuencia recomendada
 

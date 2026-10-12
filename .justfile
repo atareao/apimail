@@ -22,12 +22,12 @@ podman_fmt_config_image := '{{.Config.Image}}'
 # `docker` conserva la sonda de /api/health en la imagen construida con Podman.
 export BUILDAH_FORMAT := 'docker'
 
-# Levanta el servidor con frontend embebido (Podman)
+# Levanta el servidor local (Podman)
 dev:
     podman compose up -d --build --force-recreate
     @echo "apimail: http://localhost:3000"
 
-# Levanta el servidor con frontend embebido (Docker)
+# Levanta el servidor local (Docker, requiere docker instalado)
 dev-docker:
     docker compose up -d
     @echo "apimail: http://localhost:3000"
@@ -143,8 +143,8 @@ _verify-health:
 
 # ── Calidad ─────────────────────────────────────────────────────
 
-# Ejecuta todos los checks (Rust + frontend)
-check-all: fmt clippy test frontend-lint frontend-test frontend-check
+# Ejecuta todos los checks Rust
+check-all: fmt clippy test
 
 # Tests Rust
 test:
@@ -158,18 +158,6 @@ clippy:
 fmt:
     cargo fmt --check
 
-# Frontend: chequeo de tipos + build (desarrollo standalone con Vite)
-frontend-check:
-    cd frontend && npx tsc --noEmit && npm run build
-
-# Frontend: ESLint en modo CI
-frontend-lint:
-    cd frontend && npm run lint:ci
-
-# Frontend: tests con Vitest (una sola pasada)
-frontend-test:
-    cd frontend && npx vitest run
-
 # Check que existe un change proposal activo en openspec
 check-spec:
     @ls openspec/changes/*/proposal.md 2>/dev/null || (echo "❌ No active change proposal found. Run: openspec new change <feature>" && exit 1)
@@ -178,7 +166,6 @@ check-spec:
 # Limpia todo
 clean:
     cargo clean
-    rm -rf frontend/dist frontend/node_modules
 
 # Ayuda
 help:
@@ -189,11 +176,8 @@ help:
     @echo "  just deploy [tag]  - Despliega la imagen de GHCR (por defecto latest)"
     @echo "  just deploy-local  - Construye en local y despliega"
     @echo "  just health        - Consulta el endpoint /api/health"
-    @echo "  just check-all     - Ejecuta todos los checks (Rust + frontend)"
+    @echo "  just check-all     - Ejecuta todos los checks Rust"
     @echo "  just test          - cargo test"
     @echo "  just clippy        - cargo clippy"
     @echo "  just fmt           - cargo fmt --check"
-    @echo "  just frontend-lint - ESLint del frontend (modo CI)"
-    @echo "  just frontend-test - Tests del frontend con Vitest"
-    @echo "  just frontend-check- Tipos + build del frontend"
     @echo "  just check-spec    - Verifica change proposal activo"
