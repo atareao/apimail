@@ -398,3 +398,42 @@ async fn dead_session_is_discarded_and_the_reconnect_serves_real_data() {
         server.connections()
     );
 }
+
+#[tokio::test]
+async fn legitimately_empty_mailbox_over_a_live_session_is_200() {
+    // Guarda del non-goal («An empty mailbox still returns an empty page»), no
+    // del defecto: la defensa en profundidad revalida la vida cuando el comando
+    // de datos devuelve un resultado vacío o por defecto, así que el vacío
+    // **legítimo** es justo lo que esa revalidación podría romper. Una sola
+    // conexión sana: `SELECT` responde, `UID SEARCH` no casa nada de verdad y el
+    // `NOOP` de la revalidación contesta, de modo que el vacío es genuino y no un
+    // stream truncado.
+    let server = FakeImapServer::start(vec![Behaviour::Healthy]);
+    let app = app_for(&server);
+
+    let response = get(&app, "/api/messages?mailbox=INBOX&unseen=true&limit=50").await;
+    let status = response.status();
+    let json = body_json(response).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "un buzón legítimamente vacío sobre una sesión sana debe seguir siendo 200 \
+         (non-goal); obtuve {status} con cuerpo {json}"
+    );
+    assert_ne!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "la revalidación no puede convertir un vacío legítimo en un 503: {json}"
+    );
+    assert_eq!(
+        json["total"].as_u64(),
+        Some(0),
+        "la página vacía debe reportar `total: 0`: {json}"
+    );
+    assert_eq!(
+        json["messages"].as_array().map(Vec::len),
+        Some(0),
+        "la página vacía debe llevar una lista `messages` vacía: {json}"
+    );
+}

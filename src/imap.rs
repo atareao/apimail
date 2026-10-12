@@ -1115,7 +1115,7 @@ impl SessionHandle {
     /// — the peer closed the connection between the liveness probe and this
     /// command — is indistinguishable from a genuinely empty result:
     /// `Mailbox::default()`, zero UIDs or an empty mailbox list. This re-runs
-    /// the honest probe ([`noop`](ImapSession::noop), which validates the tagged
+    /// the honest probe ([`ImapSession::noop`], which validates the tagged
     /// reply): if the session is dead the caller propagates a connection error
     /// instead of surfacing an empty result, and if it is alive the genuinely
     /// empty result stands. It costs an extra round-trip **only** when the

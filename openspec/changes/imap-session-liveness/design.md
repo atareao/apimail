@@ -97,7 +97,11 @@
    declarada** la variante más estrecha de un truncado **a mitad de respuesta** que
    dejase un resultado **no vacío parcial** (el par envía unos bytes y cierra): (a)
    no la detecta, porque solo revalida resultados vacíos, y (b) era inviable sin
-   forkear `async-imap`. No se finge cobertura que no exista.
+   forkear `async-imap`. No se finge cobertura que no exista. **`fetch` — y, por la
+   misma razón, `store` y `uid_expunge` — están expuestos a esa misma variante
+   declarada y no revalidan**: un resultado **no vacío parcial** no es distinguible
+   de uno completo sin un segundo parser de IMAP que reconstruya el protocolo, que
+   es precisamente lo descartado en la opción (b) de la decisión 2.
 
 ## Alternatives Considered
 
