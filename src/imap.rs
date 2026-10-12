@@ -1105,9 +1105,42 @@ struct SessionHandle {
     session: async_imap::Session<ImapStream>,
 }
 
+impl SessionHandle {
+    /// Re-checks liveness before accepting a data command's result when that
+    /// result is empty or default.
+    ///
+    /// `async-imap`'s parsers (`parse_mailbox`, `parse_ids`, `parse_mailboxes`)
+    /// consume the response stream with `while let Some(...) { ... }` and finish
+    /// with `Ok`, so a stream that ends **without the command's tagged reply**
+    /// — the peer closed the connection between the liveness probe and this
+    /// command — is indistinguishable from a genuinely empty result:
+    /// `Mailbox::default()`, zero UIDs or an empty mailbox list. This re-runs
+    /// the honest probe ([`noop`](ImapSession::noop), which validates the tagged
+    /// reply): if the session is dead the caller propagates a connection error
+    /// instead of surfacing an empty result, and if it is alive the genuinely
+    /// empty result stands. It costs an extra round-trip **only** when the
+    /// result is empty, never turning a legitimately empty mailbox into a
+    /// failure.
+    async fn confirm_liveness_for_empty(&mut self) -> Result<(), ImapError> {
+        self.noop().await
+    }
+}
+
 impl ImapSession for SessionHandle {
     fn noop(&mut self) -> SendFuture<'_, Result<(), ImapError>> {
-        Box::pin(async move { self.session.noop().await.map_err(ImapError::from) })
+        Box::pin(async move {
+            // `Session::noop()` runs `parse_noop`, whose `while let Some(...)`
+            // loop treats a stream that ends without the tagged reply (the peer
+            // closed the connection) as a clean `Ok(())`: the liveness probe
+            // would pass on a zombie. `run_command_and_check_ok` instead
+            // validates the tagged reply and turns that same truncation into
+            // `Error::ConnectionLost`, which `ImapError::is_connection`
+            // classifies as a session-replacing failure.
+            self.session
+                .run_command_and_check_ok("NOOP")
+                .await
+                .map_err(ImapError::from)
+        })
     }
 
     fn list_mailboxes(&mut self) -> SendFuture<'_, Result<Vec<MailboxInfo>, ImapError>> {
@@ -1121,7 +1154,7 @@ impl ImapSession for SessionHandle {
                 .list(None, Some("*"))
                 .await
                 .map_err(ImapError::from)?;
-            let mailboxes = names
+            let mailboxes: Vec<MailboxInfo> = names
                 .map_ok(|name| MailboxInfo {
                     name: name.name().to_string(),
                     delimiter: name.delimiter().map(str::to_string),
@@ -1129,6 +1162,9 @@ impl ImapSession for SessionHandle {
                 })
                 .try_collect()
                 .await?;
+            if mailboxes.is_empty() {
+                self.confirm_liveness_for_empty().await?;
+            }
             Ok(mailboxes)
         })
     }
@@ -1143,7 +1179,11 @@ impl ImapSession for SessionHandle {
                     async_imap::error::Error::No(_) => ImapError::MailboxNotFound,
                     other => ImapError::Imap(other),
                 })?;
-            Ok(mailbox_status(&mailbox))
+            let status = mailbox_status(&mailbox);
+            if status.exists == 0 {
+                self.confirm_liveness_for_empty().await?;
+            }
+            Ok(status)
         })
     }
 
@@ -1159,6 +1199,9 @@ impl ImapSession for SessionHandle {
             // `uid_search` returns a `HashSet`, so impose the newest-first order
             // the API promises.
             uids.sort_unstable_by(|a, b| b.cmp(a));
+            if uids.is_empty() {
+                self.confirm_liveness_for_empty().await?;
+            }
             Ok(uids)
         })
     }
