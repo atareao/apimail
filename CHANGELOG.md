@@ -1,4 +1,26 @@
 # Changelog
+## [0.4.4] - 2026-10-12
+
+### Bug Fixes
+
+- *(imap)* Detectar la sesión zombi en la sonda de vida
+
+### Documentation
+
+- Referencia exhaustiva de la API y planes de MCP y OpenAPI
+- Añadir recetas y casos de uso a la referencia de la API
+- Corregir el cuerpo de idle/start|stop y el alcance del 501
+- Registrar el ítem #10 (mailboxes-empty-response)
+- *(readme)* Enlazar la referencia exhaustiva de la API
+- *(plans)* Cerrar el ítem #6 (container-image) como completado
+- *(agents)* Corregir la nota obsoleta sobre el .justfile
+- *(plans)* Registrar el cierre del ítem #10 (mailboxes-empty-response)
+- *(openspec)* Cerrar tasks y corregir el ítem #10 de PLAN-001
+- *(openspec)* Archivar el change imap-session-liveness
+
+### Miscellaneous Tasks
+
+- *(justfile)* Retirar las recetas frontend-* y arreglar check-all
 ## [0.4.3] - 2026-10-10
 
 ### Bug Fixes
@@ -12,6 +34,10 @@
 - Registrar la verificación y los residuales del enforcement
 - Cerrar y archivar el change reproducibility-enforcement
 - Documentar el despliegue en producción y los pendientes
+
+### Miscellaneous Tasks
+
+- Release v0.4.3
 ## [0.4.2] - 2026-10-10
 
 ### Bug Fixes
