@@ -9,7 +9,7 @@ flag `\Seen` sobre los mensajes leídos.
 ## Requirements
 
 ### Requirement: Message listing and search
-The service SHALL expose `GET /api/messages` as a protected route that selects the named mailbox and returns the messages matching the given search criteria, paginated and ordered by descending `UID`, without setting the `\Seen` flag.
+The service SHALL expose `GET /api/messages` as a protected route that selects the named mailbox and returns the messages matching the given search criteria, paginated and ordered by descending `UID`, without setting the `\Seen` flag. A listing run over a connection whose peer has closed it SHALL fail as a connection error and SHALL never be reported as a valid empty page.
 
 #### Scenario: Messages are listed with default pagination
 - **WHEN** `GET /api/messages?mailbox=INBOX` is requested with a valid API key and the server is reachable
@@ -28,6 +28,16 @@ The service SHALL expose `GET /api/messages` as a protected route that selects t
 #### Scenario: Newest messages come first
 - **WHEN** several messages match
 - **THEN** they are ordered by descending `UID`
+
+#### Scenario: An empty mailbox still returns an empty page
+- **WHEN** the mailbox exists and the search genuinely matches no message
+- **THEN** the response status is `200` with `total` = `0` and an empty `messages` array
+
+#### Scenario: Listing over a connection closed by the peer
+- **WHEN** the cached session's peer has already closed the connection and `GET /api/messages?mailbox=INBOX&unseen=true&limit=50` is requested
+- **THEN** the response status is `503`
+- **AND** the body is `{"error":"imap_unavailable","message":"..."}`
+- **AND** the response is never a `200` page reporting `total` = `0`
 
 #### Scenario: Unknown mailbox
 - **WHEN** the named mailbox does not exist (the server answers `NO` on selection)
@@ -112,8 +122,9 @@ The service SHALL run message operations on the existing lazily-established sess
 - **THEN** only one connection is established
 
 #### Scenario: Dead session is replaced
-- **WHEN** the cached session is found dead on next use
+- **WHEN** the cached session is found dead on next use, because its liveness probe observed the peer's already-closed connection
 - **THEN** the service discards it, reconnects within the bounded attempts and then runs the operation
+- **AND** the operation never runs against the dead session
 
 ### Requirement: Response hygiene
 The service SHALL never emit the IMAP password or third-party error text in logs, debug output or HTTP responses.
