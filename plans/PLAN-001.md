@@ -50,7 +50,7 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 | 7 | `manifest-digest` — comprobar el digest del manifiesto en el enforcement | Endurecimiento de CI | Media | ⏳ pendiente (sin propuesta) |
 | 8 | `mcp-server` — exponer la API como servidor MCP | Capability nueva / distribución | Media | ⏳ pendiente → `plans/PLAN-002.md` |
 | 9 | `openapi` — especificación OpenAPI + UI de documentación | Documentación / distribución | Media | ⏳ pendiente → `plans/PLAN-003.md` |
-| 10 | `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes` | Defecto (intermitente) | Media | ✅ resuelto (sin publicar) — change `imap-session-liveness`, PR #50 |
+| 10 | `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes` | Defecto (intermitente) | Media | ✅ hecho en `v0.4.4` — change `imap-session-liveness`, PR #50 |
 
 ### 3. `webhook-delivery` — entrega *at-least-once* con cola persistente
 
@@ -164,8 +164,21 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 - **(actualizado 2026-10-12)**: la respuesta vacía **volvió a ocurrir**, así que se retomó según
   lo acordado y quedó corregido por el change `imap-session-liveness` (PR #50). El bloque de
   decisión anterior se conserva como registro de lo que se decidió entonces.
-- **Estado**: ✅ **resuelto**; change `imap-session-liveness` (PR #50), **pendiente de publicar**
-  (sin versión de release todavía).
+- **Estado**: ✅ **resuelto**, **publicado en `v0.4.4`** (PR #52 `development` → `main`; `release-prepare`
+  determinó *patch*, `vampus upgrade --patch` → 0.4.4, changelog con `git-cliff`, commit
+  `chore: release v0.4.4` (`063cd45`) y tag `v0.4.4`) y **desplegado en producción**. La imagen en
+  GHCR (`v0.4.4`, `0.4`, `latest` y el ancla `sha-063cd45`) apunta al mismo digest
+  `sha256:6d3ea18b406e…`.
+- **Verificación en producción (co1)**: el contenedor `apimail` corre con el id de imagen
+  `sha256:cdcff4ca3f4e…`, **idéntico al `config.digest` publicado** en el registro; `/api/health`
+  responde `{"status":"ok","name":"apimail","version":"0.4.4"}`; `GET /api/mailboxes` devuelve los
+  **5** buzones reales (`Drafts`, `Sent`, `Trash`, `Spam`, `INBOX`); `GET /api/messages?mailbox=INBOX&unseen=true&limit=50`
+  devuelve **`total: 9`** con los 9 correos; el contenedor está `healthy` con 0 reinicios y el log no
+  tiene ni un aviso `discarding dead IMAP session`. La imagen anterior (`sha256:5351b61b…`) sigue
+  local en co1 como punto de vuelta atrás.
+- **Cierre y seguimiento**: el defecto se cerró por la vía del **arreglo** (sonda de vida honesta +
+  defensa en profundidad). Lo que queda es **vigilar que no aparezcan `503` nuevos**, porque el
+  arreglo **endurece** la sonda de vida (ahora `NOOP` pasa por `run_command_and_check_ok`).
 
 ## 3. Secuencia recomendada
 
