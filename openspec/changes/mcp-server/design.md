@@ -4,16 +4,23 @@
 
 Estado real del código sobre el que se construye (verificado leyendo los ficheros):
 
-- **Servidor y router**: `build_router(state: AppState) -> Router` en `src/http.rs:2158`. Construye
+*Nota sobre las anclas `fichero:línea`:* las de este documento están medidas sobre el árbol actual.
+El **refactor de la capa de servicio** (§2 de `tasks.md`) saca símbolos de `src/http.rs` y los mueve
+a `src/service.rs`, así que **los números de línea de `src/http.rs` citados aquí se desplazan con
+él**; al cerrar §2 se hace una pasada completa para revalidar todas las anclas.
+
+- **Servidor y router**: `build_router(state: AppState) -> Router` en `src/http.rs:1847`. Construye
   `protected` con las rutas `/api/...` y le aplica
   `.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))`
   (`src/http.rs:2188`); después, `Router::new().route("/api/health", get(health)).merge(protected)
   .with_state(state)` (`src/http.rs:2194-2196`). **`GET /api/health` es la única ruta pública**;
   todo lo demás cuelga de `require_api_key` (`src/http.rs:2108`) — de ahí que *anidar* el servicio
   MCP dentro de `protected` reutilice la autenticación **sin código nuevo de auth**.
-- **Estado y firma de `build_router`**: `AppState` (`src/http.rs:403`, `Debug` en `src/http.rs:434`)
+- **Estado y firma de `build_router`**: `AppState` (`src/service.rs:127`, `Debug` manual en
+  `src/service.rs:156`; `AppStateError` en el mismo módulo, `src/service.rs:77`)
   no conoce hoy nada de MCP, y `build_router(state: AppState)` solo recibe el estado. **Cambiar su
-  firma rompería los 313 tests** que llaman `build_router(state)` (p. ej. `tests/health.rs:25`,
+  firma rompería los 318 tests existentes (baseline medido al iniciar la implementación)** que
+  llaman `build_router(state)` (p. ej. `tests/health.rs:25`,
   `tests/auth.rs:32`). Por eso la configuración del transporte HTTP viaja **dentro de `AppState`**
   (ver Decisión 7): `build_router` conserva su firma y decide a partir del estado.
 - **20 rutas** expuestas entre `protected` y `health`: `/api/health` (GET), `/api/whoami` (GET),
@@ -99,7 +106,8 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
    `tower::ServiceExt::oneshot`. Reutiliza los handlers, pero obliga a un salto HTTP en bucle, a
    inyectar la API key en el proceso y a parsear códigos de estado — arquitectónicamente pobre y
    con un coste de serialización/deserialización por operación que no aporta nada.
-   *Coste*: es un **refactor sensible** de código legacy con specs y 313 tests ⇒ el paso 2 de
+   *Coste*: es un **refactor sensible** de código legacy con specs y 318 tests existentes (baseline
+   medido al iniciar la implementación) ⇒ el paso 2 de
    `tasks.md` lo aísla y exige que los tests existentes sigan en verde antes de añadir nada.
 2. **`nest_service` de un servicio Tower de `rmcp` frente a un segundo listener.** El transporte
    `StreamableHttpService` se anida en el `axum::Router` existente (`nest_service`) bajo un path
@@ -148,15 +156,16 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
 7. **La configuración del transporte HTTP viaja en `AppState`, no en la firma de `build_router`.**
    `AppState` gana un campo `mcp_path: Option<String>` poblado desde `Config`
    (`Some(path)` = montar el transporte en ese path; `None` = sin transporte HTTP), de modo que
-   **`build_router` conserva su firma** (`src/http.rs:2158`) y los **313 tests existentes no
-   cambian** (construyen el estado con los constructores actuales, `AppState::from_config` /
-   `with_services` / `with_mailer` / `with_idle`, y sin variables MCP el valor es `None`).
+   **`build_router` conserva su firma** (`src/http.rs:1847`) y los **318 tests existentes (baseline
+   medido al iniciar la implementación) no cambian** (construyen el estado con los constructores
+   actuales, `AppState::from_config` / `with_services` / `with_mailer` / `with_idle`, y sin
+   variables MCP el valor es `None`).
    *Concreto*: el campo y sus consumidores se declaran bajo `#[cfg(feature = "mcp")]`, así el build
    por defecto no contiene ni una línea de MCP y no aparecen warnings de código muerto; con la
    feature, `build_router` anida `crate::mcp::service(state.clone())` en `protected` cuando el campo
    es `Some`.
    *Alternativa descartada*: añadir un parámetro `mcp: Option<...>` a `build_router` ⇒ cambio de
-   firma que obliga a tocar los 313 tests y todos los helpers de test, sin ninguna ventaja.
+   firma que obliga a tocar los 318 tests existentes (baseline medido al iniciar la implementación) y todos los helpers de test, sin ninguna ventaja.
 8. **`schemars` permanece opcional pese a que los derives `JsonSchema` recaen sobre tipos no
    gateados.** Hay una tensión real: las tools necesitan `inputSchema`/`outputSchema`, y la promesa
    es que el build por defecto **no** compila `schemars`. Resolución elegida: los tipos de
@@ -188,7 +197,8 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
 - **Juventud de `rmcp`** (push diario, evolución rápida). *Mitigación*: fijar `rmcp = "3.5.1"`,
   revisar el CHANGELOG antes de actualizar y confirmar los nombres públicos usados.
 - **Riesgo de regresión del refactor de `http.rs`**. *Mitigación*: TDD con tests de
-  caracterización y el criterio de que los **313 tests existentes sigan en verde** sin cambiar
+  caracterización y el criterio de que los **318 tests existentes (baseline medido al iniciar la
+  implementación) sigan en verde** sin cambiar
   ningún contrato HTTP.
 - **Doble sistema de esquemas** si además se hace `plans/PLAN-003.md`: `schemars` (MCP, JSON Schema
   2020-12) conviviendo con `ToSchema` de `utoipa` para los **mismos** tipos. *Mitigación*: admitir

@@ -67,6 +67,24 @@ async fn whoami_with_valid_key_returns_200() {
     assert_eq!(json["authenticated"], true);
 }
 
+/// Pins the *shape* of the `200` body: the response DTO is moved to the service
+/// layer, and no field may be added, renamed or lost.
+#[tokio::test]
+async fn whoami_body_has_exactly_the_authenticated_field() {
+    let response = whoami(Some(&format!("Bearer {API_KEY}"))).await;
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body should be readable")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+
+    let object = json.as_object().expect("the body must be a JSON object");
+    assert_eq!(object.len(), 1, "unexpected fields in the body: {json}");
+    assert_eq!(json["authenticated"], serde_json::json!(true));
+}
+
 #[tokio::test]
 async fn whoami_without_header_returns_401() {
     let response = whoami(None).await;

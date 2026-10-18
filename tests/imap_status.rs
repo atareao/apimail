@@ -297,9 +297,62 @@ async fn unreachable_server_returns_503() {
     }
 }
 
+/// Pins the *shape* of the `200` body: the response DTO is moved to the service
+/// layer, and no field may be added, renamed or lost.
+#[tokio::test]
+async fn connected_body_has_exactly_the_reported_fields() {
+    let response = status(
+        app_with(&config(), FakeConnector::ok()),
+        Some(&format!("Bearer {API_KEY}")),
+    )
+    .await;
+
+    let json = body_json(response).await;
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["connected", "host", "port", "tls"],
+        "unexpected fields in the body: {json}"
+    );
+}
+
+/// Pins the *shape* of the `503` body: it is deliberately **not** the shared
+/// `{"error","message"}` envelope, it also carries `connected`.
+#[tokio::test]
+async fn unavailable_body_has_exactly_the_reported_fields() {
+    let response = status(
+        app_with(&config(), FakeConnector::failing()),
+        Some(&format!("Bearer {API_KEY}")),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = body_json(response).await;
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["connected", "error", "message"],
+        "unexpected fields in the body: {json}"
+    );
+}
+
 #[tokio::test]
 async fn without_api_key_returns_401() {
     let response = status(app_with(&config(), FakeConnector::ok()), None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn with_wrong_api_key_returns_401() {
+    let response = status(
+        app_with(&config(), FakeConnector::ok()),
+        Some("Bearer not-the-key"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 

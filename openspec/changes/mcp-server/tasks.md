@@ -34,7 +34,8 @@
   `smtp_error`, `imap_unavailable` y `idle_not_configured`). **Nota**: `idle_not_configured` es
   caracterización de la capa de servicio **para HTTP** (`POST /api/idle/start`); **no** es un error
   alcanzable desde las tools MCP, porque esas rutas están excluidas de la superficie. Ejecutar
-  `cargo test` y confirmar que **los 313 tests existentes y los nuevos pasan** sobre el código aún
+  `cargo test` y confirmar que **los 318 tests existentes (baseline medido al iniciar la
+  implementación) y los nuevos pasan** sobre el código aún
   sin refactorizar.
 - [ ] 2.2 GREEN (DTOs): **reubicar o exponer** los DTOs hoy privados de `src/http.rs` — moverlos a
   `src/service.rs` (o `pub(crate)` desde `http.rs`) para que `src/mcp.rs` los use: `MailboxDto`
@@ -52,8 +53,8 @@
   tools llevan `#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]`, de modo que `schemars`
   sigue siendo **opcional** (Decisión 8). Reconvertir los handlers de `src/http.rs` en envoltorios
   delgados que mapean `ServiceError` → `ErrorResponse`/estado HTTP. Verificación: `cargo test` con
-  **los 313 tests existentes en verde** y **ningún contrato HTTP cambiado** (ninguna aserción de
-  status/JSON modificada).
+  **los 318 tests existentes (baseline medido al iniciar la implementación) en verde** y **ningún
+  contrato HTTP cambiado** (ninguna aserción de status/JSON modificada).
 - [ ] 2.4 REFACTOR: eliminar lógica duplicada entre `src/http.rs` y `src/service.rs`,
   `cargo fmt --check` y `cargo clippy --all-targets -- -D warnings` limpios. Criterio de cierre del
   paso: `cargo test` sigue en verde y el diff de contratos HTTP es **cero**.

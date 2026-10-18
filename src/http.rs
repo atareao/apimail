@@ -314,323 +314,21 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
-use crate::Config;
-use crate::config::TlsMode;
-use crate::idle::{
-    HttpWebhookSender, IdleConnector, IdleError, IdleSettings, IdleSupervisor, TokioIdleConnector,
-    WebhookSender,
-};
+use crate::idle::IdleError;
 use crate::imap::{
-    Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
-    MailboxStatus, Message, MessageEnvelope, ParsedMessageError, SearchCriteria, SearchDate,
-    SystemFlag, TokioImapConnector,
+    Address, FetchFormat, ImapError, MailboxInfo, MailboxStatus, Message, MessageEnvelope,
+    ParsedMessageError, SearchCriteria, SearchDate, SystemFlag,
 };
 use crate::mime::ParsedAttachment;
-use crate::queue::{NotificationQueue, QueueError, WebhookQueue};
-use crate::smtp::{
-    MailSender, MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage, SmtpError,
-    SmtpSender,
-};
+use crate::smtp::{MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage};
 
-/// Application name, resolved from `Cargo.toml`.
-pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
-/// Application version, resolved from `Cargo.toml`.
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Slack added to the computed body limit, on top of the base64 expansion of the
-/// attachment bytes, to cover the rest of the JSON envelope.
-const BODY_LIMIT_SLACK: usize = 64 * 1024;
-
-/// Errors produced while building [`AppState`].
-///
-/// It wraps the service constructors and the delivery queue so a single
-/// `Result` covers the real SMTP transport, the IMAP connector and the queue
-/// file, none of which opens a connection or performs I/O beyond the queue file
-/// at construction time.
-#[derive(Debug, thiserror::Error)]
-pub enum AppStateError {
-    /// Building the SMTP transport failed.
-    #[error(transparent)]
-    Smtp(#[from] SmtpError),
-    /// Building the IMAP connector failed.
-    #[error(transparent)]
-    Imap(#[from] ImapError),
-    /// Building the delivery queue failed (an unusable `APIMAIL_QUEUE_PATH`).
-    #[error(transparent)]
-    Queue(#[from] QueueError),
-}
-
-impl AppStateError {
-    /// Stable, log-safe description; delegates to the wrapped error's public
-    /// message.
-    ///
-    /// The wrapped [`SmtpError`]/[`ImapError`] already group their variants into
-    /// stable, credential-free families, so this never propagates the raw
-    /// [`Display`](std::fmt::Display) text produced by `lettre`, `async-imap`,
-    /// rustls or the operating system. A queue failure names the variable but
-    /// never the path.
-    pub fn public_message(&self) -> String {
-        match self {
-            Self::Smtp(error) => error.public_message().to_string(),
-            Self::Imap(error) => error.public_message().to_string(),
-            Self::Queue(_) => {
-                "invalid APIMAIL_QUEUE_PATH: the queue file could not be created or written"
-                    .to_string()
-            }
-        }
-    }
-
-    /// Stable machine-filterable tag, for **logs only**.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Smtp(_) => "smtp",
-            Self::Imap(_) => "imap",
-            Self::Queue(_) => "queue",
-        }
-    }
-}
-
-/// Shared state exposed to handlers.
-///
-/// The configured API key is stored only as its SHA-256 digest and the field is
-/// private, so the plaintext secret can neither be read nor formatted. The
-/// manual [`Debug`] implementation redacts the digest as well as the mailer and
-/// the connection manager, which hold the SMTP and IMAP credentials.
-#[derive(Clone)]
-pub struct AppState {
-    /// Application name.
-    pub name: &'static str,
-    /// Application version.
-    pub version: &'static str,
-    /// SHA-256 digest of the expected API key.
-    api_key_hash: [u8; 32],
-    /// Non-sensitive view of the configured mail account (host and port only).
-    account: AccountView,
-    /// Outgoing mail transport (real at runtime, fake in tests).
-    mailer: Arc<dyn MailSender>,
-    /// Maximum total size, in bytes, of the decoded attachments of a message.
-    max_attachment_bytes: usize,
-    /// Maximum size, in bytes, of a message that will be fetched and parsed.
-    max_message_bytes: usize,
-    /// Sender used when a message omits `from` (the configured SMTP user).
-    default_from: String,
-    /// Lazy, persistent IMAP connection manager.
-    imap: Arc<ConnectionManager>,
-    /// TLS mode of the configured IMAP endpoint, for the status endpoint.
-    imap_tls: TlsMode,
-    /// IDLE subscription supervisor (dedicated connection + webhook).
-    idle: Arc<IdleSupervisor>,
-}
-
-impl std::fmt::Debug for AppState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppState")
-            .field("name", &self.name)
-            .field("version", &self.version)
-            .field("api_key_hash", &"***")
-            .field("account", &self.account)
-            .field("mailer", &"***")
-            .field("max_attachment_bytes", &self.max_attachment_bytes)
-            .field("max_message_bytes", &self.max_message_bytes)
-            .field("imap", &"***")
-            .field("imap_tls", &self.imap_tls)
-            .field("idle", &"***")
-            .finish()
-    }
-}
-
-/// Builds the delivery queue from `config`, failing closed.
-///
-/// With `APIMAIL_QUEUE_PATH` set the queue is persistent: any I/O failure (a
-/// path that cannot be created, opened or written) is reported as
-/// [`QueueError`] and aborts startup, naming the variable. Without a path the
-/// queue lives in memory only and nothing is ever written to disk. Either way
-/// the concrete [`WebhookQueue`] is erased behind the [`NotificationQueue`]
-/// trait the supervisor and worker depend on.
-fn build_queue(config: &Config) -> Result<Arc<dyn NotificationQueue>, QueueError> {
-    let limits = config.queue_limits();
-    match &config.queue_path {
-        Some(path) => Ok(Arc::new(WebhookQueue::persistent(path.clone(), limits)?)),
-        None => Ok(Arc::new(WebhookQueue::in_memory(limits))),
-    }
-}
-
-impl AppState {
-    /// Builds the application state from the loaded [`Config`].
-    ///
-    /// This constructs the real SMTP transport, the real IMAP connector and the
-    /// delivery queue from `config` — it opens no connection, but building any of
-    /// them (resolving a TLS configuration, or creating the queue file) can fail,
-    /// hence the `Result`.
-    ///
-    /// The expected key is hashed to a fixed-size digest here (not on every
-    /// request) so the middleware can compare two equal-length buffers in
-    /// constant time. [`Config`] guarantees a non-empty key; the assertion below
-    /// documents that invariant in debug builds.
-    pub fn from_config(config: &Config) -> Result<Self, AppStateError> {
-        debug_assert!(
-            !config.api_key.is_empty(),
-            "AppState must not be built with an empty API key"
-        );
-        let mailer: Arc<dyn MailSender> =
-            Arc::new(SmtpSender::from_endpoint(&config.account.smtp)?);
-        let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
-        Self::with_services(config, mailer, connector)
-    }
-
-    /// Builds the application state with an injected [`MailSender`].
-    ///
-    /// Used by tests to avoid the network. It delegates to
-    /// [`with_services`](Self::with_services) with a real [`TokioImapConnector`]
-    /// built from `config` (which opens no connection). The connector can still
-    /// fail to build (for example, resolving its TLS configuration), so the
-    /// fallible construction is propagated instead of panicking.
-    pub fn with_mailer(
-        config: &Config,
-        mailer: Arc<dyn MailSender>,
-    ) -> Result<Self, AppStateError> {
-        let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
-        Self::with_services(config, mailer, connector)
-    }
-
-    /// Builds the application state with both services injected.
-    ///
-    /// Used by tests to exercise the HTTP layer without touching the network. It
-    /// delegates to [`with_idle`](Self::with_idle) with a real
-    /// [`TokioIdleConnector`] and an [`HttpWebhookSender`], both of which are
-    /// infallible to build (their TLS/HTTP clients are resolved lazily). The
-    /// delivery queue is built from `config` and can fail closed when
-    /// `APIMAIL_QUEUE_PATH` is unusable, hence the `Result`.
-    pub fn with_services(
-        config: &Config,
-        mailer: Arc<dyn MailSender>,
-        imap_connector: Arc<dyn ImapConnector>,
-    ) -> Result<Self, AppStateError> {
-        let idle_connector: Arc<dyn IdleConnector> = Arc::new(TokioIdleConnector::new(
-            config.account.imap.clone(),
-            config.imap_timeout,
-        ));
-        let webhook_sender: Arc<dyn WebhookSender> =
-            Arc::new(HttpWebhookSender::new(config.webhook_timeout));
-        Self::with_idle(
-            config,
-            mailer,
-            imap_connector,
-            idle_connector,
-            webhook_sender,
-        )
-    }
-
-    /// Builds the application state with every service injected.
-    ///
-    /// Used by tests to exercise the HTTP layer, including the IDLE routes,
-    /// without touching the network: the dedicated-connection factory and the
-    /// webhook client are supplied by the caller. The subscription is built from
-    /// `config` (`APIMAIL_WEBHOOK_URL`, `APIMAIL_IDLE_MAILBOX`,
-    /// `APIMAIL_WEBHOOK_TIMEOUT_SECS` and `APIMAIL_MAX_MESSAGE_BYTES`) but is not
-    /// started until `POST /api/idle/start`.
-    ///
-    /// The delivery queue is built from `config` with `build_queue`, so an
-    /// unusable `APIMAIL_QUEUE_PATH` fails the whole construction instead of
-    /// silently degrading to an in-memory queue.
-    pub fn with_idle(
-        config: &Config,
-        mailer: Arc<dyn MailSender>,
-        imap_connector: Arc<dyn ImapConnector>,
-        idle_connector: Arc<dyn IdleConnector>,
-        webhook_sender: Arc<dyn WebhookSender>,
-    ) -> Result<Self, AppStateError> {
-        let queue = build_queue(config)?;
-        let idle = Arc::new(IdleSupervisor::new(
-            idle_connector,
-            webhook_sender,
-            IdleSettings {
-                mailbox: config.idle_mailbox.clone(),
-                webhook_url: config.webhook_url.clone(),
-                webhook_timeout: config.webhook_timeout,
-                max_message_bytes: config.max_message_bytes,
-            },
-            Backoff::default(),
-            queue,
-        ));
-        Ok(Self {
-            name: APP_NAME,
-            version: APP_VERSION,
-            api_key_hash: Sha256::digest(config.api_key.as_bytes()).into(),
-            account: AccountView {
-                imap: EndpointView {
-                    host: config.account.imap.host.clone(),
-                    port: config.account.imap.port,
-                },
-                smtp: EndpointView {
-                    host: config.account.smtp.host.clone(),
-                    port: config.account.smtp.port,
-                },
-            },
-            mailer,
-            max_attachment_bytes: config.max_attachment_bytes,
-            max_message_bytes: config.max_message_bytes,
-            default_from: config.account.smtp.username.clone(),
-            imap: Arc::new(ConnectionManager::new(imap_connector, Backoff::default())),
-            imap_tls: config.account.imap.tls,
-            idle,
-        })
-    }
-
-    /// The IDLE subscription supervisor, controlled by the `/api/idle/*` routes.
-    pub fn idle(&self) -> &IdleSupervisor {
-        &self.idle
-    }
-
-    /// Maximum total size, in bytes, of the decoded attachments of a message.
-    pub fn max_attachment_bytes(&self) -> usize {
-        self.max_attachment_bytes
-    }
-
-    /// Maximum size, in bytes, of a message that will be fetched and parsed.
-    ///
-    /// Values reported or fetched above this bound are rejected before any MIME
-    /// parsing, so untrusted content cannot exhaust memory.
-    pub fn max_message_bytes(&self) -> usize {
-        self.max_message_bytes
-    }
-
-    /// Upper bound for the raw JSON request body of `POST /api/messages`.
-    ///
-    /// The body carries base64-encoded attachments, which expand the raw bytes
-    /// by a factor of ≈ 4/3; `BODY_LIMIT_SLACK` covers the rest of the JSON
-    /// envelope. All arithmetic saturates, so an extreme configured limit cannot
-    /// overflow.
-    pub fn message_body_limit(&self) -> usize {
-        self.max_attachment_bytes
-            .saturating_mul(4)
-            .saturating_div(3)
-            .saturating_add(BODY_LIMIT_SLACK)
-    }
-}
-
-/// Public view of a single mail endpoint: host and port only.
-#[derive(Debug, Clone, Serialize)]
-pub struct EndpointView {
-    /// Server host name or address.
-    pub host: String,
-    /// Server port.
-    pub port: u16,
-}
-
-/// Public view of the mail account, exposed by `GET /api/account`.
-///
-/// It intentionally carries neither the username nor the password.
-#[derive(Debug, Clone, Serialize)]
-pub struct AccountView {
-    /// Incoming (IMAP) endpoint.
-    pub imap: EndpointView,
-    /// Outgoing (SMTP) endpoint.
-    pub smtp: EndpointView,
-}
+// The application state and its construction error belong to the service layer
+// (`crate::service`); the re-export keeps the historical `crate::http::AppState`
+// path — and the intra-doc links of this module — working.
+use crate::service::{self, ServiceError};
+pub use crate::service::{APP_NAME, APP_VERSION, AppState, AppStateError};
 
 /// JSON payload returned by `GET /api/health`.
 #[derive(Debug, Serialize)]
@@ -643,13 +341,6 @@ pub struct HealthResponse {
     pub version: &'static str,
 }
 
-/// JSON payload returned by `GET /api/whoami`.
-#[derive(Debug, Serialize)]
-struct WhoamiResponse {
-    /// Always `true`: reached only after successful authentication.
-    authenticated: bool,
-}
-
 /// JSON payload returned by a successful `POST /api/messages`.
 #[derive(Debug, Serialize)]
 struct SentResponse {
@@ -657,20 +348,12 @@ struct SentResponse {
     status: &'static str,
 }
 
-/// JSON payload returned by a successful `GET /api/imap/status`.
-#[derive(Debug, Serialize)]
-struct ImapStatusResponse {
-    /// Always `true`: reached only after a live session was ensured.
-    connected: bool,
-    /// IMAP server host.
-    host: String,
-    /// IMAP server port.
-    port: u16,
-    /// Configured TLS mode label.
-    tls: &'static str,
-}
-
 /// JSON payload returned by a failing `GET /api/imap/status`.
+///
+/// The success DTO lives in the service layer
+/// ([`crate::service::ImapStatusResponse`]); this one is the transport's
+/// rendering of a [`ServiceError::ImapUnavailable`], which is why it stays here:
+/// no other route answers `503` with a `connected` field.
 #[derive(Debug, Serialize)]
 struct ImapUnavailableResponse {
     /// Always `false`.
@@ -1626,6 +1309,20 @@ impl From<SmtpMessageError> for SendError {
     }
 }
 
+/// Single point of truth mapping a [`ServiceError`] to the HTTP status of the
+/// published error table (see the table in [`crate::service`]).
+///
+/// The *body* stays a per-route decision — the `503` of `GET /api/imap/status`
+/// adds `"connected": false` to the shared envelope — but the status of every
+/// domain failure is decided here, in one place, and the match is **exhaustive**
+/// on purpose: adding a variant to [`ServiceError`] is a compile error until its
+/// status is chosen, so no failure mode can silently inherit the wrong one.
+fn status_for(error: &ServiceError) -> StatusCode {
+    match error {
+        ServiceError::ImapUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 /// Rejection returned when a request is not authenticated.
 ///
 /// This is the embryo of the unified error model: a dedicated type implementing
@@ -1666,35 +1363,27 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-async fn whoami() -> Json<WhoamiResponse> {
-    Json(WhoamiResponse {
-        authenticated: true,
-    })
+/// `GET /api/whoami` handler: thin wrapper over [`crate::service::whoami`].
+async fn whoami() -> Json<service::WhoamiResponse> {
+    Json(service::whoami())
 }
 
+/// `GET /api/account` handler: thin wrapper over [`crate::service::account`].
 async fn account(State(state): State<AppState>) -> Response {
-    Json(&state.account).into_response()
+    Json(service::account(&state)).into_response()
 }
 
-/// `GET /api/imap/status` handler: ensures a live IMAP session and reports the
-/// outcome without exposing any credential.
+/// `GET /api/imap/status` handler: thin wrapper over
+/// [`crate::service::imap_status`], which ensures a live IMAP session and
+/// reports the outcome without exposing any credential.
 async fn imap_status(State(state): State<AppState>) -> Response {
-    match state.imap.status().await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ImapStatusResponse {
-                connected: true,
-                host: state.account.imap.host.clone(),
-                port: state.account.imap.port,
-                tls: state.imap_tls.as_str(),
-            }),
-        )
-            .into_response(),
+    match service::imap_status(&state).await {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
         Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            status_for(&error),
             Json(ImapUnavailableResponse {
                 connected: false,
-                error: "imap_unavailable",
+                error: error.code(),
                 message: error.public_message().to_string(),
             }),
         )
@@ -2026,7 +1715,7 @@ async fn send_message(
     let dto: SendMessageDto = serde_json::from_slice(&body)
         .map_err(|error| SendError::InvalidRequest(error.to_string()))?;
 
-    let message = dto.into_outgoing(&state.default_from, state.max_attachment_bytes)?;
+    let message = dto.into_outgoing(&state.default_from, state.max_attachment_bytes())?;
     message.validate()?;
     state
         .mailer
@@ -2199,6 +1888,7 @@ pub fn build_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smtp::SmtpError;
 
     #[test]
     fn app_state_error_public_message_never_leaks_third_party_text() {

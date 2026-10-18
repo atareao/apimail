@@ -86,6 +86,42 @@ async fn account_with_valid_key_returns_hosts_and_ports() {
     }
 }
 
+/// Pins the *shape* of the `200` body: the response DTOs are moved to the
+/// service layer, and no field may be added, renamed or lost.
+#[tokio::test]
+async fn account_body_has_exactly_the_two_endpoints_and_host_and_port() {
+    let response = account(Some(&format!("Bearer {API_KEY}"))).await;
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body should be readable")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["imap", "smtp"],
+        "unexpected fields in the body: {json}"
+    );
+
+    for endpoint in ["imap", "smtp"] {
+        let view = json[endpoint]
+            .as_object()
+            .unwrap_or_else(|| panic!("`{endpoint}` must be a JSON object: {json}"));
+        let mut keys: Vec<&str> = view.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["host", "port"],
+            "unexpected fields in `{endpoint}`: {json}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn account_without_header_returns_401() {
     let response = account(None).await;
