@@ -1,29 +1,43 @@
 # Tasks
 
 > Checklist TDD (RED → GREEN → REFACTOR) para `mcp-server`. Cada sección verifica por CLI con
-> `cargo test`, `cargo clippy --all-targets -- -D warnings` y `cargo fmt --check`. **Todas las
-> casillas están sin marcar**: no se ha escrito código todavía (fase SDD, pendiente de aprobación).
+> `cargo test`, `cargo clippy --all-targets -- -D warnings` y `cargo fmt --check`.
+> **Estado**: el **andamiaje (§1) está implementado y verificado** (feature, dependencias opcionales,
+> job de CI y comprobación con `cargo tree`), con el CI en verde. Las casillas de **implementación de
+> MCP (§4–§10)** siguen sin marcar. La capa de servicio (§2) ya tiene su código en el árbol, pero sus
+> casillas se marcan en la **pasada de cierre**, junto con la revalidación de anclas `fichero:línea`
+> del `design.md` (se hace una sola vez, cuando `src/http.rs` deja de moverse).
+>
+> *Anclas `fichero:línea`:* no se revalidan por secciones; la numeración de línea de este documento
+> es orientativa hasta el cierre del change (ver la nota equivalente en `design.md`).
 
 ## 1. Andamiaje de la feature (Cargo.toml + CI)
 
-- [ ] 1.1 RED (línea base, no es un test unitario): fijar el estado de partida del build por
+- [x] 1.1 RED (línea base, no es un test unitario): fijar el estado de partida del build por
   defecto — `cargo build` y `cargo test` en verde, y `cargo tree` **sin** la feature **no** debe
-  listar `rmcp` ni `schemars`. Registrar la salida como referencia.
-- [ ] 1.2 GREEN: en `Cargo.toml`, declarar `[features] mcp = ["dep:rmcp", "dep:schemars"]`
+  listar `rmcp` ni `schemars`. Registrar la salida como referencia. **MEDIDO**: `cargo tree` sin la
+  feature → **0** apariciones de `rmcp`/`schemars`; `cargo tree --features mcp` → **4** paquetes
+  (`rmcp`, `rmcp-macros`, `schemars`, `schemars_derive`).
+- [x] 1.2 GREEN: en `Cargo.toml`, declarar `[features] mcp = ["dep:rmcp", "dep:schemars"]`
   (**default OFF**) y las deps **opcionales** con la higiene del `design.md`: `rmcp` con
-  `default-features = false` y features `transport-io`, `transport-streamable-http-server`,
-  `macros`, `schemars`; `schemars = { version = "1.2.2", optional = true }`. **NO** activar la
-  feature `auth` de `rmcp`. Verificación (de build, no test unitario): `cargo build` (por defecto) y
-  `cargo build --features mcp` compilan; `cargo tree --features mcp` no muestra un segundo
-  `reqwest` 0.13 ni `base64` 0.23.
-- [ ] 1.3 GREEN (CI): añadir un **job nuevo** `test-mcp` a `.github/workflows/ci.yml` que ejecute
+  `default-features = false` y features `server`, `transport-io`,
+  `transport-streamable-http-server`, `macros`, `schemars`; `schemars = { version = "1.2.2",
+  optional = true }`. **NO** activar la feature `auth` de `rmcp`. Verificación (de build, no test
+  unitario): `cargo build` (por defecto) y `cargo build --features mcp` compilan; `cargo tree
+  --features mcp` **no** muestra un segundo `reqwest` (sigue un único `reqwest 0.12.28`) ni un
+  segundo `http`. *(Nota corregida: la comprobación original pedía «ni `base64` 0.23» — es un
+  criterio equivocado: `base64 0.23.1` es **preexistente** y el par `0.22.1 + 0.23.1` es idéntico con
+  y sin la feature.)* **`server` es obligatoria**: sin ella el servidor MCP no se puede ni nombrar
+  (ver design.md, Decisión 3).
+- [x] 1.3 GREEN (CI): añadir un **job nuevo** `test-mcp` a `.github/workflows/ci.yml` que ejecute
   `cargo test --features mcp` (y `cargo clippy --all-targets --features mcp -- -D warnings`) **sin**
   tocar el job `test` por defecto, que sigue sin la feature. Verificación: el CI por defecto no
-  cambia y el job nuevo compila con la feature.
-- [ ] 1.4 REFACTOR: `cargo fmt --check` y `cargo clippy --all-targets -- -D warnings` limpios en
+  cambia y el job nuevo compila con la feature. **MEDIDO**: el job se llama `test-mcp` y el job
+  `test` no se modificó.
+- [x] 1.4 REFACTOR: `cargo fmt --check` y `cargo clippy --all-targets -- -D warnings` limpios en
   ambos modos. **Verificación de la promesa de opcionalidad** (build, no test unitario):
   `cargo tree` / `cargo tree --no-default-features` **sin** la feature **no** listan `rmcp` ni
-  `schemars`; `cargo tree --features mcp` sí los lista.
+  `schemars`; `cargo tree --features mcp` sí los lista. **MEDIDO**: 0 vs 4 paquetes (ver 1.1).
 
 ## 2. Capa de servicio `src/service.rs` (el paso más delicado)
 

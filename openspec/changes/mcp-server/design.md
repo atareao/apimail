@@ -4,10 +4,12 @@
 
 Estado real del código sobre el que se construye (verificado leyendo los ficheros):
 
-*Nota sobre las anclas `fichero:línea`:* las de este documento están medidas sobre el árbol actual.
-El **refactor de la capa de servicio** (§2 de `tasks.md`) saca símbolos de `src/http.rs` y los mueve
-a `src/service.rs`, así que **los números de línea de `src/http.rs` citados aquí se desplazan con
-él**; al cerrar §2 se hace una pasada completa para revalidar todas las anclas.
+*Nota sobre las anclas `fichero:línea`:* las de esta sección se midieron **antes** de implementar §2
+(capa de servicio) y §5 (montaje del transporte HTTP). Ambas secciones sacan símbolos de
+`src/http.rs` y los mueven a `src/service.rs`. Por eso **los números de línea citados aquí están
+desfasados a propósito y no se corrigen todavía**: la revalidación de anclas se hace **una sola vez al
+cerrar el change** —cuando `src/http.rs` ya no se va a mover más—, nunca por secciones. Hasta esa
+pasada, toda cifra `fichero:línea` de este documento debe leerse como **orientativa**.
 
 - **Servidor y router**: `build_router(state: AppState) -> Router` en `src/http.rs:1847`. Construye
   `protected` con las rutas `/api/...` y le aplica
@@ -115,14 +117,43 @@ a `src/service.rs`, así que **los números de línea de `src/http.rs` citados a
    un servidor HTTP aparte para MCP ⇒ puerto y proceso extra, dos capas de auth que sincronizar y
    un arranque más complejo, sin ninguna ventaja.
 3. **Higiene de dependencias.** Se activa `rmcp` con `default-features = false` y **features
-   explícitas**: `transport-io` (stdio), `transport-streamable-http-server`, `macros` y
+   explícitas**: `server`, `transport-io` (stdio), `transport-streamable-http-server`, `macros` y
    `schemars`. Los motivos:
+   - **`server` es obligatoria, no un extra.** En `rmcp 3.5.1` (`src/lib.rs`), `#[cfg(feature =
+     "server")]` gatea el módulo `transport`, los re-exports `ServerHandler` y `ServiceExt` y los de
+     las macros (`#[tool_router]`/`#[tool_handler]`/`#[tool]`, estos tras `all(feature = "macros",
+     feature = "server")`). Sin `server` el servidor MCP **no se puede ni nombrar**. *Verificado con
+     un crate sonda*: la lista de features **sin** `server` **no compila** (`unresolved imports
+     rmcp::ServerHandler, rmcp::ServiceExt, rmcp::tool, rmcp::tool_handler, rmcp::tool_router` y
+     `cannot find server in handler` / `cannot find transport in rmcp`); **con** `server` compila y
+     monta el transporte en `axum`. La feature `server` = `transport-async-rw` + `schemars` +
+     `pastey` + `uuid`, todo ya presente en el árbol por las demás features, así que **no añade
+     ninguna versión nueva**.
    - **NO** se activa la feature `auth` de `rmcp`: arrastraría `oauth2 ^5` y `reqwest ^0.13.2`,
      mientras el proyecto ya usa `reqwest 0.12` para el webhook ⇒ **dos `reqwest` en el árbol**.
-   - El `default` de `rmcp` incluye `base64 ^0.23`, mientras el proyecto usa **`base64 0.22`** ⇒
-     usar `default-features = false` evita dos versiones de `base64`.
+     *Verificado*: `cargo tree -d --features mcp` **no** muestra un segundo `reqwest` (sigue un único
+     `reqwest 0.12.28`); `http` tampoco se duplica ⇒ el objetivo de no arrastrar `auth` se cumple.
+   - **El argumento del `base64` queda RETIRADO por falso** (era: «el `default` de `rmcp` incluye
+     `base64 ^0.23` mientras el proyecto usa `base64 0.22` ⇒ `default-features = false` evita dos
+     versiones»). *Medido*, es inválido por dos motivos: **(a)** `base64 0.23.1` **ya estaba en el
+     árbol antes de este change** (entra por `async-imap`, por `lettre`/`email-encoding` y por
+     `hyper-util`/`axum`); el par `base64 0.22.1 + 0.23.1` es **idéntico con y sin la feature**
+     (`cargo tree -d` en ambos modos). **(b)** Además, `transport-streamable-http-server` →
+     `server-side-http` **activa explícitamente la feature `base64` de `rmcp`**, así que
+     `default-features = false` no lo evitaría en ningún caso. Se mantiene `default-features = false`
+     (no queremos arrastrar los `default` de `rmcp`), pero **no por este motivo**: la duplicación de
+     `base64` es **preexistente y ajena a este change**.
    - `schemars 1.2.2` comparte el **major** (`^1.0`) con la dependencia de `rmcp`: **sin duplicar
-     tipos**.
+     tipos**. *Verificado*: `schemars` resuelve a **1.2.3** (caret de `1.2.2`) y hay **una sola
+     versión** en el árbol, compartiendo el `^1.0` que pide `rmcp` ⇒ no hay dos sistemas de esquemas
+     ni tipos duplicados.
+   - **Evidencia medida de la promesa central de la spec** (`tasks.md` §1): `cargo tree` **sin** la
+     feature → **0** apariciones de `rmcp`/`schemars`; `cargo tree --features mcp` → **4** paquetes
+     (`rmcp`, `rmcp-macros`, `schemars`, `schemars_derive`). La opcionalidad es un hecho medido, no
+     una intención.
+   - **Duplicaciones nuevas y transitivas** que sí introduce la feature, **ninguna de las cuales
+     afecta al código del proyecto**: `cpufeatures (0.2.17 / 0.3.1)` (la nueva entra por `chacha20` ←
+     `rand` ← `rmcp`) y `getrandom (0.2.17 / 0.4.3)` (la nueva por `rand`/`uuid` ← `rmcp`).
    - Versiones a fijar en la implementación: `rmcp = "3.5.1"`, `schemars = "1.2.2"`.
    *Alternativa descartada*: **`rust-mcp-sdk` 2.0.0** (MIT, menos tracción, API propia); se
    prefiere el SDK de referencia del ecosistema MCP (`rmcp`).
@@ -211,9 +242,9 @@ a `src/service.rs`, así que **los números de línea de `src/http.rs` citados a
 
 Ficheros y firmas afectadas:
 
-- `Cargo.toml` (**no se toca hasta implementar**): `[features] mcp = ["dep:rmcp", "dep:schemars"]`
-  (default OFF) y deps **opcionales** `rmcp` (`default-features = false`, features
-  `transport-io`, `transport-streamable-http-server`, `macros`, `schemars`) y
+- `Cargo.toml` (**ya declarada en §1 del andamiaje**): `[features] mcp = ["dep:rmcp",
+  "dep:schemars"]` (default OFF) y deps **opcionales** `rmcp` (`default-features = false`, features
+  `server`, `transport-io`, `transport-streamable-http-server`, `macros`, `schemars`) y
   `schemars = { version = "1.2.2", optional = true }`.
 - `src/service.rs` (**nuevo**): capa de servicio con los DTOs y `ServiceError` compartidos. Los
   tipos de entrada/salida de las tools llevan el derive condicional
