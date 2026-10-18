@@ -16,10 +16,12 @@
 //! `{"error":…,"message":…}` envelope. Handlers there are thin wrappers over the
 //! operations of this module **as they migrate**, one operation at a time: today
 //! `whoami`, `account`, `imap_status`, `list_mailboxes`, both IDLE reads
-//! (`idle_status`, `idle_queue`) and the five message reads (`list_messages`,
-//! `fetch_message`, `message_body`, `list_attachments`, `attachment`); the rest
-//! still hold their own logic and their own per-route error type in
-//! [`crate::http`].
+//! (`idle_status`, `idle_queue`), the five message reads (`list_messages`,
+//! `fetch_message`, `message_body`, `list_attachments`, `attachment`) and the
+//! first **write** operation, `send_message` — which brought its request DTO
+//! ([`SendMessageDto`]) with it, because decoding and validating an outgoing
+//! message is domain work, not HTTP work; the rest still hold their own logic and
+//! their own per-route error type in [`crate::http`].
 //!
 //! # Published HTTP error table
 //!
@@ -34,7 +36,12 @@
 //! Until an operation migrates, its code is still produced by that operation's
 //! per-route error type in [`crate::http`] and [`ServiceError`] has no variant
 //! for it yet: variants are added **with their operation**, never ahead of it,
-//! so this table carries no speculative row.
+//! so this table carries no speculative row. The migration of `send_message` has
+//! made three of these rows real on both sides — `invalid_request` and
+//! `payload_too_large` now have their **domain** producer
+//! ([`ServiceError::InvalidRequest`] and [`ServiceError::PayloadTooLarge`]) next
+//! to the transport's own, and `smtp_error` its only one
+//! ([`ServiceError::SmtpFailure`]).
 //!
 //! | HTTP | `error`                    | Owner               |
 //! |------|----------------------------|---------------------|
@@ -56,9 +63,9 @@
 //! - `unauthorized` (`401`): the auth middleware is the only place that sees the
 //!   `Authorization` header, and the header is HTTP dialect.
 //! - The `invalid_request` (`400`) that comes from **parsing** the input — the
-//!   `serde`, query-string, base64 and type decoding of a request. A malformed
-//!   request is not a domain failure: it means the caller did not speak the
-//!   transport's dialect. MCP has its own input schema and reports its own.
+//!   `serde`, query-string and type decoding of a request. A malformed request is
+//!   not a domain failure: it means the caller did not speak the transport's
+//!   dialect. MCP has its own input schema and reports its own.
 //! - The `payload_too_large` (`413`) of the **HTTP request body limit**
 //!   ([`AppState::message_body_limit`] plus `DefaultBodyLimit::disable()`, which
 //!   hands the size check to the send handler so it answers with this JSON
@@ -82,8 +89,10 @@
 //! transport (a malformed body or query string; the raw HTTP body limit) while
 //! the service produces the **domain** ones, so that an operation never
 //! re-implements a rule a second transport would have to re-implement as well.
-//! [`ServiceError`] gains its `InvalidRequest` variant with the first operation
-//! that needs it.
+//! [`ServiceError`] gained its [`InvalidRequest`](ServiceError::InvalidRequest)
+//! variant with the first operation that needed it — sending a message, whose
+//! validation (a recipient, a mailbox address, the total decoded attachment size)
+//! is a domain rule, not a dialect of HTTP.
 //!
 //! This is a conscious deviation from the audit's recommendation that the
 //! service only ever receive *already validated* types and that
@@ -92,9 +101,13 @@
 //! known flags — are validated **here**, precisely so MCP inherits them instead
 //! of reproducing them.
 //!
-//! The `message` of a domain failure is a `&'static str` from the service's own
-//! vocabulary: never text taken from the request, never a value read from the
-//! configuration.
+//! The `message` of a domain failure is the service's own vocabulary, fixed at
+//! construction time: never a value read from the configuration, and never text
+//! an upstream server or library handed back. One family is deliberately
+//! **request-echoing** — the offending field, address or attachment file name of
+//! a message that failed a validation rule (see
+//! [`ServiceError::InvalidRequest`]) — because that is the diagnostic the caller
+//! needs to fix the request, and the API has always echoed it back.
 //!
 //! Two rows share the code `imap_unavailable` but not the same body: the 503 of
 //! `GET /api/imap/status` also carries `"connected": false`, which is that
@@ -104,7 +117,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -120,7 +133,9 @@ use crate::imap::{
 };
 use crate::mime::ParsedAttachment;
 use crate::queue::{NotificationQueue, QueueError, QueueStats, WebhookQueue};
-use crate::smtp::{MailSender, SmtpError, SmtpSender};
+use crate::smtp::{
+    MailSender, MessageError, OutgoingAttachment, OutgoingMessage, SmtpError, SmtpSender,
+};
 
 /// Application name, resolved from `Cargo.toml`.
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
@@ -203,21 +218,20 @@ pub struct AppState {
     account: AccountView,
     /// Outgoing mail transport (real at runtime, fake in tests).
     ///
-    /// Crate-visible **while the handlers of `src/http.rs` are not yet
-    /// migrated**; it goes back to private when the last one is. This is a
-    /// migration artefact, **not** the target pattern: operations must reach the
-    /// transport through a method of this type, the way [`AppState::idle`] does.
-    pub(crate) mailer: Arc<dyn MailSender>,
+    /// Private: [`send_message`] is the only operation that reaches it, through
+    /// this field, and no transport sees it — the handler of `POST /api/messages`
+    /// delegates to that operation.
+    mailer: Arc<dyn MailSender>,
     /// Maximum total size, in bytes, of the decoded attachments of a message.
     max_attachment_bytes: usize,
     /// Maximum size, in bytes, of a message that will be fetched and parsed.
     max_message_bytes: usize,
     /// Sender used when a message omits `from` (the configured SMTP user).
     ///
-    /// Crate-visible **while the handlers of `src/http.rs` are not yet
-    /// migrated**; it goes back to private when the last one is. This is a
-    /// migration artefact, **not** the target pattern.
-    pub(crate) default_from: String,
+    /// Private: [`send_message`] resolves it into [`OutgoingMessage::from`]
+    /// before the transport sees the message, so the sender that is actually used
+    /// is the one the transport — and a test fake — observes.
+    default_from: String,
     /// Lazy, persistent IMAP connection manager.
     ///
     /// Crate-visible **while the handlers of `src/http.rs` are not yet
@@ -775,6 +789,110 @@ pub struct AttachmentResponse {
     pub content_base64: String,
 }
 
+/// JSON payload returned by a successful send.
+#[derive(Debug, Serialize)]
+pub struct SentResponse {
+    /// Always `sent`: reached only after the transport accepted the message.
+    pub status: &'static str,
+}
+
+/// One attachment of a [`SendMessageDto`].
+///
+/// This is the transport-agnostic **input** shape of the send operation: the HTTP
+/// route decodes a JSON body into it, and a second transport (MCP) fills it in
+/// from its own input schema.
+#[derive(Debug, Deserialize)]
+pub struct AttachmentDto {
+    /// File name presented to the recipient.
+    pub filename: String,
+    /// Optional MIME content type.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Attachment content, base64-encoded.
+    pub data_base64: String,
+}
+
+/// A message to be sent, as the send operation expects it.
+///
+/// The type was extracted from [`crate::http`] together with the operation, so the
+/// **domain** work it carries with it (`into_outgoing`: decoding the attachments
+/// and measuring their *decoded* size against [`AppState::max_attachment_bytes`])
+/// happens once, for every transport.
+#[derive(Debug, Deserialize)]
+pub struct SendMessageDto {
+    /// Optional sender; defaults to the configured SMTP user.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Primary recipients (at least one is required).
+    #[serde(default)]
+    pub to: Vec<String>,
+    /// Carbon-copy recipients.
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// Blind carbon-copy recipients.
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    /// Subject line.
+    #[serde(default)]
+    pub subject: String,
+    /// Optional plain-text body.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Optional HTML body.
+    #[serde(default)]
+    pub html: Option<String>,
+    /// Attachments.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentDto>,
+}
+
+impl SendMessageDto {
+    /// Validates the request and converts it into an [`OutgoingMessage`].
+    ///
+    /// The effective sender is resolved here (to `default_from` when `from` is
+    /// absent) so downstream transports — including test fakes — always observe
+    /// the sender that will actually be used.
+    fn into_outgoing(
+        self,
+        default_from: &str,
+        limit: usize,
+    ) -> Result<OutgoingMessage, MessageError> {
+        if self.to.is_empty() {
+            return Err(MessageError::MissingRecipient);
+        }
+
+        let mut total = 0usize;
+        let mut attachments = Vec::with_capacity(self.attachments.len());
+        for attachment in self.attachments {
+            let data = STANDARD
+                .decode(attachment.data_base64.as_bytes())
+                .map_err(|_| MessageError::InvalidBase64 {
+                    filename: attachment.filename.clone(),
+                })?;
+            total = total.saturating_add(data.len());
+            attachments.push(OutgoingAttachment {
+                filename: attachment.filename,
+                content_type: attachment.content_type,
+                data,
+            });
+        }
+        if total > limit {
+            return Err(MessageError::TooLarge { total, limit });
+        }
+
+        Ok(OutgoingMessage {
+            from: Some(self.from.unwrap_or_else(|| default_from.to_string())),
+            to: self.to,
+            cc: self.cc,
+            bcc: self.bcc,
+            subject: self.subject,
+            text: self.text,
+            html: self.html,
+            attachments,
+        })
+    }
+}
+
 /// Failure of an application operation.
 ///
 /// The variant decides the stable `error` code (via [`kind`](Self::kind)) and
@@ -797,11 +915,15 @@ pub struct AttachmentResponse {
 ///
 /// Today this enum holds the variants the operations owned by this module can
 /// produce: `whoami` and `account` cannot fail, `imap_status` can only fail with
-/// `imap_unavailable`, and the seven read operations of the third migration wave
-/// add the two `SELECT`-driven `404`s, the message `404`s, the two MIME-parsing
+/// `imap_unavailable`, the seven read operations of the third migration wave add
+/// the two `SELECT`-driven `404`s, the message `404`s, the two MIME-parsing
 /// refusals and the `501` of a server that does not announce the extension an
-/// operation needs. The remaining rows of the module's error table are
-/// added, one operation at a time, as their handlers migrate.
+/// operation needs, and the send operation adds its three: the *domain*
+/// [`invalid_request`](Self::InvalidRequest) and
+/// [`payload_too_large`](Self::PayloadTooLarge) and the
+/// [`smtp_error`](Self::SmtpFailure) of a rejected delivery. The remaining rows of
+/// the module's error table are added, one operation at a time, as their handlers
+/// migrate.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ServiceError {
@@ -879,6 +1001,63 @@ pub enum ServiceError {
         #[source]
         source: ParsedMessageError,
     },
+    /// The message breaks one of the send operation's own rules (`400`,
+    /// `invalid_request`).
+    ///
+    /// **`invalid_request` has two producers, and this is the domain one.** The
+    /// transport produces its own for a request that does not speak HTTP's dialect
+    /// (a `serde` or type decoding failure) — MCP has a different dialect and
+    /// reports its own. This variant is the other half: input that was decoded
+    /// successfully but breaks a **domain** rule — no recipient, an attachment
+    /// that is not valid base64, an address that is not a mailbox — so the rule is
+    /// written once here and inherited by every transport instead of being
+    /// re-implemented by each one.
+    ///
+    /// The message is the [`MessageError`]'s own `Display` text, which **echoes
+    /// the offending field, address or attachment file name**: that is request
+    /// input (the API has always echoed it back, because it is what the caller
+    /// needs to fix the request) and never text handed back by a server.
+    #[error("{message}")]
+    InvalidRequest {
+        /// The operation's own description of the broken rule.
+        message: String,
+        /// The validation failure this response describes.
+        #[source]
+        source: MessageError,
+    },
+    /// The decoded attachments of a message exceed the configured limit (`413`,
+    /// `payload_too_large`).
+    ///
+    /// **`payload_too_large` has two producers, and this is the domain one.** The
+    /// transport produces its own for the **raw HTTP request body** exceeding
+    /// [`AppState::message_body_limit`] — a limit that exists only because an HTTP
+    /// request has a body, so an MCP call can never produce it. This variant is
+    /// the other half: the limit over the **decoded** attachment bytes, a domain
+    /// rule every transport must respect. The message names the total and the
+    /// limit, as the API has always reported them.
+    #[error("{message}")]
+    PayloadTooLarge {
+        /// The operation's own description of the exceeded limit.
+        message: String,
+        /// The refusal produced by the size guard.
+        #[source]
+        source: MessageError,
+    },
+    /// The SMTP server rejected or failed the delivery (`502`, `smtp_error`).
+    ///
+    /// Same shape as [`ImapUnavailable`](Self::ImapUnavailable): the message is
+    /// the credential-free [`SmtpError::public_message`] of the cause, so the
+    /// banner, host name or address a server hands back never reaches a caller,
+    /// and the cause itself is kept as the [`source`](std::error::Error::source)
+    /// for logs only.
+    #[error("{message}")]
+    SmtpFailure {
+        /// Credential-free, stable message of the underlying SMTP failure.
+        message: &'static str,
+        /// The SMTP failure this response describes.
+        #[source]
+        source: SmtpError,
+    },
 }
 
 impl ServiceError {
@@ -948,6 +1127,43 @@ impl ServiceError {
         }
     }
 
+    /// Maps the validation failure surface of the send operation.
+    ///
+    /// The mapping is **exhaustive and explicit** (no catch-all arm): the size
+    /// guard of the decoded attachments is the only failure that answers `413`;
+    /// every other refusal is a request that breaks a domain rule and answers
+    /// `400`. Adding a [`MessageError`] variant is therefore a compile error until
+    /// its code is chosen, so a new failure mode can never silently inherit the
+    /// wrong one.
+    ///
+    /// The message is the cause's own `Display` text, which echoes the offending
+    /// field, address or file name — the diagnostic the caller needs — and the
+    /// cause is kept as the source, for logs.
+    fn send_failure(source: MessageError) -> Self {
+        let message = source.to_string();
+        match source {
+            MessageError::TooLarge { .. } => Self::PayloadTooLarge { message, source },
+            MessageError::MissingRecipient
+            | MessageError::MissingSender
+            | MessageError::InvalidAddress { .. }
+            | MessageError::InvalidBase64 { .. }
+            | MessageError::Build(_) => Self::InvalidRequest { message, source },
+        }
+    }
+
+    /// Builds the `smtp_error` failure around the underlying [`SmtpError`].
+    ///
+    /// Both fields are derived here, in one place, so the public message — the
+    /// credential-free [`SmtpError::public_message`] — can never drift away from
+    /// the cause it describes, and no server banner, host name or address can
+    /// reach a caller through it.
+    fn smtp_failure(source: SmtpError) -> Self {
+        Self::SmtpFailure {
+            message: source.public_message(),
+            source,
+        }
+    }
+
     /// Stable, machine-filterable `error` code of the shared envelope.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -958,16 +1174,26 @@ impl ServiceError {
             Self::AttachmentNotFound => "attachment_not_found",
             Self::MessageTooLarge { .. } => "message_too_large",
             Self::MessageNotParsable { .. } => "message_not_parsable",
+            Self::InvalidRequest { .. } => "invalid_request",
+            Self::PayloadTooLarge { .. } => "payload_too_large",
+            Self::SmtpFailure { .. } => "smtp_error",
         }
     }
 
     /// Stable, credential-free description, safe to expose to a caller.
     ///
-    /// It never propagates third-party text directly: the underlying
-    /// [`ImapError::public_message`] already groups its variants into stable
-    /// families, the MIME refusals are fixed strings, and the message is fixed at
-    /// construction time.
-    pub fn public_message(&self) -> &'static str {
+    /// Nothing an upstream server or library handed back ever reaches it: the
+    /// underlying [`ImapError::public_message`] and [`SmtpError::public_message`]
+    /// already group their variants into stable families, and the MIME refusals
+    /// are fixed strings. The one **request-echoing** family is the send
+    /// operation's validation ([`InvalidRequest`](Self::InvalidRequest)), whose
+    /// message names the offending field, address or attachment — input the caller
+    /// supplied, which is what makes the refusal actionable.
+    ///
+    /// The return type is `&str` and not `&'static str` because those
+    /// request-echoing messages are built at construction time; every other
+    /// variant still borrows a `'static` message.
+    pub fn public_message(&self) -> &str {
         match self {
             Self::ImapUnavailable { message, .. } => message,
             Self::CapabilityNotSupported { message, .. } => message,
@@ -976,6 +1202,9 @@ impl ServiceError {
             Self::AttachmentNotFound => "attachment not found",
             Self::MessageTooLarge { .. } => "message exceeds the configured size limit",
             Self::MessageNotParsable { .. } => "message cannot be parsed",
+            Self::InvalidRequest { message, .. } => message,
+            Self::PayloadTooLarge { message, .. } => message,
+            Self::SmtpFailure { message, .. } => message,
         }
     }
 }
@@ -1241,6 +1470,49 @@ pub async fn attachment(
     })
 }
 
+/// Sends `dto` over the configured SMTP transport, resolving the sender when the
+/// message omits `from`.
+///
+/// This operation owns the **domain** validation of an outgoing message, which is
+/// deliberately not split across transports:
+///
+/// - the base64 attachments are decoded **here** and their **decoded** total is
+///   measured against [`AppState::max_attachment_bytes`];
+/// - every address (`from`, `to`, `cc`, `bcc`) is validated as a mailbox, and at
+///   least one primary recipient is required.
+///
+/// Decoding is not transport dialect: the same rules must hold for a caller that
+/// never produced a JSON body, so the operation applies them once and every
+/// transport inherits them. What stays in [`crate::http`] is what only an HTTP
+/// request has — its own body limit — and the `serde` decoding of that body.
+///
+/// # Errors
+///
+/// - [`ServiceError::InvalidRequest`] (`400`) when the message has no recipient,
+///   one of its addresses is not a valid mailbox, or an attachment's `data_base64`
+///   is not valid base64. **Nothing is sent.**
+/// - [`ServiceError::PayloadTooLarge`] (`413`) when the decoded attachments
+///   exceed the configured limit. **Nothing is sent.**
+/// - [`ServiceError::SmtpFailure`] (`502`) when the SMTP server rejects or fails
+///   the delivery, carrying the credential-free [`SmtpError::public_message`] of
+///   the failure and the failure itself as its `source`.
+pub async fn send_message(
+    state: &AppState,
+    dto: SendMessageDto,
+) -> Result<SentResponse, ServiceError> {
+    let message = dto
+        .into_outgoing(&state.default_from, state.max_attachment_bytes())
+        .map_err(ServiceError::send_failure)?;
+    message.validate().map_err(ServiceError::send_failure)?;
+    state
+        .mailer
+        .send(message)
+        .await
+        .map_err(ServiceError::smtp_failure)?;
+
+    Ok(SentResponse { status: "sent" })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,7 +1609,7 @@ mod tests {
         let error =
             ServiceError::imap_unavailable(ImapError::Login("attacker-controlled".to_string()));
 
-        let message: &'static str = error.public_message();
+        let message: &str = error.public_message();
         assert_eq!(message, "IMAP authentication or command failed");
     }
 
@@ -1350,7 +1622,7 @@ mod tests {
         let error = ServiceError::capability_not_supported(ImapError::CapabilityNotSupported);
 
         assert_eq!(error.kind(), "capability_not_supported");
-        let message: &'static str = error.public_message();
+        let message: &str = error.public_message();
         assert_eq!(message, "the server does not support this operation");
         assert_eq!(
             error.to_string(),

@@ -68,17 +68,28 @@
 //! ```
 //!
 //! `to` is required (at least one address) and `from` defaults to the configured
-//! SMTP user. Attachment content is base64-encoded and is decoded **here**, at
-//! the HTTP boundary; the total **decoded** size must not exceed
-//! `APIMAIL_MAX_ATTACHMENT_BYTES`. Every address is validated as a mailbox. On
-//! success the route returns HTTP `200`, `Content-Type: application/json` and
-//! `{"status":"sent"}`. Failures use the `{"error":...,"message":...}` pattern:
+//! SMTP user. Attachment content is base64-encoded and is decoded by the
+//! operation that sends it ([`crate::service::send_message`]), not at the HTTP
+//! boundary: the total **decoded** size is what must not exceed
+//! `APIMAIL_MAX_ATTACHMENT_BYTES`, and that rule has to hold for every transport.
+//! Every address is validated as a mailbox. On success the route returns HTTP
+//! `200`, `Content-Type: application/json` and `{"status":"sent"}`. Failures use
+//! the `{"error":...,"message":...}` pattern:
 //!
 //! - `400` (`invalid_request`) — malformed JSON, missing recipients, invalid
 //!   address or invalid base64.
 //! - `413` (`payload_too_large`) — the raw request body exceeds the per-route
 //!   body limit, or the decoded attachments exceed the attachment limit.
 //! - `502` (`smtp_error`) — the SMTP server rejects or fails the delivery.
+//!
+//! The `413` has **two producers and they are not interchangeable**: the *raw
+//! body* limit below is the transport's, and the limit over the *decoded*
+//! attachments is the service's ([`crate::service::ServiceError::PayloadTooLarge`]),
+//! rendered with the very same envelope. The same is true of the `400`: a body
+//! that is not JSON at all is the transport's, while a decoded body that breaks a
+//! domain rule (no recipient, an address that is not a mailbox, invalid base64)
+//! is the service's ([`crate::service::ServiceError::InvalidRequest`]). Both are
+//! documented in the error table of [`crate::service`].
 //!
 //! The per-route body limit is **not** enforced by axum's `DefaultBodyLimit`
 //! (which would answer with a plain-text `413`): the route disables it and the
@@ -87,7 +98,8 @@
 //! JSON error envelope. The body limit is
 //! `max_attachment_bytes * 4 / 3 + BODY_LIMIT_SLACK` (base64 expansion plus a
 //! small, documented slack for the rest of the JSON); the authoritative
-//! *decoded* check is still [`AppState::max_attachment_bytes`].
+//! *decoded* check is still [`AppState::max_attachment_bytes`], owned by the
+//! service operation.
 //!
 //! Requests for unknown routes still return `404`, and requests using an
 //! unhandled method (for example `POST /api/health`) still return `405`; the
@@ -313,14 +325,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::idle::{IdleError, IdleStatus};
 use crate::imap::{FetchFormat, ImapError, MailboxStatus, SearchCriteria, SearchDate, SystemFlag};
 use crate::queue::QueueStats;
-use crate::smtp::{MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage};
 
 // The application state and its construction error belong to the service layer
 // (`crate::service`); the re-export keeps the historical `crate::http::AppState`
@@ -337,13 +346,6 @@ pub struct HealthResponse {
     pub name: &'static str,
     /// Application version.
     pub version: &'static str,
-}
-
-/// JSON payload returned by a successful `POST /api/messages`.
-#[derive(Debug, Serialize)]
-struct SentResponse {
-    /// Always `sent`: reached only after the transport accepted the message.
-    status: &'static str,
 }
 
 /// JSON payload returned by a failing `GET /api/imap/status`.
@@ -899,94 +901,6 @@ impl From<ImapError> for MessageError {
     }
 }
 
-/// One attachment of the `POST /api/messages` request body.
-#[derive(Debug, Deserialize)]
-struct AttachmentDto {
-    /// File name presented to the recipient.
-    filename: String,
-    /// Optional MIME content type.
-    #[serde(default)]
-    content_type: Option<String>,
-    /// Attachment content, base64-encoded.
-    data_base64: String,
-}
-
-/// `POST /api/messages` request body.
-#[derive(Debug, Deserialize)]
-struct SendMessageDto {
-    /// Optional sender; defaults to the configured SMTP user.
-    #[serde(default)]
-    from: Option<String>,
-    /// Primary recipients (at least one is required).
-    #[serde(default)]
-    to: Vec<String>,
-    /// Carbon-copy recipients.
-    #[serde(default)]
-    cc: Vec<String>,
-    /// Blind carbon-copy recipients.
-    #[serde(default)]
-    bcc: Vec<String>,
-    /// Subject line.
-    #[serde(default)]
-    subject: String,
-    /// Optional plain-text body.
-    #[serde(default)]
-    text: Option<String>,
-    /// Optional HTML body.
-    #[serde(default)]
-    html: Option<String>,
-    /// Attachments.
-    #[serde(default)]
-    attachments: Vec<AttachmentDto>,
-}
-
-impl SendMessageDto {
-    /// Validates the request and converts it into an [`OutgoingMessage`].
-    ///
-    /// The effective sender is resolved here (to `default_from` when `from` is
-    /// absent) so downstream transports — including test fakes — always observe
-    /// the sender that will actually be used.
-    fn into_outgoing(
-        self,
-        default_from: &str,
-        limit: usize,
-    ) -> Result<OutgoingMessage, SmtpMessageError> {
-        if self.to.is_empty() {
-            return Err(SmtpMessageError::MissingRecipient);
-        }
-
-        let mut total = 0usize;
-        let mut attachments = Vec::with_capacity(self.attachments.len());
-        for attachment in self.attachments {
-            let data = STANDARD
-                .decode(attachment.data_base64.as_bytes())
-                .map_err(|_| SmtpMessageError::InvalidBase64 {
-                    filename: attachment.filename.clone(),
-                })?;
-            total = total.saturating_add(data.len());
-            attachments.push(OutgoingAttachment {
-                filename: attachment.filename,
-                content_type: attachment.content_type,
-                data,
-            });
-        }
-        if total > limit {
-            return Err(SmtpMessageError::TooLarge { total, limit });
-        }
-
-        Ok(OutgoingMessage {
-            from: Some(self.from.unwrap_or_else(|| default_from.to_string())),
-            to: self.to,
-            cc: self.cc,
-            bcc: self.bcc,
-            subject: self.subject,
-            text: self.text,
-            html: self.html,
-            attachments,
-        })
-    }
-}
-
 /// JSON body serialised for a `POST /api/messages` failure.
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
@@ -997,15 +911,28 @@ struct ErrorResponse {
 }
 
 /// Failure modes of `POST /api/messages`, mapped to the documented statuses.
+///
+/// The transport owns two of them — the `413` of the **raw HTTP request body**
+/// and the `400` of a body that is not a [`SendMessageDto`](service::SendMessageDto)
+/// at all — plus the wrapper ([`Domain`](Self::Domain)) around the
+/// [`ServiceError`] of the operation, which is rendered by the shared
+/// `IntoResponse` implementation of the service layer instead of a second
+/// envelope built here.
+///
+/// The other failures of the route — an unparsable payload that breaks a domain
+/// rule (`400`), the **decoded** attachments exceeding their limit (`413`) and a
+/// failed delivery (`502`) — are the service's, and travel here as a
+/// [`Domain`](Self::Domain) value: the transport never decides their status, nor
+/// rewrites their message.
 #[derive(Debug)]
 enum SendError {
-    /// Invalid request payload (`400`).
+    /// The body is not a decodable `SendMessageDto` (`400`).
     InvalidRequest(String),
-    /// The request is too large — the raw body or the decoded attachments exceed
-    /// the configured limit (`413`).
+    /// The raw request body exceeds the per-route body limit (`413`); the decoded
+    /// attachments have their own `413`, owned by the service.
     PayloadTooLarge(String),
-    /// The SMTP transport failed (`502`).
-    Smtp(String),
+    /// A domain failure of the operation, rendered by the service layer.
+    Domain(ServiceError),
 }
 
 impl IntoResponse for SendError {
@@ -1015,20 +942,20 @@ impl IntoResponse for SendError {
             Self::PayloadTooLarge(message) => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
             }
-            Self::Smtp(message) => (StatusCode::BAD_GATEWAY, "smtp_error", message),
+            // One single rendering of a domain failure: the shared envelope of the
+            // service layer, never a second copy of it.
+            Self::Domain(error) => return error.into_response(),
         };
         (status, Json(ErrorResponse { error, message })).into_response()
     }
 }
 
-/// Single point of truth mapping a validation failure to its HTTP status: an
-/// oversized attachment is `413`, anything else is a `400`.
-impl From<SmtpMessageError> for SendError {
-    fn from(error: SmtpMessageError) -> Self {
-        match error {
-            SmtpMessageError::TooLarge { .. } => Self::PayloadTooLarge(error.to_string()),
-            other => Self::InvalidRequest(other.to_string()),
-        }
+/// Maps a [`ServiceError`] into the send route's failure model: the domain failure
+/// travels untouched and is rendered by the service layer, so the thin handler
+/// only has to propagate it with `?`.
+impl From<ServiceError> for SendError {
+    fn from(error: ServiceError) -> Self {
+        Self::Domain(error)
     }
 }
 
@@ -1051,6 +978,9 @@ fn status_for(error: &ServiceError) -> StatusCode {
         | ServiceError::AttachmentNotFound => StatusCode::NOT_FOUND,
         ServiceError::MessageTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         ServiceError::MessageNotParsable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        ServiceError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
+        ServiceError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        ServiceError::SmtpFailure { .. } => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -1395,12 +1325,22 @@ fn parse_body_destination(body: &[u8]) -> Result<String, MessageError> {
     parse_destination(dto.to)
 }
 
-/// `POST /api/messages` handler: reads the body, validates it, then sends it.
+/// `POST /api/messages` handler: reads and decodes the body, then sends it.
+///
+/// A **thin wrapper** over [`service::send_message`], which owns every rule of an
+/// outgoing message (recipients, addresses, base64 attachments and their decoded
+/// size) so a second transport inherits them instead of re-implementing them.
+/// What stays here is exactly what only an HTTP request has: its own body and the
+/// `serde` dialect of that body.
 ///
 /// The route disables axum's `DefaultBodyLimit`; the body is read here with
 /// [`to_bytes`] against [`AppState::message_body_limit`] so that exceeding the
 /// limit is answered with the shared JSON envelope (`413 payload_too_large`)
-/// rather than axum's plain-text rejection. A malformed JSON body is a `400`.
+/// rather than axum's plain-text rejection — that limit exists only because an
+/// HTTP request *has* a body, which is why it is the transport's `413` and not
+/// the service's. A body that is not a
+/// [`SendMessageDto`](service::SendMessageDto) is likewise the transport's `400`.
+/// The `200` body is the operation's own [`service::SentResponse`].
 async fn send_message(
     State(state): State<AppState>,
     request: Request,
@@ -1411,18 +1351,14 @@ async fn send_message(
             SendError::PayloadTooLarge(format!("request body exceeds the limit: {error}"))
         })?;
 
-    let dto: SendMessageDto = serde_json::from_slice(&body)
+    let dto: service::SendMessageDto = serde_json::from_slice(&body)
         .map_err(|error| SendError::InvalidRequest(error.to_string()))?;
 
-    let message = dto.into_outgoing(&state.default_from, state.max_attachment_bytes())?;
-    message.validate()?;
-    state
-        .mailer
-        .send(message)
-        .await
-        .map_err(|error| SendError::Smtp(error.public_message().to_string()))?;
-
-    Ok((StatusCode::OK, Json(SentResponse { status: "sent" })).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(service::send_message(&state, dto).await?),
+    )
+        .into_response())
 }
 
 /// Failure mode of the IDLE control routes.
