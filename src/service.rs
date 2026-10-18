@@ -18,13 +18,17 @@
 //! `whoami`, `account`, `imap_status`, `list_mailboxes`, the mailbox selection
 //! (`select_mailbox`), all four IDLE routes (`idle_status`, `idle_queue`,
 //! `idle_start`, `idle_stop`), the five message reads (`list_messages`,
-//! `fetch_message`, `message_body`, `list_attachments`, `attachment`), three of
-//! the four message mutations (`update_flags`, `move_message`, `copy_message`)
-//! and the first **write** operation, `send_message` — which brought its request
-//! DTO ([`SendMessageDto`]) with it, because decoding and validating an outgoing
-//! message is domain work, not HTTP work. Only `DELETE /api/messages/{uid}`
-//! (`delete_message`) still holds its own logic and its own per-route error type
-//! in [`crate::http`].
+//! `fetch_message`, `message_body`, `list_attachments`, `attachment`), the four
+//! message mutations (`update_flags`, `move_message`, `copy_message`,
+//! `delete_message`) and the first **write** operation, `send_message` — which
+//! brought its request DTO ([`SendMessageDto`]) with it, because decoding and
+//! validating an outgoing message is domain work, not HTTP work.
+//!
+//! **§2 of the migration plan (the service layer) has nothing left in
+//! [`crate::http`]**: every handler of that section is now a thin wrapper over an
+//! operation of this module, and the only logic that stays in the transport is
+//! what only an HTTP request has — its own dialect (a malformed `uid`, query
+//! string or body) and its raw body limit.
 //!
 //! # Published HTTP error table
 //!
@@ -870,6 +874,21 @@ pub struct MoveCopyResponse {
     pub status: &'static str,
 }
 
+/// JSON payload returned by a successful `DELETE /api/messages/{uid}`.
+///
+/// The type moved here with its operation, so the output schema is owned by the
+/// layer that produces it. The field order is the declaration order, which is the
+/// serialisation order of the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct DeleteResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// Always `deleted`.
+    pub status: &'static str,
+}
+
 /// JSON payload returned by a successful send.
 #[derive(Debug, Serialize)]
 pub struct SentResponse {
@@ -1006,9 +1025,13 @@ impl SendMessageDto {
 /// and the IDLE control routes add two more: the **[`invalid_request`]** a flag
 /// update cannot be rendered as ([`InvalidFlags`](Self::InvalidFlags)) and the
 /// **[`idle_not_configured`]** of a `start` with no configured webhook
-/// ([`IdleNotConfigured`](Self::IdleNotConfigured)). The remaining row of the
-/// module's error table is added, one operation at a time, as its handler
-/// migrates.
+/// ([`IdleNotConfigured`](Self::IdleNotConfigured)). The last row of the
+/// module's error table — `delete_message`, whose `capability_not_supported`
+/// (`501`) comes from a missing `UIDPLUS` — added no variant: the four failures
+/// the operation can produce (`mailbox_not_found`, `message_not_found`,
+/// `capability_not_supported` and `imap_unavailable`) were already produced by
+/// the operations migrated before it, and its handler mapped them with
+/// `message_failure` unchanged.
 ///
 /// [`invalid_request`]: Self::InvalidRequest
 /// [`idle_not_configured`]: Self::IdleNotConfigured
@@ -1763,6 +1786,42 @@ pub async fn copy_message(
         uid,
         to,
         status: "copied",
+    })
+}
+
+/// Deletes the single message `uid` of `mailbox`.
+///
+/// This operation is **irreversible**: it does not move the message to a trash
+/// mailbox, it purges it. `UIDPLUS` is therefore required, so that `UID EXPUNGE`
+/// removes only the addressed message and the operation **never** falls back to a
+/// global `EXPUNGE` — which would destroy every message flagged `\Deleted` in the
+/// mailbox, including ones this operation never touched. When the server does not
+/// announce the extension the operation fails with a `501` and **sends no
+/// command at all**.
+///
+/// # Errors
+///
+/// - [`ServiceError::MailboxNotFound`] (`404`) when the server answers `NO` for
+///   the mailbox.
+/// - [`ServiceError::MessageNotFound`] (`404`) when the mailbox holds no message
+///   with that `uid`; **nothing is stored or expunged.**
+/// - [`ServiceError::CapabilityNotSupported`] (`501`) when the server does not
+///   announce `UIDPLUS`; **no command is sent.**
+/// - [`ServiceError::ImapUnavailable`] (`503`) for every other session failure.
+pub async fn delete_message(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+) -> Result<DeleteResponse, ServiceError> {
+    state
+        .imap
+        .delete_message(&mailbox, uid)
+        .await
+        .map_err(ServiceError::message_failure)?;
+    Ok(DeleteResponse {
+        mailbox,
+        uid,
+        status: "deleted",
     })
 }
 

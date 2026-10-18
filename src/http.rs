@@ -149,8 +149,8 @@
 //!   `mailbox`.
 //! - `404` (`mailbox_not_found`) — the server answered `NO` for the mailbox.
 //! - `503` (`imap_unavailable`) — the session or server is unavailable; the
-//!   message is the stable [`ImapError::public_message`] and never
-//!   [`Display`](std::fmt::Display) text from a third party.
+//!   message is the stable [`public_message`](crate::imap::ImapError::public_message)
+//!   and never [`Display`](std::fmt::Display) text from a third party.
 //! - `401` (`unauthorized`) — missing or invalid API key.
 //!
 //! # Message reading contract
@@ -328,7 +328,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::idle::IdleStatus;
-use crate::imap::{FetchFormat, ImapError, SearchCriteria, SearchDate, SystemFlag};
+use crate::imap::{FetchFormat, SearchCriteria, SearchDate, SystemFlag};
 use crate::queue::QueueStats;
 
 // The application state and its construction error belong to the service layer
@@ -729,17 +729,6 @@ fn parse_destination(value: String) -> Result<String, MessageError> {
     Ok(trimmed.to_string())
 }
 
-/// JSON payload returned by a successful `DELETE /api/messages/{uid}`.
-#[derive(Debug, Serialize)]
-struct DeleteResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Always `deleted`.
-    status: &'static str,
-}
-
 /// Decodes a raw query string into `T`, mapping a failure to `invalid_request`.
 fn parse_raw_query<T>(raw: Option<String>) -> Result<T, MessageError>
 where
@@ -754,30 +743,23 @@ where
 
 /// Failure modes of the message routes, mapped to the documented statuses.
 ///
-/// The transport owns two of them: the `400` of a request that does not speak
-/// HTTP's dialect (a malformed `uid`, query string or body), and the wrapper
-/// ([`Domain`](Self::Domain)) around a [`ServiceError`] of a migrated operation,
-/// which is rendered by the shared `IntoResponse` implementation of the service
-/// layer instead of a second envelope built here.
+/// The transport owns one of them — the `400` of a request that does not speak
+/// HTTP's dialect (a malformed `uid`, query string or body) — plus the wrapper
+/// ([`Domain`](Self::Domain)) around a [`ServiceError`] of the operation behind
+/// each handler, which is rendered by the shared `IntoResponse` implementation of
+/// the service layer instead of a second envelope built here.
 ///
-/// The domain variants still carried here — `mailbox_not_found`,
-/// `message_not_found`, `capability_not_supported` and `imap_unavailable` — belong
-/// to `DELETE /api/messages/{uid}`, the **only** mutation route that has not
-/// migrated yet; they disappear with its last producer.
+/// Every domain failure of a message route — the two `404`s, the `501` of a
+/// missing extension and the `503` — travels here as a [`Domain`](Self::Domain)
+/// value: the transport never decides their status, nor rewrites their message.
+/// The per-route variants that used to carry them disappeared with the last
+/// producer, `DELETE /api/messages/{uid}`.
 #[derive(Debug)]
 enum MessageError {
     /// The request is malformed (`400`).
     InvalidRequest(String),
-    /// A domain failure of a migrated operation, rendered by the service layer.
+    /// A domain failure of an operation, rendered by the service layer.
     Domain(ServiceError),
-    /// The server answered `NO`: the mailbox does not exist (`404`).
-    MailboxNotFound,
-    /// The requested message does not exist (`404`).
-    MessageNotFound,
-    /// The server does not announce the extension the operation needs (`501`).
-    CapabilityNotSupported(String),
-    /// The IMAP session or server is unavailable (`503`).
-    Unavailable(String),
 }
 
 impl IntoResponse for MessageError {
@@ -787,58 +769,17 @@ impl IntoResponse for MessageError {
             // One single rendering of a domain failure: the shared envelope of the
             // service layer, never a second copy of it.
             Self::Domain(error) => return error.into_response(),
-            Self::MailboxNotFound => (
-                StatusCode::NOT_FOUND,
-                "mailbox_not_found",
-                "mailbox not found".to_string(),
-            ),
-            Self::MessageNotFound => (
-                StatusCode::NOT_FOUND,
-                "message_not_found",
-                "message not found".to_string(),
-            ),
-            Self::CapabilityNotSupported(message) => (
-                StatusCode::NOT_IMPLEMENTED,
-                "capability_not_supported",
-                message,
-            ),
-            Self::Unavailable(message) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "imap_unavailable", message)
-            }
         };
         (status, Json(ErrorResponse { error, message })).into_response()
     }
 }
 
 /// Maps a [`ServiceError`] into the transport's failure model: the domain failure
-/// travels untouched and is rendered by the service layer, so a migrated handler
+/// travels untouched and is rendered by the service layer, so a thin handler
 /// only has to propagate it with `?`.
 impl From<ServiceError> for MessageError {
     fn from(error: ServiceError) -> Self {
         Self::Domain(error)
-    }
-}
-
-/// Maps an [`ImapError`] to the message routes' failure model.
-///
-/// Missing mailboxes and messages become `404`, a missing extension becomes
-/// `501` and every other failure becomes `503`, always carrying the stable,
-/// credential-free [`ImapError::public_message`]. This mapping is the one the
-/// **unmigrated** mutation routes still use — including the `InvalidFlags`
-/// mapping, which the transport already rejects before composing a `STORE` and
-/// which is therefore kept verbatim rather than reinterpreted; the migrated read
-/// routes map their own failures inside the service operations.
-impl From<ImapError> for MessageError {
-    fn from(error: ImapError) -> Self {
-        match &error {
-            ImapError::MailboxNotFound => Self::MailboxNotFound,
-            ImapError::MessageNotFound => Self::MessageNotFound,
-            ImapError::InvalidFlags => Self::InvalidRequest("invalid flags".to_string()),
-            ImapError::CapabilityNotSupported => {
-                Self::CapabilityNotSupported(error.public_message().to_string())
-            }
-            other => Self::Unavailable(other.public_message().to_string()),
-        }
     }
 }
 
@@ -1225,7 +1166,14 @@ async fn copy_message(
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `DELETE /api/messages/{uid}` handler: deletes a single message.
+/// `DELETE /api/messages/{uid}` handler: thin wrapper over
+/// [`crate::service::delete_message`].
+///
+/// The `uid` and the `mailbox` are validated here (shared JSON `400` envelope);
+/// the deletion itself — the purge the operation owns, which requires `UIDPLUS`
+/// and never falls back to a global `EXPUNGE` — and its domain outcomes (the two
+/// `404`s, the `501` of a server that does not announce the extension and the
+/// `503`) belong to the operation.
 async fn delete_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1234,16 +1182,8 @@ async fn delete_message(
     let uid = parse_uid(&uid)?;
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
 
-    state.imap.delete_message(&mailbox, uid).await?;
-    Ok((
-        StatusCode::OK,
-        Json(DeleteResponse {
-            mailbox,
-            uid,
-            status: "deleted",
-        }),
-    )
-        .into_response())
+    let response = service::delete_message(&state, mailbox, uid).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
 /// Parses the required `to` field of a move/copy body and validates it.
@@ -1428,6 +1368,7 @@ pub fn build_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imap::ImapError;
     use crate::smtp::SmtpError;
 
     #[test]

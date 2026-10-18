@@ -960,6 +960,7 @@ async fn deleting_with_uidplus_marks_deleted_then_expunges() {
 async fn deleting_without_uidplus_is_501_without_sending_an_expunge() {
     let connector =
         FakeConnector::new(ConnectOutcome::Session).with_messages(vec![message(42, &["\\Seen"])]);
+    let ops = Arc::clone(&connector.ops);
     let stores = Arc::clone(&connector.stores);
     let expunges = Arc::clone(&connector.expunges);
     let app = app_with(connector);
@@ -983,6 +984,10 @@ async fn deleting_without_uidplus_is_501_without_sending_an_expunge() {
         "no EXPUNGE (global or targeted) must be sent"
     );
     assert!(stores.lock().expect("stores log poisoned").is_empty());
+    assert!(
+        ops.lock().expect("ops log poisoned").is_empty(),
+        "a delete that purges the message must not send a single command"
+    );
 }
 
 #[tokio::test]
