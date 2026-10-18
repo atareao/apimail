@@ -897,6 +897,7 @@ pub struct AttachmentResponse {
 /// order, which is the serialisation order of the published body, so it is part
 /// of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct FlagUpdateResponse {
     /// Selected mailbox name.
     pub mailbox: String,
@@ -912,6 +913,7 @@ pub struct FlagUpdateResponse {
 /// layer that produces it. The field order is the declaration order, which is the
 /// serialisation order of the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MoveCopyResponse {
     /// Selected (source) mailbox name.
     pub mailbox: String,
@@ -929,6 +931,7 @@ pub struct MoveCopyResponse {
 /// layer that produces it. The field order is the declaration order, which is the
 /// serialisation order of the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct DeleteResponse {
     /// Selected mailbox name.
     pub mailbox: String,
@@ -940,6 +943,7 @@ pub struct DeleteResponse {
 
 /// JSON payload returned by a successful send.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct SentResponse {
     /// Always `sent`: reached only after the transport accepted the message.
     pub status: &'static str,
@@ -951,6 +955,7 @@ pub struct SentResponse {
 /// route decodes a JSON body into it, and a second transport (MCP) fills it in
 /// from its own input schema.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AttachmentDto {
     /// File name presented to the recipient.
     pub filename: String,
@@ -968,6 +973,7 @@ pub struct AttachmentDto {
 /// and measuring their *decoded* size against [`AppState::max_attachment_bytes`])
 /// happens once, for every transport.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct SendMessageDto {
     /// Optional sender; defaults to the configured SMTP user.
     #[serde(default)]

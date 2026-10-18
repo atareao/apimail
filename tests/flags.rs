@@ -1372,3 +1372,342 @@ async fn without_an_api_key_every_operation_is_401() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// MCP write tools (§7)
+// ---------------------------------------------------------------------------
+
+/// The MCP **write** tools, driven in process against the very same
+/// [`FakeConnector`] the HTTP tests above use.
+///
+/// Reusing the double is the point: the `stores`/`copies`/`moves`/`expunges`
+/// logs it already records are what proves a tool reaches the *same* IMAP
+/// command sequence as its route, and — for `delete_message` — that the purge
+/// really is a purge: a `\Deleted` mark followed by a targeted `EXPUNGE`, with no
+/// `COPY` or `MOVE` placing a copy in a trash mailbox.
+///
+/// Each call runs over the real transport (`rmcp` over an in-memory pipe), not
+/// against the handler directly, so the tool router, the derived argument schema
+/// and the rendering of a failure are all exercised. The module is gated on the
+/// `mcp` feature, so the default test run compiles none of it.
+#[cfg(feature = "mcp")]
+mod mcp_write {
+    use std::time::{Duration, Instant};
+
+    use apimail::ApimailMcp;
+    use rmcp::ServiceExt;
+    use tokio::io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt,
+        BufReader as AsyncBufReader, Lines,
+    };
+
+    use super::*;
+
+    /// How long a test waits for a reply before failing, so a wedged transport
+    /// fails the test instead of hanging the suite.
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The protocol revision the test client asks for, as in
+    /// `tests/mcp_server.rs`.
+    const PROTOCOL_VERSION: &str = "2026-07-28";
+
+    /// A [`MailSender`] that counts the messages it accepts and never fails.
+    struct CountingMailer {
+        /// Number of messages handed to SMTP.
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl MailSender for CountingMailer {
+        fn send(&self, _message: OutgoingMessage) -> MailSendFuture<'_> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// Builds the application state with both services injected, so nothing in
+    /// this module touches the network.
+    fn state_with(mailer: Arc<dyn MailSender>, connector: FakeConnector) -> AppState {
+        AppState::with_services(&config(), mailer, Arc::new(connector))
+            .expect("building the app state must not touch the network")
+    }
+
+    /// Writes one newline-delimited JSON-RPC message.
+    async fn write<W>(writer: &mut W, message: &Value)
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut line = message.to_string();
+        line.push('\n');
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .expect("the request should be written to the server");
+        writer
+            .flush()
+            .await
+            .expect("the request should reach the server");
+    }
+
+    /// Reads messages until the reply to `id` arrives, skipping notifications.
+    async fn reply<R>(lines: &mut Lines<R>, id: i64) -> Value
+    where
+        R: AsyncRead + AsyncBufRead + Unpin,
+    {
+        let deadline = Instant::now() + REPLY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = tokio::time::timeout(remaining, lines.next_line())
+                .await
+                .expect("timed out waiting for a reply from the MCP server")
+                .expect("failed to read from the MCP server")
+                .expect("the MCP server closed the stream before answering");
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value =
+                serde_json::from_str(&line).expect("the stream should carry JSON-RPC");
+            if value["id"] == json!(id) {
+                return value;
+            }
+        }
+    }
+
+    /// Drives one `tools/call` over a fresh in-process MCP session and returns
+    /// the tool result (`isError`, `content`, `structuredContent`).
+    async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Value {
+        let (server_end, client_end) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_end);
+        let server = tokio::spawn({
+            let state = state.clone();
+            async move {
+                // The `RunningService` must be held for the whole session: dropping
+                // it cancels the server, which would close the pipe mid-flight.
+                if let Ok(running) = ApimailMcp::new(state)
+                    .serve((server_read, server_write))
+                    .await
+                {
+                    let _ = running.waiting().await;
+                }
+            }
+        });
+
+        let (client_read, mut client_write) = tokio::io::split(client_end);
+        let mut lines = AsyncBufReader::new(client_read).lines();
+
+        // The lifecycle a real client drives: initialize, acknowledge, call.
+        write(
+            &mut client_write,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "flags-tests", "version": "0.1.0" },
+                },
+            }),
+        )
+        .await;
+        let _ = reply(&mut lines, 1).await;
+        write(
+            &mut client_write,
+            &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await;
+
+        write(
+            &mut client_write,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }),
+        )
+        .await;
+        let answer = reply(&mut lines, 2).await;
+
+        drop(client_write);
+        drop(lines);
+        let _ = tokio::time::timeout(REPLY_TIMEOUT, server).await;
+
+        answer["result"].clone()
+    }
+
+    /// Asserts `result` is a tool error and returns the `"{kind}: {message}"` it
+    /// carries, which must be the stable code of the operation.
+    fn tool_error_text(result: &Value) -> String {
+        assert_eq!(
+            result["isError"],
+            json!(true),
+            "expected a tool error, got: {result}"
+        );
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a tool error should carry text: {result}"))
+            .to_string()
+    }
+
+    /// Asserts `result` is a success and returns its structured content.
+    fn structured(result: &Value) -> &Value {
+        assert_ne!(
+            result["isError"],
+            json!(true),
+            "the tool reported a failure: {result}"
+        );
+        result.get("structuredContent").unwrap_or_else(|| {
+            panic!("a successful call should carry structured content: {result}")
+        })
+    }
+
+    #[tokio::test]
+    async fn mcp_update_flags_sends_only_the_named_flag() {
+        let connector = FakeConnector::new(ConnectOutcome::Session)
+            .with_messages(vec![message(42, &["\\Seen"])]);
+        let stores = Arc::clone(&connector.stores);
+        let state = state_with(Arc::new(NoopMailer), connector);
+
+        let result = call_tool(
+            &state,
+            "update_flags",
+            json!({ "mailbox": "INBOX", "uid": 42, "add": ["\\Flagged"] }),
+        )
+        .await;
+
+        let content = structured(&result);
+        assert_eq!(content["mailbox"], "INBOX");
+        assert_eq!(content["uid"], json!(42));
+        assert_eq!(content["flags"], json!(["\\Seen"]));
+        assert_eq!(
+            stores.lock().expect("stores log poisoned").as_slice(),
+            ["+FLAGS.SILENT (\\Flagged)"],
+            "the STORE must name exactly the flag the call named, and nothing else"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_delete_message_purges_and_leaves_no_copy_in_a_trash_mailbox() {
+        let connector = FakeConnector::new(ConnectOutcome::Session)
+            .with_capabilities(Capabilities {
+                has_move: false,
+                has_uidplus: true,
+            })
+            .with_messages(vec![message(42, &["\\Seen"])]);
+        let ops = Arc::clone(&connector.ops);
+        let copies = Arc::clone(&connector.copies);
+        let moves = Arc::clone(&connector.moves);
+        let state = state_with(Arc::new(NoopMailer), connector);
+
+        let result = call_tool(
+            &state,
+            "delete_message",
+            json!({ "mailbox": "INBOX", "uid": 42 }),
+        )
+        .await;
+
+        assert_eq!(structured(&result)["status"], "deleted");
+        assert_eq!(
+            ops.lock().expect("ops log poisoned").as_slice(),
+            ["store 42 +FLAGS.SILENT (\\Deleted)", "expunge 42"],
+            "the deletion must mark the message and then target it with UID EXPUNGE"
+        );
+        assert!(
+            copies.lock().expect("copies log poisoned").is_empty(),
+            "a purge must not COPY the message anywhere — there is no Trash mailbox to file it in"
+        );
+        assert!(
+            moves.lock().expect("moves log poisoned").is_empty(),
+            "a purge must not MOVE the message to a Trash mailbox either"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_delete_message_without_uidplus_is_501_and_sends_no_command() {
+        let connector = FakeConnector::new(ConnectOutcome::Session)
+            .with_messages(vec![message(42, &["\\Seen"])]);
+        let ops = Arc::clone(&connector.ops);
+        let expunges = Arc::clone(&connector.expunges);
+        let state = state_with(Arc::new(NoopMailer), connector);
+
+        let result = call_tool(
+            &state,
+            "delete_message",
+            json!({ "mailbox": "INBOX", "uid": 42 }),
+        )
+        .await;
+
+        assert!(
+            tool_error_text(&result).starts_with("capability_not_supported:"),
+            "the stable code of a server without UIDPLUS must survive: {result}"
+        );
+        assert!(
+            ops.lock().expect("ops log poisoned").is_empty(),
+            "no command — and no global EXPUNGE — may be sent"
+        );
+        assert!(expunges.lock().expect("expunges log poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_move_message_without_a_destination_is_invalid_request() {
+        let connector = FakeConnector::new(ConnectOutcome::Session)
+            .with_messages(vec![message(42, &["\\Seen"])]);
+        let connects = Arc::clone(&connector.connects);
+        let state = state_with(Arc::new(NoopMailer), connector);
+
+        let result = call_tool(
+            &state,
+            "move_message",
+            json!({ "mailbox": "INBOX", "uid": 42 }),
+        )
+        .await;
+
+        assert!(
+            tool_error_text(&result).starts_with("invalid_request:"),
+            "a missing destination is a request the tool rejects: {result}"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            0,
+            "a rejected request must not open a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_send_message_needs_a_recipient_and_reaches_smtp_when_it_has_one() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mailer = Arc::new(CountingMailer {
+            sends: Arc::clone(&sends),
+        });
+        let state = state_with(mailer, FakeConnector::new(ConnectOutcome::Session));
+
+        let rejected = call_tool(
+            &state,
+            "send_message",
+            json!({ "to": [], "subject": "no recipient" }),
+        )
+        .await;
+        assert!(
+            tool_error_text(&rejected).starts_with("invalid_request:"),
+            "a message with no recipient must be rejected: {rejected}"
+        );
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "a rejected message must not reach SMTP"
+        );
+
+        let accepted = call_tool(
+            &state,
+            "send_message",
+            json!({
+                "to": ["dest@test.example"],
+                "subject": "hello",
+                "text": "body",
+            }),
+        )
+        .await;
+        assert_eq!(structured(&accepted)["status"], "sent");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+}

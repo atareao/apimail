@@ -6,12 +6,22 @@
 //!
 //! # Tool surface
 //!
-//! The server exposes the account's **read** operations plus `whoami`: twelve
-//! tools in total. Every one of them is a thin `#[tool]` method that delegates to
-//! the very same [`service`] operation its HTTP route calls and owns no business
-//! logic at all — what belongs to this transport is only the dialect of its
-//! arguments (which value is optional, how a date or a format is spelled, where a
-//! page size is bounded) and the rendering of a failure.
+//! The server exposes the account's **read** operations plus `whoami` (twelve
+//! tools) and its **write** operations (five more): seventeen in total. Every one
+//! of them is a thin `#[tool]` method that delegates to the very same [`service`]
+//! operation its HTTP route calls and owns no business logic at all — what belongs
+//! to this transport is only the dialect of its arguments (which value is
+//! optional, how a date or a format is spelled, where a page size is bounded) and
+//! the rendering of a failure.
+//!
+//! The five write tools — `send_message`, `update_flags`, `move_message`,
+//! `copy_message` and `delete_message` — reach the same domain rules the HTTP
+//! routes do, so nothing a caller can do over MCP is more (or less) permissive
+//! than over HTTP. Because an agent chooses what to call from the tool's own
+//! documentation, each of them **states its destructive semantics** in its
+//! description: `delete_message` purges the message instead of moving it to a
+//! trash mailbox, `move_message` requires an explicit destination, `update_flags`
+//! changes only the flags it names and `send_message` requires a recipient.
 //!
 //! The two administrative operations behind `POST /api/idle/start` and
 //! `POST /api/idle/stop` are deliberately **not** exposed: an MCP client may
@@ -65,7 +75,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::imap::{FetchFormat, SearchCriteria, SearchDate};
+use crate::imap::{FetchFormat, SearchCriteria, SearchDate, SystemFlag};
 use crate::service::{self, AppState, AppStateError, ServiceError};
 
 /// Page size `list_messages` applies when the caller names none.
@@ -158,6 +168,41 @@ fn validate_uid(uid: u32) -> Result<u32, String> {
     } else {
         Ok(uid)
     }
+}
+
+/// Validates a move/copy destination mailbox.
+///
+/// Mirrored from the HTTP boundary, which validates the body's `to` with the same
+/// two rules and the same messages: no control character, and non-blank after
+/// trimming. A **blank or missing** destination is therefore a request that breaks
+/// this transport's dialect and not a domain failure.
+fn validate_destination(value: &str) -> Result<String, String> {
+    if has_control_characters(value) {
+        return Err(invalid_input("`to` contains a forbidden control character"));
+    }
+    let to = value.trim();
+    if to.is_empty() {
+        return Err(invalid_input("`to` must not be empty"));
+    }
+    Ok(to.to_string())
+}
+
+/// Parses a list of flag names against the [`SystemFlag`] allowlist.
+///
+/// Mirrored from the HTTP boundary, which parses the body's `add`/`remove` with
+/// the same allowlist, the same case-insensitive acceptance and the same fixed
+/// message (the supplied value is never echoed back). Canonicalises the spelling
+/// and removes duplicates, preserving order.
+fn validate_flags(values: Vec<String>) -> Result<Vec<SystemFlag>, String> {
+    let mut flags: Vec<SystemFlag> = Vec::with_capacity(values.len());
+    for value in values {
+        let flag = SystemFlag::parse(&value)
+            .map_err(|_| invalid_input("a flag is not a known system flag"))?;
+        if !flags.contains(&flag) {
+            flags.push(flag);
+        }
+    }
+    Ok(flags)
 }
 
 /// The `format` argument of `get_message`.
@@ -307,6 +352,81 @@ impl GetAttachmentInput {
             validate_uid(self.uid)?,
             self.id,
         ))
+    }
+}
+
+/// Arguments of the `update_flags` tool.
+///
+/// This is the transport's own dialect of `PATCH /api/messages/{uid}/flags`: the
+/// HTTP route reads its `add`/`remove` from a body plus its `mailbox` from the
+/// query and its `uid` from the path, while here all four arrive as JSON fields.
+/// The **validation** is mirrored, not moved — the request rules stay with the
+/// layer that parses the request, exactly as they do at the HTTP boundary — and
+/// the resulting [`SystemFlag`]s are the domain values the operation takes.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct UpdateFlagsInput {
+    /// Mailbox holding the message.
+    pub mailbox: String,
+    /// Unique identifier of the message within the mailbox.
+    pub uid: u32,
+    /// Flags to add, spelled as IMAP system flags (`\Seen`, `\Flagged`, …).
+    #[serde(default)]
+    pub add: Vec<String>,
+    /// Flags to remove, spelled as IMAP system flags.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+impl UpdateFlagsInput {
+    /// Validates the arguments into the operation's own pieces.
+    ///
+    /// At least one of `add` or `remove` must be non-empty and no flag may appear
+    /// in both, as at the HTTP boundary: an update that names nothing, or that
+    /// contradicts itself, is rejected **before** any IMAP command is sent.
+    fn into_parts(self) -> Result<(String, u32, Vec<SystemFlag>, Vec<SystemFlag>), String> {
+        let mailbox = validate_mailbox(&self.mailbox)?;
+        let uid = validate_uid(self.uid)?;
+        let add = validate_flags(self.add)?;
+        let remove = validate_flags(self.remove)?;
+        if add.is_empty() && remove.is_empty() {
+            return Err(invalid_input(
+                "at least one of `add` or `remove` must be non-empty",
+            ));
+        }
+        if add.iter().any(|flag| remove.contains(flag)) {
+            return Err(invalid_input("the same flag cannot be added and removed"));
+        }
+        Ok((mailbox, uid, add, remove))
+    }
+}
+
+/// Arguments of the tools that send one message to a named destination:
+/// `move_message` and `copy_message`.
+///
+/// The transport's dialect of the HTTP route: the `uid` path parameter and the
+/// `mailbox` query become JSON fields. `to` is declared optional so that a
+/// caller **omitting** the destination is answered with the same
+/// `invalid_request` tool error as one sending a blank value, instead of failing
+/// at argument decoding; it stays mandatory in the operation, and both tools say
+/// so.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct MoveCopyInput {
+    /// Mailbox holding the message.
+    pub mailbox: String,
+    /// Unique identifier of the message within the mailbox.
+    pub uid: u32,
+    /// Destination mailbox. **Mandatory**: a missing or blank value is an
+    /// invalid request.
+    pub to: Option<String>,
+}
+
+impl MoveCopyInput {
+    /// Validates the arguments into the operation's own pieces.
+    fn into_parts(self) -> Result<(String, u32, String), String> {
+        let mailbox = validate_mailbox(&self.mailbox)?;
+        let uid = validate_uid(self.uid)?;
+        let to = validate_destination(self.to.as_deref().unwrap_or_default())?;
+        Ok((mailbox, uid, to))
     }
 }
 
@@ -524,6 +644,137 @@ impl ApimailMcp {
     async fn idle_queue(&self) -> Json<crate::queue::QueueStats> {
         Json(service::idle_queue(&self.state))
     }
+
+    /// Sends a message over the configured SMTP transport.
+    ///
+    /// Thin wrapper over [`service::send_message`], which owns every rule of an
+    /// outgoing message — at least one primary recipient, every address validated
+    /// as a mailbox, the base64 attachments decoded and measured against the
+    /// configured limit — so this transport inherits those rules instead of
+    /// re-implementing them. The argument is the very
+    /// [`SendMessageDto`](service::SendMessageDto) the HTTP route decodes from its
+    /// request body: one input shape, two dialects.
+    ///
+    /// An empty `to` is the domain's `400`
+    /// ([`ServiceError::InvalidRequest`], **nothing is sent**); an oversized
+    /// attachment is its `413`; a refused delivery is its `502`
+    /// [`ServiceError::SmtpFailure`], which carries the credential-free message of
+    /// the failure.
+    #[tool(
+        description = "Send a message over SMTP and report `status: sent`. At least one recipient is required: an empty `to` fails as `invalid_request` and nothing is sent. `from` defaults to the account's SMTP user; `attachments[].data_base64` is base64-encoded and its *decoded* size is bounded by the configured limit (`payload_too_large` when exceeded). A server-side refusal is `smtp_failure`."
+    )]
+    async fn send_message(
+        &self,
+        Parameters(dto): Parameters<service::SendMessageDto>,
+    ) -> Result<Json<service::SentResponse>, String> {
+        service::send_message(&self.state, dto)
+            .await
+            .map(Json)
+            .map_err(|error| tool_error(&error))
+    }
+
+    /// Adds and removes IMAP system flags on one message.
+    ///
+    /// Thin wrapper over [`service::update_flags`], which selects the mailbox,
+    /// checks the message exists and issues a single `UID STORE` built **only**
+    /// from the named flags, then reads the resulting flags back with a summary
+    /// `UID FETCH`. Nothing else about the message is touched and no other flag
+    /// changes.
+    ///
+    /// The request rules stay here, where the request is parsed: a missing
+    /// message is the domain's `404` `message_not_found`, an unknown flag or a
+    /// contradictory update is `invalid_request` and **no command is sent**.
+    #[tool(
+        description = "Add and/or remove IMAP system flags (`\\Seen`, `\\Answered`, `\\Flagged`, `\\Draft`, `\\Deleted`) on one message, addressed by `mailbox` and `uid`. Only the flags named in `add` and `remove` change; every other flag of the message is left untouched. At least one of the two must be non-empty and no flag may appear in both, otherwise the call fails as `invalid_request` without sending a command. The result reports the message's resulting flags."
+    )]
+    async fn update_flags(
+        &self,
+        Parameters(input): Parameters<UpdateFlagsInput>,
+    ) -> Result<Json<service::FlagUpdateResponse>, String> {
+        let (mailbox, uid, add, remove) = input.into_parts()?;
+        service::update_flags(&self.state, mailbox, uid, add, remove)
+            .await
+            .map(Json)
+            .map_err(|error| tool_error(&error))
+    }
+
+    /// Moves one message to an explicit destination mailbox.
+    ///
+    /// Thin wrapper over [`service::move_message`], which uses `UID MOVE` when the
+    /// server announces it and otherwise emulates the move with `COPY`, a
+    /// `\Deleted` mark and `UID EXPUNGE` — copying before deleting, so mail is
+    /// never lost. A server that announces neither capability answers the
+    /// domain's `501` `capability_not_supported` and **no command is sent**.
+    ///
+    /// The destination is **mandatory**: without it the call fails here, as
+    /// `invalid_request`, before any connection is opened. The destination
+    /// mailbox must already exist; the source mailbox is the named one, never
+    /// whatever `select_mailbox` left selected.
+    #[tool(
+        description = "Move one message, addressed by `mailbox` and `uid`, to the destination mailbox named in `to`, and report `status: moved`. `to` is mandatory: a missing or blank destination fails as `invalid_request` and sends no command. Uses `UID MOVE` when the server announces it, otherwise the `UIDPLUS` emulation (`COPY`, mark `\\Deleted`, `UID EXPUNGE`); a server announcing neither fails as `capability_not_supported`. The message is removed from the source mailbox."
+    )]
+    async fn move_message(
+        &self,
+        Parameters(input): Parameters<MoveCopyInput>,
+    ) -> Result<Json<service::MoveCopyResponse>, String> {
+        let (mailbox, uid, to) = input.into_parts()?;
+        service::move_message(&self.state, mailbox, uid, to)
+            .await
+            .map(Json)
+            .map_err(|error| tool_error(&error))
+    }
+
+    /// Copies one message to an explicit destination mailbox.
+    ///
+    /// Thin wrapper over [`service::copy_message`], which issues `UID COPY` — part
+    /// of IMAP4rev1, so no server extension is required — leaving the source
+    /// message in place, flags and all.
+    ///
+    /// As in a move, the destination is **mandatory** and a missing or blank
+    /// value is this transport's `invalid_request`.
+    #[tool(
+        description = "Copy one message, addressed by `mailbox` and `uid`, to the destination mailbox named in `to`, and report `status: copied`. `to` is mandatory: a missing or blank destination fails as `invalid_request`. The source message is left untouched in its mailbox. Needs no server extension (`UID COPY`)."
+    )]
+    async fn copy_message(
+        &self,
+        Parameters(input): Parameters<MoveCopyInput>,
+    ) -> Result<Json<service::MoveCopyResponse>, String> {
+        let (mailbox, uid, to) = input.into_parts()?;
+        service::copy_message(&self.state, mailbox, uid, to)
+            .await
+            .map(Json)
+            .map_err(|error| tool_error(&error))
+    }
+
+    /// Permanently purges one message: the irreversible write tool.
+    ///
+    /// Thin wrapper over [`service::delete_message`], which marks the message
+    /// `\Deleted` and then runs a **targeted** `UID EXPUNGE`. Two consequences
+    /// must be read before calling it:
+    ///
+    /// - the message is **purged, not filed**: nothing places a copy in a Trash
+    ///   mailbox, so there is no undo, no `move_message` to recover it and no
+    ///   `\Deleted` message left for a client to restore — the only way back is
+    ///   the peer's own backup;
+    /// - the operation therefore requires `UIDPLUS`, so that `UID EXPUNGE`
+    ///   removes exactly the addressed message. A server that does not announce
+    ///   the extension answers `501` `capability_not_supported` and **no command
+    ///   is sent** — this tool never falls back to a global `EXPUNGE`, which would
+    ///   destroy every `\Deleted` message in the mailbox, including ones this call
+    ///   never touched.
+    #[tool(
+        description = "Destructive and irreversible: permanently purge one message, addressed by `mailbox` and `uid`, and report `status: deleted`. It marks the message `\\Deleted` and runs `EXPUNGE`, so the message is **removed from the mailbox for good** — it is **not moved to a Trash mailbox** and no copy is kept. Requires the server to announce `UIDPLUS`; a server that does not fails as `capability_not_supported` and sends no command. To keep the message, use `move_message` or `copy_message` instead."
+    )]
+    async fn delete_message(
+        &self,
+        Parameters(input): Parameters<MessageRefInput>,
+    ) -> Result<Json<service::DeleteResponse>, String> {
+        let (mailbox, uid) = input.into_parts()?;
+        service::delete_message(&self.state, mailbox, uid)
+            .await
+            .map(Json)
+            .map_err(|error| tool_error(&error))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -539,9 +790,12 @@ impl ServerHandler for ApimailMcp {
             .with_instructions(
                 "apimail exposes a mail account over MCP. Call `whoami` to confirm the \
                  connection is authenticated, then `get_account`, `list_mailboxes`, \
-                 `list_messages` and the message tools to read the account. Every failure \
-                 is reported as a tool error carrying the stable code of the operation \
-                 (`imap_unavailable`, `mailbox_not_found`, …).",
+                 `list_messages` and the message tools to read the account. To change it, \
+                 use `send_message`, `update_flags`, `move_message`, `copy_message` and \
+                 `delete_message` — note that `delete_message` purges the message for good \
+                 and does not move it to a Trash mailbox. Every failure is reported as a \
+                 tool error carrying the stable code of the operation (`imap_unavailable`, \
+                 `mailbox_not_found`, …).",
             )
     }
 }

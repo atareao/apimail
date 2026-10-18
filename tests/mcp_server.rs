@@ -254,7 +254,7 @@ async fn tool_cycle_runs_in_process_over_a_pipe() {
     )
     .await;
 
-    // 2. tools/list. Exactly the twelve read-only tools are advertised, in the
+    // 2. tools/list. Exactly the seventeen tools are advertised, in the
     //    alphabetical order the router publishes them, and every one of them
     //    carries an input schema and a description.
     send(&mut client_write, &list_tools_request(2)).await;
@@ -270,6 +270,8 @@ async fn tool_cycle_runs_in_process_over_a_pipe() {
     assert_eq!(
         names,
         vec![
+            "copy_message",
+            "delete_message",
             "get_account",
             "get_attachment",
             "get_message",
@@ -280,10 +282,13 @@ async fn tool_cycle_runs_in_process_over_a_pipe() {
             "list_attachments",
             "list_mailboxes",
             "list_messages",
+            "move_message",
             "select_mailbox",
+            "send_message",
+            "update_flags",
             "whoami",
         ],
-        "the MCP surface is the twelve read-only tools and nothing else: {listing}"
+        "the MCP surface is the twelve read tools and the five write tools, and nothing else: {listing}"
     );
     // The administrative IDLE controls stay off the MCP surface on purpose:
     // starting and stopping the subscription is an operator decision.
