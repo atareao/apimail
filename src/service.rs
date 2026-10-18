@@ -500,6 +500,7 @@ impl AppState {
 
 /// Public view of a single mail endpoint: host and port only.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct EndpointView {
     /// Server host name or address.
     pub host: String,
@@ -511,6 +512,7 @@ pub struct EndpointView {
 ///
 /// It intentionally carries neither the username nor the password.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AccountView {
     /// Incoming (IMAP) endpoint.
     pub imap: EndpointView,
@@ -520,6 +522,7 @@ pub struct AccountView {
 
 /// JSON payload returned by `GET /api/whoami`.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct WhoamiResponse {
     /// Always `true`: reached only after successful authentication.
     pub authenticated: bool,
@@ -527,6 +530,7 @@ pub struct WhoamiResponse {
 
 /// JSON payload returned by a successful `GET /api/imap/status`.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct ImapStatusResponse {
     /// Always `true`: reached only after a live session was ensured.
     pub connected: bool,
@@ -543,6 +547,7 @@ pub struct ImapStatusResponse {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MailboxDto {
     /// Mailbox name.
     pub name: String,
@@ -567,6 +572,7 @@ impl From<MailboxInfo> for MailboxDto {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MailboxListResponse {
     /// The account's mailboxes.
     pub mailboxes: Vec<MailboxDto>,
@@ -577,6 +583,7 @@ pub struct MailboxListResponse {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MailboxStatusResponse {
     /// Selected mailbox name.
     pub mailbox: String,
@@ -614,6 +621,7 @@ impl MailboxStatusResponse {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AddressDto {
     /// Display name, or `null`.
     pub name: Option<String>,
@@ -635,6 +643,7 @@ impl From<&Address> for AddressDto {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct EnvelopeDto {
     /// `From` addresses.
     pub from: Vec<AddressDto>,
@@ -668,6 +677,7 @@ impl From<&MessageEnvelope> for EnvelopeDto {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MessageDto {
     /// Unique identifier within the mailbox.
     pub uid: u32,
@@ -701,6 +711,7 @@ impl From<&Message> for MessageDto {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MessageListResponse {
     /// Selected mailbox name.
     pub mailbox: String,
@@ -721,6 +732,7 @@ pub struct MessageListResponse {
 /// declaration order, which is the serialisation order of the published body, so
 /// it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MessageDetailResponse {
     /// Selected mailbox name.
     pub mailbox: String,
@@ -791,6 +803,7 @@ impl MessageDetailResponse {
 /// order, which is the serialisation order of the published body, so it is part
 /// of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct MessageBodyResponse {
     /// Selected mailbox name.
     pub mailbox: String,
@@ -809,6 +822,7 @@ pub struct MessageBodyResponse {
 /// is the declaration order, which is the serialisation order of the published
 /// body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct ParsedAttachmentDto {
     /// Positional identifier within the parsed attachment list.
     pub id: u32,
@@ -842,6 +856,7 @@ impl From<&ParsedAttachment> for ParsedAttachmentDto {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AttachmentListResponse {
     /// Selected mailbox name.
     pub mailbox: String,
@@ -857,6 +872,7 @@ pub struct AttachmentListResponse {
 /// The field order is the declaration order, which is the serialisation order of
 /// the published body, so it is part of the contract.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AttachmentResponse {
     /// Selected mailbox name.
     pub mailbox: String,
