@@ -159,8 +159,11 @@ fmt:
     cargo fmt --check
 
 # Check que existe un change proposal activo en openspec
+# NOTA: `openspec` 1.13.2 NO tiene `openspec new change` (ese subcomando no existe; `openspec change`
+# solo ofrece `show`, `list` y `validate`). El change se crea a mano: el directorio
+# openspec/changes/<feature>/ con su .openspec.yaml + los artefactos. Plantillas: `openspec templates`.
 check-spec:
-    @ls openspec/changes/*/proposal.md 2>/dev/null || (echo "❌ No active change proposal found. Run: openspec new change <feature>" && exit 1)
+    @ls openspec/changes/*/proposal.md 2>/dev/null || (echo "❌ No hay ningún change proposal activo en openspec/changes/." && echo "   'openspec new change' NO existe en openspec 1.13.2. Crea el directorio a mano:" && echo "     openspec/changes/<feature>/.openspec.yaml   # schema: spec-driven, created: <YYYY-MM-DD>, goal: ..." && echo "     openspec/changes/<feature>/proposal.md      # ver openspec templates (proposal)" && echo "     openspec/changes/<feature>/design.md        # ver openspec templates (design)" && echo "     openspec/changes/<feature>/tasks.md         # ver openspec templates (tasks)" && echo "     openspec/changes/<feature>/specs/<capability>/spec.md" && echo "   Valida con: openspec validate <feature> --strict" && exit 1)
     @echo "✅ Active change proposal found."
 
 # Limpia todo

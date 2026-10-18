@@ -8,17 +8,39 @@ aprueba en `openspec/changes/<feature>/` **antes** de escribir código (ver `AGE
 
 ---
 
-## 1. Punto de partida (v0.3.0)
+## 0. Estado actual (medido el 2026-10-18, no histórico)
+
+| Dato | Comando | Valor |
+|---|---|---|
+| Tag más reciente | `git tag --sort=-v:refname \| head -1` | **`v0.4.4`** |
+| `development` por delante de `main` | `git rev-list --count origin/main..origin/development` | **22** commits *(no están sincronizadas)* |
+| Specs consolidadas | `ls -1 openspec/specs/ \| wc -l` | **15** |
+| Changes archivados | `ls -1 openspec/changes/archive/ \| wc -l` | **24** |
+| Changes activos | `openspec list` | **0** |
+| Ficheros en `src/` | `ls -1 src/*.rs \| wc -l` | **11** |
+| Ficheros en `tests/` | `ls -1 tests/*.rs \| wc -l` | **15** |
+| Tests (build por defecto) | `cargo test` | **349** |
+| Tests (feature `mcp`) | `cargo test --features mcp` | **364** |
+
+**Estado de los ítems de §2:** #1 y #2 ✅ (`v0.2.1`), #3 ✅ (`v0.3.0`), **#6 ✅ (`v0.4.0`)**,
+**#8 ✅ implementado y archivado — release pendiente**, #10 ✅ (`v0.4.4`).
+**Pendientes: #4, #5, #7 y #9.** No queda nada más por hacer del resto.
+
+---
+
+## 1. Punto de partida (v0.3.0) — *snapshot*
 
 - **Releases publicadas** hasta el cierre de `v0.3.0`: `v0.3.0`, `v0.2.1`, `v0.2.0` y `v0.1.0` en
   crates.io y GitHub Releases (binarios `x86_64` y `aarch64`); para la última versión,
-  `git tag --sort=-v:refname`.
+  `git tag --sort=-v:refname`. *(El estado medido hoy es el de §0.)*
 - **Roadmap completado**: `api-auth`, `mail-account`, `imap-connection`, `imap-mailboxes`,
   `imap-messages`, `imap-flags`, `mime-parsing`, `smtp-send`, `imap-idle`.
 - **12 specs** consolidadas en `openspec/specs/`; **16 changes archivados** en
-  `openspec/changes/archive/`; sin changes activos.
+  `openspec/changes/archive/`; sin changes activos. *(Recuentos de `v0.3.0`; hoy: 15 y 24 — ver §0.)*
 - **Calidad**: 311 tests, `clippy --all-targets -- -D warnings` en cero, `fmt` limpio.
-- `development` y `main` sincronizadas.
+  *(Snapshot de `v0.3.0`; hoy son 349 en el build por defecto y 364 con `--features mcp`.)*
+- `development` y `main` sincronizadas. *(Cierto al cerrar `v0.3.0`; hoy `development` va 22 commits
+  por delante de `main` — ver §0.)*
 
 ### Completado en `v0.2.1` (change `release-hygiene`, `skip_specs`)
 
@@ -33,7 +55,9 @@ aprueba en `openspec/changes/<feature>/` **antes** de escribir código (ver `AGE
 |---|---|---|
 | 3 | `webhook-delivery` | Entrega **at-least-once**: ingesta y entrega desacopladas (worker FIFO con backoff), cola **persistente opt-in** (`APIMAIL_QUEUE_PATH`, log JSONL con `fsync` y compactación atómica, permisos `0600`), **reanudación** desde el watermark y `GET /api/idle/queue`. Change archivado; 12 specs; **311 tests**. Publicado como **v0.3.0** (crates.io + GitHub Release; paquete de **28 ficheros**). |
 
-Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
+Lo que queda abajo es trabajo **nuevo**: cuatro ítems pendientes (**#4**, **#5**, **#7** y **#9**),
+de los cuales solo #4 y #5 son extensiones opcionales conscientes; dos ya se cerraron después de
+escribir esto (**#6** completado en `v0.4.0`, **#8** implementado y archivado, release pendiente).
 
 ---
 
@@ -46,9 +70,9 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 | 3 | `webhook-delivery` — entrega *at-least-once* con cola persistente | Capability nueva | Alta (siguiente) | ✅ hecho en `v0.3.0` |
 | 4 | `idle-scope` — `IDLE` multi-buzón / multi-cuenta | Capability nueva | Baja | ⏳ pendiente |
 | 5 | `attachment-content` — contenido de adjuntos en el payload | Extensión de `imap-idle` | Baja | ⏳ pendiente |
-| 6 | `container-image` — despliegue contenedorizado | Infraestructura de distribución | Alta | 🚧 en curso |
+| 6 | `container-image` — despliegue contenedorizado | Infraestructura de distribución | Alta | ✅ hecho en `v0.4.0` (imagen en GHCR; desplegada — ver §6) |
 | 7 | `manifest-digest` — comprobar el digest del manifiesto en el enforcement | Endurecimiento de CI | Media | ⏳ pendiente (sin propuesta) |
-| 8 | `mcp-server` — exponer la API como servidor MCP | Capability nueva / distribución | Media | ⏳ pendiente → `plans/PLAN-002.md` |
+| 8 | `mcp-server` — exponer la API como servidor MCP | Capability nueva / distribución | Media | ✅ implementado y archivado (`2026-10-18-mcp-server`, PR #54) — **release pendiente** |
 | 9 | `openapi` — especificación OpenAPI + UI de documentación | Documentación / distribución | Media | ⏳ pendiente → `plans/PLAN-003.md` |
 | 10 | `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes` | Defecto (intermitente) | Media | ✅ hecho en `v0.4.4` — change `imap-session-liveness`, PR #50 |
 
@@ -98,7 +122,8 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
   desplegar en un servidor obligaba a compilar y configurar el servicio a mano, y el `.justfile`
   heredado no aplicaba a apimail.
 - **Estado**: ✅ **completado** — change `container-image` **archivado**
-  (`openspec/changes/archive/2026-10-09-container-image`); imagen publicada en GHCR
+  (`openspec/changes/archive/2026-10-09-container-image`); se publicó como **minor `v0.4.0`**
+  (`CHANGELOG`: «Distribuir apimail como imagen de contenedor»), con la imagen en GHCR
   (`linux/amd64`) y **desplegada en producción** (`v0.4.3`, digest
   `sha256:0f95967ed8d2b7f6461b57fbfe717e16e284adff11b32a2687a8319b7cef5176`).
   El arreglo del `.justfile` quedó **a medias**: las recetas de contenedor y salud sí se
@@ -119,6 +144,23 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
   — deterministas por nivel, no aleatorios.
 - **Estado**: ⏳ **no aprobado**; sin propuesta ni rama. Requiere un change en `openspec/changes/`
   antes de escribir código.
+
+### 8. `mcp-server` — exponer la API como servidor MCP
+
+- **Qué se hizo**: el servidor MCP (*Model Context Protocol*) completo: capa de servicio compartida
+  (`src/service.rs`, 2240 líneas), servidor con **17 tools** (12 de lectura + 5 de escritura) en
+  `src/mcp.rs` (883 líneas), **dos transportes** — stdio y Streamable HTTP anidado en el `axum`
+  existente reutilizando la API key— y la **feature de Cargo `mcp`, por defecto OFF**, más el job
+  **`test-mcp`** del CI. El plan detallado vive en `plans/PLAN-002.md`, que ya lleva su **estado de
+  cierre** (incluidas las desviaciones respecto al plan).
+- **Evidencia**: change **`mcp-server` archivado** como `openspec/changes/archive/2026-10-18-mcp-server/`
+  (con las specs nuevas `mcp-server`, `mcp-tools` y `mcp-auth` y un delta de `http-api`), **fusionado
+  en `development`** por el merge del **PR #54** (`ae9d751`). Verificado con
+  `cargo test --features mcp`: **364 tests**, y **349** en el build por defecto.
+- **Estado**: ✅ **implementado y archivado** — ⚠️ **release PENDIENTE**: **no está en ningún tag**
+  (`git tag --contains ae9d751` no devuelve nada; el tag más reciente sigue siendo `v0.4.4`), así que
+  no está publicado ni en crates.io ni como imagen. Falta también la verificación con un cliente MCP
+  real (casilla 10.1 del `tasks.md` del change, sin marcar).
 
 ### 10. `mailboxes-empty-response` — respuesta vacía transitoria en `GET /api/mailboxes`
 
@@ -182,8 +224,13 @@ Lo que queda abajo es trabajo **nuevo**: solo dos extensiones opcionales.
 
 ## 3. Secuencia recomendada
 
-1. **#4 `idle-scope`** y **#5 `attachment-content`** — cuando haya necesidad real; hoy son
+1. **Release del MCP pendiente** (#8): el código está en `development` (PR #54) pero **sin publicar**;
+   falta la release a `main` (con confirmación explícita del usuario) y la verificación con un cliente
+   MCP real.
+2. **#4 `idle-scope`** y **#5 `attachment-content`** — cuando haya necesidad real; hoy son
    *Fuera de alcance* conscientes.
+3. **#7 `manifest-digest`** y **#9 `openapi`** — sin propuesta todavía; requieren un change en
+   `openspec/changes/` antes de escribir código.
 
 ---
 
