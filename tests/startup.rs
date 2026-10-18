@@ -306,6 +306,39 @@ fn invalid_value_is_not_echoed_in_stderr() {
     );
 }
 
+/// Configuring MCP on a binary compiled **without** the `mcp` feature must make
+/// the process exit non-zero, naming the offending variable: a build that cannot
+/// serve MCP has to say so instead of silently ignoring the configuration.
+///
+/// The counterpart — with the feature, the same variable starting a transport —
+/// belongs to the MCP server work; here only the fail-closed path is asserted.
+#[cfg(not(feature = "mcp"))]
+#[test]
+fn mcp_variable_without_the_feature_exits_non_zero() {
+    for (name, value) in [
+        ("APIMAIL_MCP_HTTP", "true"),
+        ("APIMAIL_MCP_STDIO", "1"),
+        ("APIMAIL_MCP_PATH", "/mcp"),
+    ] {
+        let output = configured_command()
+            .env(name, value)
+            .output()
+            .expect("failed to spawn apimail binary");
+
+        assert!(
+            !output.status.success(),
+            "expected non-zero exit for {name}, got {:?}",
+            output.status
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(name),
+            "stderr should mention {name}, got: {stderr:?}"
+        );
+    }
+}
+
 /// A malformed webhook URL may embed userinfo; the credential must not reach stderr.
 #[test]
 fn invalid_webhook_url_credentials_are_not_echoed_in_stderr() {
