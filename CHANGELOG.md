@@ -1,4 +1,41 @@
 # Changelog
+## [0.5.0] - 2026-10-18
+
+### Documentation
+
+- *(plans)* Registrar el release v0.4.4 del ítem #10
+- *(openspec)* Propuesta del change mcp-server (pendiente de aprobación)
+- *(openspec)* Corregir dos errores del diseño de mcp-server y registrar §1
+- *(mcp)* Documentar el servidor MCP (§9)
+- *(openspec)* Revalidar anclas, marcar tareas y archivar el change mcp-server (§10)
+- Corregir el estado real del proyecto
+
+### Features
+
+- *(mcp)* Configuración fail-closed del servidor MCP (§3)
+- *(mcp)* Servidor MCP por stdio con la primera tool (§4)
+- *(mcp)* Transporte Streamable HTTP anidado en el axum existente (§5)
+- *(mcp)* Derivar los esquemas JSON de los DTOs del servicio (§6, paso previo)
+- *(mcp)* Las 12 tools de lectura (§6)
+- *(mcp)* Las 5 tools de escritura (§7)
+
+### Miscellaneous Tasks
+
+- *(just)* Encadenar cargo doc en check-all y anadir check-all-mcp
+
+### Other
+
+- *(mcp)* Andamiaje de la feature `mcp` (§1) + job de CI
+
+### Refactor
+
+- *(service)* Extraer la capa de servicio y migrar whoami, account e imap_status
+- *(service)* Cerrar el patrón de la capa de servicio (oleada 0)
+- *(service)* Migrar GET /api/mailboxes a la capa de servicio
+- *(service)* Migrar las 7 lecturas restantes y cerrar dos huecos de mapeo
+- *(service)* Migrar POST /api/messages (envío)
+- *(service)* Migrar select, idle start/stop, flags, move y copy
+- *(service)* Migrar DELETE y cerrar §2 (las 20 rutas)
 ## [0.4.4] - 2026-10-12
 
 ### Bug Fixes
@@ -21,6 +58,7 @@
 ### Miscellaneous Tasks
 
 - *(justfile)* Retirar las recetas frontend-* y arreglar check-all
+- Release v0.4.4
 ## [0.4.3] - 2026-10-10
 
 ### Bug Fixes
