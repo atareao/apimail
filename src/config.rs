@@ -45,6 +45,16 @@ pub const DEFAULT_QUEUE_MAX_ITEMS: usize = 1000;
 pub const QUEUE_MAX_BYTES_VAR: &str = "APIMAIL_QUEUE_MAX_BYTES";
 /// Default maximum live bytes (64 MiB) when `APIMAIL_QUEUE_MAX_BYTES` is unset.
 pub const DEFAULT_QUEUE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Environment variable enabling the MCP transport over standard input/output.
+pub const MCP_STDIO_VAR: &str = "APIMAIL_MCP_STDIO";
+/// Environment variable enabling the MCP transport over Streamable HTTP.
+pub const MCP_HTTP_VAR: &str = "APIMAIL_MCP_HTTP";
+/// Environment variable holding the path the MCP HTTP transport is mounted at.
+pub const MCP_PATH_VAR: &str = "APIMAIL_MCP_PATH";
+/// Default MCP HTTP transport path (`/mcp`) when `APIMAIL_MCP_PATH` is unset.
+pub const DEFAULT_MCP_PATH: &str = "/mcp";
+/// Path prefix reserved to the HTTP API, which the MCP transport must not nest in.
+pub const RESERVED_API_PATH_PREFIX: &str = "/api";
 
 /// TLS mode negotiated with a mail endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +327,19 @@ pub struct Config {
     pub webhook_timeout: Duration,
     /// Timeout applied to TCP connect, the TLS handshake and the IMAP login.
     pub imap_timeout: Duration,
+    /// Whether the MCP server is served over standard input/output.
+    ///
+    /// `true` only when `APIMAIL_MCP_STDIO` enables it; the two transports are
+    /// mutually exclusive, so [`mcp_http`](Self::mcp_http) is then `false`.
+    pub mcp_stdio: bool,
+    /// Whether the MCP server is served over Streamable HTTP.
+    ///
+    /// `true` only when `APIMAIL_MCP_HTTP` enables it; the transport is then
+    /// nested in the shared listener under [`mcp_path`](Self::mcp_path).
+    pub mcp_http: bool,
+    /// Absolute path the MCP HTTP transport is mounted at, outside the reserved
+    /// `/api` prefix; defaults to [`DEFAULT_MCP_PATH`].
+    pub mcp_path: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -335,6 +358,9 @@ impl std::fmt::Debug for Config {
             .field("idle_mailbox", &self.idle_mailbox)
             .field("webhook_timeout", &self.webhook_timeout)
             .field("imap_timeout", &self.imap_timeout)
+            .field("mcp_stdio", &self.mcp_stdio)
+            .field("mcp_http", &self.mcp_http)
+            .field("mcp_path", &self.mcp_path)
             .finish()
     }
 }
@@ -404,6 +430,40 @@ pub enum ConfigError {
     /// The mail account could not be loaded.
     #[error(transparent)]
     Account(#[from] AccountError),
+    /// An MCP transport flag held an unsupported value.
+    ///
+    /// Deliberately carries no raw value (unlike the numeric variants above):
+    /// the accepted domain is fixed and spelled out in the message, so the value
+    /// never needs to be echoed — not even by [`Display`](std::fmt::Display),
+    /// which is what the entrypoint logs.
+    #[error("invalid {name}: expected one of `true`, `false`, `1` or `0`")]
+    InvalidMcpFlag {
+        /// Name of the offending environment variable.
+        name: String,
+    },
+    /// Both MCP transports were requested at once.
+    #[error("conflicting MCP transports: {stdio} and {http} must not both be true")]
+    ConflictingMcpTransports {
+        /// Name of the stdio transport variable.
+        stdio: String,
+        /// Name of the HTTP transport variable.
+        http: String,
+    },
+    /// `APIMAIL_MCP_PATH` was not an absolute path outside the reserved prefix.
+    ///
+    /// Deliberately carries no raw value: the message already names the variable
+    /// and states every accepted form, so nothing has to be echoed anywhere.
+    #[error(
+        "invalid APIMAIL_MCP_PATH: expected an absolute path other than `/` and outside the reserved `/api` prefix"
+    )]
+    InvalidMcpPath,
+    /// An MCP variable was set while the crate was compiled without the `mcp`
+    /// feature.
+    #[error("{name} is set but this build was compiled without the `mcp` feature")]
+    McpFeatureDisabled {
+        /// Name of the offending environment variable.
+        name: String,
+    },
 }
 
 impl ConfigError {
@@ -448,6 +508,19 @@ impl ConfigError {
                     .to_string()
             }
             Self::Account(error) => error.public_message(),
+            Self::InvalidMcpFlag { name } => {
+                format!("invalid {name}: expected one of true, false, 1 or 0")
+            }
+            Self::ConflictingMcpTransports { stdio, http } => {
+                format!("conflicting MCP transports: {stdio} and {http} must not both be true")
+            }
+            Self::InvalidMcpPath => {
+                "invalid APIMAIL_MCP_PATH: expected an absolute path other than / and outside the reserved /api prefix"
+                    .to_string()
+            }
+            Self::McpFeatureDisabled { name } => {
+                format!("{name} is set but this build was compiled without the mcp feature")
+            }
         }
     }
 
@@ -464,6 +537,10 @@ impl ConfigError {
             Self::InvalidWebhookTimeout { .. } => "invalid_webhook_timeout",
             Self::InvalidImapTimeout { .. } => "invalid_imap_timeout",
             Self::Account(_) => "account",
+            Self::InvalidMcpFlag { .. } => "invalid_mcp_flag",
+            Self::ConflictingMcpTransports { .. } => "conflicting_mcp_transports",
+            Self::InvalidMcpPath => "invalid_mcp_path",
+            Self::McpFeatureDisabled { .. } => "mcp_feature_disabled",
         }
     }
 }
@@ -487,13 +564,22 @@ impl Config {
     ///
     /// Validation runs in the order host → port → api key → mail account →
     /// attachment limit → message limit → queue path → queue item limit → queue
-    /// byte limit → webhook url → idle mailbox → webhook timeout → IMAP timeout,
-    /// so an invalid server port is reported before any missing API key or
+    /// byte limit → webhook url → idle mailbox → webhook timeout → IMAP timeout →
+    /// MCP stdio flag → MCP http flag → MCP path → MCP transports, so an invalid
+    /// server port is reported before any missing API key or
     /// account value, an invalid attachment limit is reported after the account,
     /// an invalid message limit after the attachment limit, an invalid queue limit
     /// after the message limit, an invalid webhook url after the queue limits, an
     /// invalid idle mailbox after the webhook url, an invalid webhook timeout
-    /// after the idle mailbox, and an invalid IMAP timeout last.
+    /// after the idle mailbox, an invalid IMAP timeout after the webhook timeout,
+    /// and the MCP settings last.
+    ///
+    /// The three MCP variables are **fail-closed**: a malformed value aborts the
+    /// startup instead of falling back to the default, requesting both transports
+    /// at once is rejected naming both variables, and any MCP variable defined on
+    /// a build without the `mcp` feature is an error rather than a silent no-op.
+    /// With none of them defined the configuration — and therefore the service —
+    /// behaves exactly as it did before MCP existed.
     pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -598,6 +684,38 @@ impl Config {
             }
             None => Duration::from_secs(DEFAULT_IMAP_TIMEOUT_SECS),
         };
+        // MCP is opt-in, so every variable goes through `ensure_mcp_feature`
+        // first: a binary compiled without the feature must refuse to start when
+        // it is handed MCP configuration, never ignore it silently.
+        let mcp_stdio = match lookup(MCP_STDIO_VAR) {
+            Some(raw) => {
+                ensure_mcp_feature(MCP_STDIO_VAR)?;
+                parse_mcp_flag(MCP_STDIO_VAR, &raw)?
+            }
+            None => false,
+        };
+        let mcp_http = match lookup(MCP_HTTP_VAR) {
+            Some(raw) => {
+                ensure_mcp_feature(MCP_HTTP_VAR)?;
+                parse_mcp_flag(MCP_HTTP_VAR, &raw)?
+            }
+            None => false,
+        };
+        // One transport per process: stdio binds no port at all, so asking for
+        // both would add a second, untested startup path and no use case.
+        if mcp_stdio && mcp_http {
+            return Err(ConfigError::ConflictingMcpTransports {
+                stdio: MCP_STDIO_VAR.to_string(),
+                http: MCP_HTTP_VAR.to_string(),
+            });
+        }
+        let mcp_path = match lookup(MCP_PATH_VAR) {
+            Some(raw) => {
+                ensure_mcp_feature(MCP_PATH_VAR)?;
+                validate_mcp_path(&raw)?
+            }
+            None => DEFAULT_MCP_PATH.to_string(),
+        };
         Ok(Self {
             host,
             port,
@@ -612,6 +730,9 @@ impl Config {
             idle_mailbox,
             webhook_timeout,
             imap_timeout,
+            mcp_stdio,
+            mcp_http,
+            mcp_path,
         })
     }
 
@@ -652,6 +773,56 @@ fn validate_webhook_url(value: &str) -> Result<String, ConfigError> {
     }
 
     Ok(value.to_string())
+}
+
+/// Fails when an MCP variable is configured on a build without the `mcp` feature.
+///
+/// Uses `cfg!` rather than `#[cfg]` so the check — and its error variant — exist
+/// in **both** builds: configuring MCP on a binary that cannot serve it must be
+/// reported, not swallowed. Whoever sets `APIMAIL_MCP_*` has to learn that no
+/// MCP transport is running.
+fn ensure_mcp_feature(name: &str) -> Result<(), ConfigError> {
+    if cfg!(feature = "mcp") {
+        Ok(())
+    } else {
+        Err(ConfigError::McpFeatureDisabled {
+            name: name.to_string(),
+        })
+    }
+}
+
+/// Parses a strict MCP boolean flag.
+///
+/// Accepts `true`/`false` (ASCII case-insensitive) and `1`/`0`. Anything else is
+/// an error naming the variable: the value is **not** trimmed, so a blank or
+/// padded flag is a deployment mistake rather than an invitation to fall back to
+/// the default. Mirrors the criterion of the query-parameter parser
+/// (`src/http.rs::parse_strict_bool`), widened with `1`/`0`, without importing
+/// from the HTTP layer.
+fn parse_mcp_flag(name: &str, raw: &str) -> Result<bool, ConfigError> {
+    if raw == "1" || raw.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if raw == "0" || raw.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(ConfigError::InvalidMcpFlag {
+            name: name.to_string(),
+        })
+    }
+}
+
+/// Validates `APIMAIL_MCP_PATH`.
+///
+/// The path must be absolute, must not be `/` (which would swallow every route
+/// of the HTTP API) and must stay outside [`RESERVED_API_PATH_PREFIX`], which the
+/// `/api/v1/...` endpoints own. On success the value is returned **unchanged**.
+fn validate_mcp_path(raw: &str) -> Result<String, ConfigError> {
+    let inside_reserved_prefix = raw == RESERVED_API_PATH_PREFIX || raw.starts_with("/api/");
+    if !raw.starts_with('/') || raw == "/" || inside_reserved_prefix {
+        return Err(ConfigError::InvalidMcpPath);
+    }
+
+    Ok(raw.to_string())
 }
 
 #[cfg(test)]
@@ -1445,6 +1616,33 @@ mod tests {
                 "APIMAIL_IMAP_TIMEOUT_SECS",
             ),
             (
+                ConfigError::InvalidMcpFlag {
+                    name: MCP_STDIO_VAR.into(),
+                },
+                "invalid_mcp_flag",
+                MCP_STDIO_VAR,
+            ),
+            (
+                ConfigError::ConflictingMcpTransports {
+                    stdio: MCP_STDIO_VAR.into(),
+                    http: MCP_HTTP_VAR.into(),
+                },
+                "conflicting_mcp_transports",
+                MCP_STDIO_VAR,
+            ),
+            (
+                ConfigError::InvalidMcpPath,
+                "invalid_mcp_path",
+                MCP_PATH_VAR,
+            ),
+            (
+                ConfigError::McpFeatureDisabled {
+                    name: MCP_HTTP_VAR.into(),
+                },
+                "mcp_feature_disabled",
+                MCP_HTTP_VAR,
+            ),
+            (
                 ConfigError::Account(AccountError::InvalidTls {
                     name: "APIMAIL_IMAP_TLS".into(),
                     value: LEAKED_VALUE.into(),
@@ -1636,5 +1834,210 @@ mod tests {
         let limits = config.queue_limits();
         assert_eq!(limits.max_items, 23);
         assert_eq!(limits.max_bytes, 2048);
+    }
+
+    /// With no MCP variable set the service must behave exactly as it did before
+    /// MCP existed: this test runs in **both** build modes on purpose.
+    #[test]
+    fn mcp_defaults_when_absent() {
+        let config = Config::from_lookup(lookup_from(base_entries())).expect("valid config");
+        assert!(!config.mcp_stdio);
+        assert!(!config.mcp_http);
+        assert_eq!(config.mcp_path, DEFAULT_MCP_PATH);
+        assert_eq!(DEFAULT_MCP_PATH, "/mcp");
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_flags_are_parsed_case_insensitively() {
+        for (name, value, expected) in [
+            (MCP_STDIO_VAR, "true", true),
+            (MCP_STDIO_VAR, "TRUE", true),
+            (MCP_STDIO_VAR, "True", true),
+            (MCP_STDIO_VAR, "1", true),
+            (MCP_HTTP_VAR, "false", false),
+            (MCP_HTTP_VAR, "FALSE", false),
+            (MCP_HTTP_VAR, "False", false),
+            (MCP_HTTP_VAR, "0", false),
+        ] {
+            let config = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(name, value)]),
+            ))
+            .expect("a valid flag should load");
+            let (loaded, other) = if name == MCP_STDIO_VAR {
+                (config.mcp_stdio, config.mcp_http)
+            } else {
+                (config.mcp_http, config.mcp_stdio)
+            };
+            assert_eq!(
+                loaded, expected,
+                "{name}={value} should parse to {expected}"
+            );
+            assert!(!other, "{name}={value} must not enable the other transport");
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn invalid_mcp_flag_is_an_error_naming_the_variable() {
+        // A blank or padded flag is rejected too: the raw value is never trimmed,
+        // so a deployment that sends `APIMAIL_MCP_STDIO=` fails loudly instead of
+        // silently falling back to `false`.
+        for (name, value) in [
+            (MCP_STDIO_VAR, "yes"),
+            (MCP_STDIO_VAR, ""),
+            (MCP_STDIO_VAR, " true"),
+            (MCP_STDIO_VAR, "TRUE "),
+            (MCP_HTTP_VAR, "on"),
+        ] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(name, value)]),
+            ))
+            .expect_err("an invalid flag must fail");
+            assert!(
+                err.to_string().contains(name),
+                "the error message must name {name}: {err}"
+            );
+            match err {
+                ConfigError::InvalidMcpFlag { name: got } => assert_eq!(got, name),
+                other => panic!("expected InvalidMcpFlag for {value:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Neither surface may echo the offending value: `Display` and
+    /// `public_message` are what the entrypoint logs.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn invalid_mcp_flag_never_echoes_the_value() {
+        for name in [MCP_STDIO_VAR, MCP_HTTP_VAR] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(name, LEAKED_VALUE)]),
+            ))
+            .expect_err("an invalid flag must fail");
+            assert!(
+                !err.to_string().contains(LEAKED_VALUE),
+                "the error message must not echo the value: {err}"
+            );
+            assert!(
+                !err.public_message().contains(LEAKED_VALUE),
+                "the public message must not echo the value: {}",
+                err.public_message()
+            );
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn requesting_both_mcp_transports_is_an_error_naming_both_variables() {
+        for (stdio, http) in [("true", "true"), ("1", "TRUE"), ("TRUE", "1")] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries()
+                    .into_iter()
+                    .chain([(MCP_STDIO_VAR, stdio), (MCP_HTTP_VAR, http)]),
+            ))
+            .expect_err("both transports at once must fail");
+            let message = err.to_string();
+            assert!(
+                message.contains(MCP_STDIO_VAR),
+                "the error message must name {MCP_STDIO_VAR}: {message}"
+            );
+            assert!(
+                message.contains(MCP_HTTP_VAR),
+                "the error message must name {MCP_HTTP_VAR}: {message}"
+            );
+            match err {
+                ConfigError::ConflictingMcpTransports {
+                    stdio: got_stdio,
+                    http: got_http,
+                } => {
+                    assert_eq!(got_stdio, MCP_STDIO_VAR);
+                    assert_eq!(got_http, MCP_HTTP_VAR);
+                }
+                other => panic!("expected ConflictingMcpTransports, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_path_accepts_absolute_paths_outside_the_reserved_prefix() {
+        for path in ["/mcp", "/mcp/email", "/not-api", "/apis", "/apiary"] {
+            let config = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(MCP_PATH_VAR, path)]),
+            ))
+            .expect("a valid path should load");
+            assert_eq!(config.mcp_path, path);
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn invalid_mcp_path_is_an_error_naming_the_variable() {
+        for path in ["", "mcp", "./mcp", "/", "/api", "/api/", "/api/v1/messages"] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(MCP_PATH_VAR, path)]),
+            ))
+            .expect_err("an invalid path must fail");
+            assert!(
+                err.to_string().contains(MCP_PATH_VAR),
+                "the error message must name the variable: {err}"
+            );
+            match err {
+                ConfigError::InvalidMcpPath => {}
+                other => panic!("expected InvalidMcpPath for {path:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The whole point of the feature check: a binary that cannot serve MCP must
+    /// refuse to start when it is handed MCP configuration.
+    #[cfg(not(feature = "mcp"))]
+    #[test]
+    fn mcp_variable_is_an_error_without_the_feature() {
+        for (name, value) in [
+            (MCP_STDIO_VAR, "true"),
+            (MCP_HTTP_VAR, "1"),
+            (MCP_PATH_VAR, "/mcp"),
+        ] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(name, value)]),
+            ))
+            .expect_err("an MCP variable without the feature must fail");
+            assert!(
+                err.to_string().contains(name),
+                "the error message must name {name}: {err}"
+            );
+            match err {
+                ConfigError::McpFeatureDisabled { name: got } => assert_eq!(got, name),
+                other => panic!("expected McpFeatureDisabled for {name}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The feature error must not echo the value either, and it must win over any
+    /// value validation: what is defined is the variable, not its contents.
+    #[cfg(not(feature = "mcp"))]
+    #[test]
+    fn mcp_error_without_the_feature_never_echoes_the_value() {
+        for name in [MCP_STDIO_VAR, MCP_HTTP_VAR, MCP_PATH_VAR] {
+            let err = Config::from_lookup(lookup_from(
+                base_entries().into_iter().chain([(name, LEAKED_VALUE)]),
+            ))
+            .expect_err("an MCP variable without the feature must fail");
+            assert!(
+                !err.to_string().contains(LEAKED_VALUE),
+                "the error message must not echo the value: {err}"
+            );
+            assert!(
+                !err.public_message().contains(LEAKED_VALUE),
+                "the public message must not echo the value: {}",
+                err.public_message()
+            );
+            match err {
+                ConfigError::McpFeatureDisabled { name: got } => assert_eq!(got, name),
+                other => panic!("expected McpFeatureDisabled for {name}, got {other:?}"),
+            }
+        }
     }
 }

@@ -76,6 +76,7 @@ pub struct StoredWatermark {
 
 /// Observable state of the queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct QueueStats {
     /// Whether the queue is backed by a file.
     pub persistent: bool,

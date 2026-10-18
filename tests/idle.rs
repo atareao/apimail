@@ -286,6 +286,17 @@ fn content_type(response: &Response) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
+/// Asserts a JSON body carries exactly `expected` as its field names (sorted).
+///
+/// The shape of a body is part of the contract, so the migration of an operation
+/// into the service layer may not add, rename or drop a field.
+fn assert_body_keys(json: &serde_json::Value, expected: &[&str], what: &str) {
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, expected, "unexpected fields in {what}: {json}");
+}
+
 /// Waits (bounded) until `check` holds, panicking with `what` otherwise.
 async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -317,6 +328,11 @@ async fn start_reports_running_with_a_configured_webhook() {
     assert_eq!(json["status"], "running");
     assert_eq!(json["mailbox"], "INBOX");
     assert_eq!(json["last_error"], serde_json::Value::Null);
+    assert_body_keys(
+        &json,
+        &["last_error", "mailbox", "status"],
+        "the start body",
+    );
 
     // A dedicated connection is established for the subscription.
     wait_until("the dedicated connection", || connector.connects() >= 1).await;
@@ -382,6 +398,42 @@ async fn status_reports_state_mailbox_and_last_error() {
     let _ = post(&app, "/api/idle/stop", Some(&bearer())).await;
 }
 
+/// Pins the *shape* of the `200` body: the DTO lives in [`apimail::idle`] and is
+/// consumed verbatim by the operation, so no field may be added, renamed or lost.
+#[tokio::test]
+async fn status_body_has_exactly_the_reported_fields() {
+    let config = config_with_webhook(Some(WEBHOOK_URL));
+    let connector = FakeIdleConnector::new(mailbox_status(Some(43)), Vec::new(), Vec::new());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = app(
+        &config,
+        connector.clone(),
+        Arc::new(FakeWebhook { deliveries: tx }),
+    );
+
+    let stopped = get(&app, "/api/idle/status", Some(&bearer())).await;
+    assert_eq!(stopped.status(), StatusCode::OK);
+    let json = body_json(stopped).await;
+    assert_body_keys(
+        &json,
+        &["last_error", "mailbox", "status"],
+        "the stopped body",
+    );
+
+    let _ = post(&app, "/api/idle/start", Some(&bearer())).await;
+
+    let running = get(&app, "/api/idle/status", Some(&bearer())).await;
+    assert_eq!(running.status(), StatusCode::OK);
+    let json = body_json(running).await;
+    assert_body_keys(
+        &json,
+        &["last_error", "mailbox", "status"],
+        "the running body",
+    );
+
+    let _ = post(&app, "/api/idle/stop", Some(&bearer())).await;
+}
+
 #[tokio::test]
 async fn stop_reports_stopped_and_is_idempotent() {
     let config = config_with_webhook(Some(WEBHOOK_URL));
@@ -398,11 +450,19 @@ async fn stop_reports_stopped_and_is_idempotent() {
     let stopped = post(&app, "/api/idle/stop", Some(&bearer())).await;
     assert_eq!(stopped.status(), StatusCode::OK);
     assert_eq!(content_type(&stopped), Some("application/json"));
-    assert_eq!(body_json(stopped).await["status"], "stopped");
+    let json = body_json(stopped).await;
+    assert_eq!(json["status"], "stopped");
+    assert_body_keys(&json, &["last_error", "mailbox", "status"], "the stop body");
 
     let again = post(&app, "/api/idle/stop", Some(&bearer())).await;
     assert_eq!(again.status(), StatusCode::OK);
-    assert_eq!(body_json(again).await["status"], "stopped");
+    let json = body_json(again).await;
+    assert_eq!(json["status"], "stopped");
+    assert_body_keys(
+        &json,
+        &["last_error", "mailbox", "status"],
+        "the repeated stop body",
+    );
 }
 
 #[tokio::test]
@@ -422,7 +482,11 @@ async fn start_without_a_webhook_is_501_and_opens_no_connection() {
     assert_eq!(content_type(&response), Some("application/json"));
     let json = body_json(response).await;
     assert_eq!(json["error"], "idle_not_configured");
-    assert!(json["message"].is_string(), "{json}");
+    assert_eq!(
+        json["message"], "idle notifications are not configured",
+        "the 501 message is part of the contract"
+    );
+    assert_body_keys(&json, &["error", "message"], "the 501 body");
     assert_eq!(connector.connects(), 0, "no connection must be opened");
 }
 

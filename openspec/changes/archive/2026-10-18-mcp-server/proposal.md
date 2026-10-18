@@ -51,7 +51,9 @@ actuales no cambian. Los cambios en `http-api` son aditivos (un escenario nuevo)
 ## Impact
 
 - `Cargo.toml`: feature `mcp` (default OFF) y dependencias **opcionales** `rmcp` y `schemars`
-  (higiene de dependencias en `design.md`). **No** se toca hasta la fase de implementación.
+  (higiene de dependencias en `design.md`). **Corregido: ya se tocó en §1** (el andamiaje declaró la
+  feature y las deps opcionales), así que no es un fichero «intacto hasta la implementación»: es el
+  primer fichero que el change modifica.
 - `src/service.rs` (**nuevo**): capa de servicio compartida (DTOs y errores de dominio).
 - `src/mcp.rs` (**nuevo**, tras `#[cfg(feature = "mcp")]`): servidor, transportes y las 17 tools.
 - `src/http.rs`: `build_router` anida el servicio MCP cuando corresponde; los handlers delegan en

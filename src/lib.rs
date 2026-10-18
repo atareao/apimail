@@ -7,12 +7,15 @@ pub mod config;
 pub mod http;
 pub mod idle;
 pub mod imap;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod mime;
 pub mod queue;
+pub mod service;
 pub mod smtp;
 
 pub use config::{AccountError, Config, ConfigError, MailAccount, MailEndpoint, TlsMode};
-pub use http::{AppState, AppStateError, build_router};
+pub use http::build_router;
 pub use idle::{
     AddressPayload, AttachmentPayload, EnvelopePayload, HttpWebhookSender, IDLE_REISSUE_INTERVAL,
     IdleConnector, IdleError, IdleEvent, IdleSession, IdleSettings, IdleStatus, IdleSupervisor,
@@ -25,9 +28,12 @@ pub use imap::{
     MessageEnvelope, MessagePage, ParsedMessageError, QueryError, SearchCriteria, SearchDate,
     SendFuture, SystemFlag, TokioImapConnector,
 };
+#[cfg(feature = "mcp")]
+pub use mcp::{ApimailMcp, McpServeError};
 pub use mime::{MimeError, ParsedAttachment, ParsedMessage};
 pub use queue::{
     NotificationQueue, QueueError, QueueLimits, QueueStats, QueuedNotification, StoredWatermark,
     WebhookQueue,
 };
+pub use service::{AppState, AppStateError, ServiceError};
 pub use smtp::{MailSender, MessageError, OutgoingAttachment, OutgoingMessage, SmtpError};

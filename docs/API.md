@@ -163,6 +163,37 @@ Notas de límites relevantes para la API:
 - **Códigos `error` estables**: los mensajes de error de correo son cadenas fijas
   o agrupadas por familia, nunca texto de terceros.
 
+### MCP: una capa de exposición, no una segunda API
+
+apimail puede exponerse además como **servidor MCP** (feature de Cargo `mcp`,
+opt-in y por defecto OFF) sobre **dos** transportes: stdio y Streamable HTTP
+anidado en este **mismo listener** (`APIMAIL_MCP_PATH`, por defecto `/mcp`).
+
+Ese servidor **no** introduce rutas ni lógica nuevas: sus 17 tools delegan en la
+**misma capa de servicio** que los handlers de las rutas de este documento, y un
+fallo de una tool se presenta como error de tool con el texto
+`"<kind>: <mensaje>"` — el mismo par código/mensaje que el envoltorio
+`{"error","message"}` de aquí. Es decir, los códigos `error` de la tabla del
+apéndice (`imap_unavailable`, `mailbox_not_found`, `message_not_found`,
+`invalid_request`, `capability_not_supported`, `smtp_error`, …) significan lo
+mismo y se alcanzan en las mismas condiciones por MCP que por HTTP; lo único que
+cambia es el dialecto de los argumentos (qué parámetro es opcional, cómo se
+escribe una fecha o un `format`, dónde se acota una página) y la forma de
+renderizar el fallo. Por eso esta referencia **no duplica** la superficie MCP: la
+lista de tools, los ejemplos de configuración de cliente y las variables de
+entorno están en el README (`## Servidor MCP (Model Context Protocol)`).
+
+Dos consecuencias que conviene tener presentes al leer las convenciones de arriba:
+
+- El transporte **HTTP** de MCP queda dentro del sub-router protegido, así que
+  exige la **misma** cabecera `Authorization: Bearer <APIMAIL_API_KEY>` y responde
+  el mismo `401 unauthorized` del apartado de autenticación. **No hay OAuth** en
+  esta iteración: los clientes que exigen OAuth 2.1 (ChatGPT) todavía no
+  funcionan.
+- Las operaciones administrativas **no** se exponen como tools: `GET /api/health`,
+  `POST /api/idle/start` y `POST /api/idle/stop` solo existen aquí. La suscripción
+  IDLE se puede observar por MCP (`idle_status`, `idle_queue`), no gobernar.
+
 ---
 
 ## Índice de rutas

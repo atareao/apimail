@@ -23,3 +23,22 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - name: Run tests
         run: cargo test
+
+  test-mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (feature mcp)
+        run: cargo clippy --features mcp --all-targets -- -D warnings
+      - name: Check rustdoc (feature mcp)
+        run: cargo doc --features mcp --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - name: Run tests (feature mcp)
+        run: cargo test --features mcp --no-fail-fast

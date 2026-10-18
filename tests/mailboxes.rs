@@ -359,6 +359,61 @@ async fn listing_reports_null_delimiter_and_empty_attributes() {
     );
 }
 
+/// Pins the *shape* of the `200` body: the listing DTOs move to the service
+/// layer, and no field may be added, renamed or lost.
+#[tokio::test]
+async fn listing_body_has_exactly_the_reported_fields() {
+    let response = get_mailboxes(
+        app_with(FakeConnector::with_mailboxes(
+            vec![inbox()],
+            SelectResponse::NotFound,
+        )),
+        Some(&format!("Bearer {API_KEY}")),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["mailboxes"], "unexpected fields in the body: {json}");
+
+    let mailbox = json["mailboxes"][0]
+        .as_object()
+        .expect("each mailbox must be a JSON object");
+    let mut keys: Vec<&str> = mailbox.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["attributes", "delimiter", "name"],
+        "unexpected fields in a mailbox: {json}"
+    );
+}
+
+/// Pins the *shape* of the `503` body: exactly the shared `{"error","message"}`
+/// envelope, with no extra field.
+#[tokio::test]
+async fn unavailable_body_has_exactly_the_reported_fields() {
+    let response = get_mailboxes(
+        app_with(FakeConnector::unreachable()),
+        Some(&format!("Bearer {API_KEY}")),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = body_json(response).await;
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["error", "message"],
+        "unexpected fields in the body: {json}"
+    );
+}
+
 #[tokio::test]
 async fn protocol_errors_return_stable_503_without_third_party_text() {
     for (failure, expected) in [
@@ -459,6 +514,25 @@ async fn selecting_returns_the_status() {
     assert_eq!(json["uid_next"], 100);
     assert_eq!(json["flags"][0], "\\Seen");
     assert_eq!(json["flags"][1], "\\Flagged");
+
+    // The *shape* of the body is part of the contract: no field may be added,
+    // renamed or lost by the migration into the service layer.
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "exists",
+            "flags",
+            "mailbox",
+            "recent",
+            "uid_next",
+            "uid_validity",
+            "unseen"
+        ],
+        "unexpected fields in the select body: {json}"
+    );
 }
 
 #[tokio::test]
@@ -483,10 +557,14 @@ async fn unknown_mailbox_returns_404() {
     );
     let json = body_json(response).await;
     assert_eq!(json["error"], "mailbox_not_found");
-    assert!(
-        json["message"].is_string(),
-        "message should be a string: {json}"
+    assert_eq!(
+        json["message"], "mailbox not found",
+        "the 404 message is part of the contract"
     );
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["error", "message"], "unexpected fields: {json}");
 }
 
 #[tokio::test]
@@ -502,12 +580,21 @@ async fn malformed_body_returns_400() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(response).await["error"], "invalid_request");
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "invalid_request");
+    assert_eq!(
+        json["message"], "invalid JSON body",
+        "the transport's own 400 must not echo the payload"
+    );
 }
 
 #[tokio::test]
 async fn empty_or_blank_mailbox_returns_400() {
-    for body in ["{}", "{\"mailbox\":\"\"}", "{\"mailbox\":\"   \"}"] {
+    for (body, expected) in [
+        ("{}", "invalid JSON body"),
+        ("{\"mailbox\":\"\"}", "`mailbox` must not be empty"),
+        ("{\"mailbox\":\"   \"}", "`mailbox` must not be empty"),
+    ] {
         let response = post_select(
             app_with(FakeConnector::with_mailboxes(
                 vec![inbox()],
@@ -530,7 +617,12 @@ async fn empty_or_blank_mailbox_returns_400() {
             StatusCode::BAD_REQUEST,
             "body `{body}` should be rejected"
         );
-        assert_eq!(body_json(response).await["error"], "invalid_request");
+        let json = body_json(response).await;
+        assert_eq!(json["error"], "invalid_request");
+        assert_eq!(
+            json["message"], expected,
+            "body `{body}` should carry the documented message"
+        );
     }
 }
 

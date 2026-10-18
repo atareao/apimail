@@ -747,3 +747,174 @@ async fn without_api_key_returns_401() {
     .await;
     assert_eq!(detail.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// Reads a response body as text, keeping the serialisation order observable.
+async fn body_text(response: Response) -> String {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body should be readable")
+        .to_bytes();
+    String::from_utf8(bytes.to_vec()).expect("the JSON body is UTF-8")
+}
+
+/// The sorted key set of a JSON object.
+fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+    let object = value.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<String> = object.keys().cloned().collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Asserts that every key of `expected` appears in `raw` **in that order**.
+///
+/// The DTOs are serialised in declaration order, so the order of the keys of the
+/// published body is part of the contract and is pinned here from the raw bytes
+/// (which `serde_json::Value`, an unordered map, cannot show).
+fn assert_key_order(raw: &str, expected: &[&str]) {
+    let mut previous = 0usize;
+    for key in expected {
+        let needle = format!("\"{key}\":");
+        let at = raw
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing key `{key}` in {raw}"));
+        assert!(at >= previous, "key `{key}` is out of order in {raw}");
+        previous = at;
+    }
+}
+
+/// Pins the **exact shape and field order** of the `200` body of
+/// `GET /api/messages`: the DTOs moved to [`apimail::service`] with their fields
+/// in the same declaration order, so nothing may be added, renamed, lost or
+/// reordered.
+#[tokio::test]
+async fn listing_body_shape_and_order_are_pinned() {
+    let connector = FakeConnector::new(ConnectOutcome::Session)
+        .with_uids(vec![42])
+        .with_messages(vec![message(42)]);
+    let app = app_with(connector);
+
+    let response = get(app, "/api/messages?mailbox=INBOX", Some(&bearer())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = body_text(response).await;
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON body");
+
+    assert_eq!(
+        sorted_keys(&json),
+        ["limit", "mailbox", "messages", "offset", "total"]
+    );
+    let message = &json["messages"][0];
+    assert_eq!(
+        sorted_keys(message),
+        ["envelope", "flags", "internal_date", "seq", "size", "uid"]
+    );
+    let envelope = &message["envelope"];
+    assert_eq!(
+        sorted_keys(envelope),
+        ["cc", "date", "from", "message_id", "subject", "to"]
+    );
+    assert_eq!(sorted_keys(&envelope["from"][0]), ["address", "name"]);
+
+    assert_key_order(
+        &raw,
+        &[
+            "mailbox",
+            "total",
+            "limit",
+            "offset",
+            "messages",
+            "uid",
+            "seq",
+            "flags",
+            "size",
+            "internal_date",
+            "envelope",
+            "from",
+            "to",
+            "cc",
+            "subject",
+            "date",
+            "message_id",
+        ],
+    );
+}
+
+/// Pins the **exact shape and field order** of the `200` body of
+/// `GET /api/messages/{uid}`, in all three formats: the conditional
+/// `headers_base64`/`raw_base64` fields must appear last, and only for the
+/// matching format.
+#[tokio::test]
+async fn detail_body_shape_and_order_are_pinned() {
+    let header_bytes = b"Subject: hi\r\n\r\n".to_vec();
+    let raw_body = b"Subject: hi\r\n\r\nfull body".to_vec();
+
+    let mut headers_message = message(42);
+    headers_message.headers = Some(header_bytes);
+    let mut full_message = message(42);
+    full_message.body = Some(raw_body);
+
+    let cases: [(&str, Vec<Message>, &[&str]); 3] = [
+        (
+            "/api/messages/42?mailbox=INBOX",
+            vec![message(42)],
+            &[
+                "mailbox",
+                "uid",
+                "seq",
+                "flags",
+                "size",
+                "internal_date",
+                "envelope",
+                "format",
+            ],
+        ),
+        (
+            "/api/messages/42?mailbox=INBOX&format=headers",
+            vec![headers_message],
+            &[
+                "mailbox",
+                "uid",
+                "seq",
+                "flags",
+                "size",
+                "internal_date",
+                "envelope",
+                "format",
+                "headers_base64",
+            ],
+        ),
+        (
+            "/api/messages/42?mailbox=INBOX&format=full",
+            vec![full_message],
+            &[
+                "mailbox",
+                "uid",
+                "seq",
+                "flags",
+                "size",
+                "internal_date",
+                "envelope",
+                "format",
+                "raw_base64",
+            ],
+        ),
+    ];
+
+    for (uri, messages, expected) in cases {
+        let app = app_with(FakeConnector::new(ConnectOutcome::Session).with_messages(messages));
+        let response = get(app, uri, Some(&bearer())).await;
+        assert_eq!(response.status(), StatusCode::OK, "`{uri}` should be a 200");
+        let raw = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON body");
+
+        let mut expected_sorted: Vec<&str> = expected.to_vec();
+        expected_sorted.sort_unstable();
+        assert_eq!(
+            sorted_keys(&json),
+            expected_sorted,
+            "unexpected fields: {raw}"
+        );
+        assert_key_order(&raw, expected);
+    }
+}

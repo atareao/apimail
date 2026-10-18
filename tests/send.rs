@@ -1,4 +1,10 @@
 //! Integration tests for `POST /api/messages` using an in-memory fake mailer.
+//!
+//! The `message` of every failure is **characterised here with its exact text**:
+//! it is part of the contract the operation publishes, so the MCP transport can
+//! render the very same refusal. Note that `payload_too_large` has two
+//! producers — the decoded attachments of the service and the raw HTTP body of
+//! the transport — and the two messages are deliberately different.
 
 use std::sync::{Arc, Mutex};
 
@@ -208,7 +214,11 @@ async fn missing_recipient_is_400() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(response).await["error"], "invalid_request");
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "invalid_request");
+    // Characterisation: the message is the validation rule's own text, and it is
+    // now part of the contract the MCP transport inherits unchanged.
+    assert_eq!(json["message"], "at least one recipient (`to`) is required");
     assert!(mailer.messages().is_empty());
 }
 
@@ -223,7 +233,35 @@ async fn invalid_address_is_400() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(response).await["error"], "invalid_request");
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "invalid_request");
+    // The message echoes the offending field and the offending value: that is
+    // request input, and it is what makes the refusal actionable.
+    assert_eq!(json["message"], "invalid address in `to`: `not an address`");
+    assert!(mailer.messages().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_sender_is_400() {
+    let mailer = FakeMailer::default();
+    let response = post_json(
+        app(&mailer, 1024),
+        &serde_json::json!({
+            "from": "not-an-address",
+            "to": ["dest@test.example"],
+            "subject": "hi"
+        }),
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "invalid_request");
+    assert_eq!(
+        json["message"],
+        "invalid address in `from`: `not-an-address`"
+    );
     assert!(mailer.messages().is_empty());
 }
 
@@ -253,7 +291,13 @@ async fn invalid_base64_attachment_is_400() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(response).await["error"], "invalid_request");
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "invalid_request");
+    // The message names the offending attachment, never the payload.
+    assert_eq!(
+        json["message"],
+        "attachment `broken.bin` is not valid base64"
+    );
     assert!(mailer.messages().is_empty());
 }
 
@@ -273,7 +317,15 @@ async fn oversized_attachment_is_413() {
     .await;
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(body_json(response).await["error"], "payload_too_large");
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "payload_too_large");
+    // The **domain** `413`: the limit is over the *decoded* attachments, so the
+    // message names the total and the limit — not the body limit (see
+    // `oversized_raw_body_is_413_with_json_envelope` for that other `413`).
+    assert_eq!(
+        json["message"],
+        "attachments total 10 bytes, exceeding the limit of 4 bytes"
+    );
     assert!(mailer.messages().is_empty());
 }
 
@@ -313,7 +365,14 @@ async fn attachment_one_byte_over_the_limit_is_413() {
     .await;
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(body_json(response).await["error"], "payload_too_large");
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "payload_too_large");
+    // Second sample of the domain `413` at a different scale: the message is
+    // built from the two numbers, never a fixed string.
+    assert_eq!(
+        json["message"],
+        "attachments total 1025 bytes, exceeding the limit of 1024 bytes"
+    );
     assert!(mailer.messages().is_empty());
 }
 
@@ -337,6 +396,25 @@ async fn oversized_raw_body_is_413_with_json_envelope() {
     let json = body_json(response).await;
     assert_eq!(json["error"], "payload_too_large");
     assert!(json["message"].is_string(), "message should be a string");
+    // The **transport's** `413`: the limit is over the raw HTTP body, and its
+    // message is deliberately *different* from the domain one
+    // (`attachments total … bytes, exceeding the limit of … bytes`), because the
+    // two failures are not interchangeable.
+    assert_eq!(
+        json["message"],
+        "request body exceeds the limit: length limit exceeded"
+    );
+    assert_ne!(
+        json["message"],
+        "attachments total 1025 bytes, exceeding the limit of 1024 bytes"
+    );
+    assert!(
+        !json["message"]
+            .as_str()
+            .expect("message should be a string")
+            .starts_with("attachments total"),
+        "the transport's `413` must not be mistaken for the domain one: {json}"
+    );
     assert!(mailer.messages().is_empty());
 }
 

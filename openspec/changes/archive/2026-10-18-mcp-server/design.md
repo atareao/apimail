@@ -4,17 +4,28 @@
 
 Estado real del código sobre el que se construye (verificado leyendo los ficheros):
 
-- **Servidor y router**: `build_router(state: AppState) -> Router` en `src/http.rs:2158`. Construye
+*Nota sobre las anclas `fichero:línea`:* esta sección se midió **antes** de implementar §2 (capa de
+servicio) y §5 (montaje del transporte HTTP), que sacan símbolos de `src/http.rs` y los mueven a
+`src/service.rs`. La revalidación se aplazó a propósito **a una sola pasada al cerrar el change**
+(§10), ya con el refactor terminado y `src/http.rs` sin moverse: los números que siguen son los del
+árbol en ese momento (HEAD `27531f0`, `src/http.rs` en **1483** líneas). Donde un número era frágil
+(una línea que un reflow mueve, o una que ya se desvió dos veces) se cita el **nombre del símbolo**,
+que sobrevive al reflow; la línea exacta queda como referencia secundaria.
+
+- **Servidor y router**: `build_router(state: AppState) -> Router` en `src/http.rs:1334`. Construye
   `protected` con las rutas `/api/...` y le aplica
   `.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))`
-  (`src/http.rs:2188`); después, `Router::new().route("/api/health", get(health)).merge(protected)
-  .with_state(state)` (`src/http.rs:2194-2196`). **`GET /api/health` es la única ruta pública**;
-  todo lo demás cuelga de `require_api_key` (`src/http.rs:2108`) — de ahí que *anidar* el servicio
+  (`src/http.rs:1377`); después, `Router::new().route("/api/health", get(health)).merge(protected)
+  .with_state(state)` (`src/http.rs:1382-1385`). **`GET /api/health` es la única ruta pública**;
+  todo lo demás cuelga de `require_api_key` (`src/http.rs:1276`) — de ahí que *anidar* el servicio
   MCP dentro de `protected` reutilice la autenticación **sin código nuevo de auth**.
-- **Estado y firma de `build_router`**: `AppState` (`src/http.rs:403`, `Debug` en `src/http.rs:434`)
-  no conoce hoy nada de MCP, y `build_router(state: AppState)` solo recibe el estado. **Cambiar su
-  firma rompería los 313 tests** que llaman `build_router(state)` (p. ej. `tests/health.rs:25`,
-  `tests/auth.rs:32`). Por eso la configuración del transporte HTTP viaja **dentro de `AppState`**
+- **Estado y firma de `build_router`**: `AppState` (`src/service.rs:222`, `Debug` manual en
+  `src/service.rs:275`; `AppStateError` en el mismo módulo, `src/service.rs:171`)
+  no conocía nada de MCP, y `build_router(state: AppState)` solo recibe el estado. **Cambiar su
+  firma habría roto los tests existentes** — **318 tests en el baseline medido al iniciar la
+  implementación** (la suite, ya con el change cerrado, es de **349** por defecto y **364** con
+  `--features mcp`), que llaman `build_router(state)` (p. ej. `tests/health.rs:25`,
+  `tests/auth.rs:32`) —. Por eso la configuración del transporte HTTP viaja **dentro de `AppState`**
   (ver Decisión 7): `build_router` conserva su firma y decide a partir del estado.
 - **20 rutas** expuestas entre `protected` y `health`: `/api/health` (GET), `/api/whoami` (GET),
   `/api/account` (GET), `/api/imap/status` (GET), `/api/idle/start` (POST), `/api/idle/stop`
@@ -24,45 +35,55 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
   `/api/messages/{uid}/copy` (POST), `/api/messages/{uid}/body` (GET),
   `/api/messages/{uid}/attachments` (GET) y `/api/messages/{uid}/attachments/{id}` (GET). El mapeo
   a tools cuadra: **17 tools + health + idle/start + idle/stop = 20**.
-- **DTOs**: los tipos de respuesta viven en `src/http.rs` — `EndpointView` (`617`), `AccountView`
-  (`628`), `HealthResponse` (`637`), `WhoamiResponse` (`648`), `SentResponse` (`655`),
-  `ImapStatusResponse` (`662`), `ImapUnavailableResponse` (`675`), `MailboxDto` (`686`),
-  `MailboxListResponse` (`707`), `SelectMailboxDto` (`714`), `MailboxStatusResponse` (`721`),
-  `MessageDto` (`845`), `MessageListResponse` (`875`), `MessageDetailResponse` (`893`),
-  `MessageBodyResponse` (`961`), `ParsedAttachmentDto` (`977`), `AttachmentListResponse` (`1007`),
-  `AttachmentResponse` (`1019`), `FlagUpdateDto` (`1256`), `MoveCopyDto` (`1290`),
-  `FlagUpdateResponse` (`1354`), `MoveCopyResponse` (`1365`), `DeleteResponse` (`1378`),
-  `SendMessageDto` (`1510`), `ErrorResponse` (`1586`). Solo `EndpointView`, `AccountView` y
-  `HealthResponse` son `pub` hoy; el resto son privados del módulo y habrá que reubicarlos o
-  exponerlos al extraer la capa de servicio.
+- **DTOs**: **el inventario inicial decía que los tipos de respuesta viven en `src/http.rs` y era
+  falso** — el refactor de §2 los movió a **`src/service.rs`**, que es donde viven hoy, todos `pub`
+  (ya no son privados de módulo): `EndpointView` (`src/service.rs:504`), `AccountView` (`516`),
+  `WhoamiResponse` (`526`), `ImapStatusResponse` (`534`), `MailboxDto` (`551`),
+  `MailboxListResponse` (`576`), `MailboxStatusResponse` (`587`), `AddressDto` (`625`, **nuevo** en
+  el refactor), `EnvelopeDto` (`647`, **nuevo**), `MessageDto` (`681`), `MessageListResponse`
+  (`715`), `MessageDetailResponse` (`736`), `MessageBodyResponse` (`807`), `ParsedAttachmentDto`
+  (`826`), `AttachmentListResponse` (`860`), `AttachmentResponse` (`876`), `FlagUpdateResponse`
+  (`901`), `MoveCopyResponse` (`917`), `DeleteResponse` (`935`), `SentResponse` (`947`),
+  `AttachmentDto` (`959`, **nuevo**), `SendMessageDto` (`977`) y `ServiceError` (`1095`).
+  Lo que **sigue** en `src/http.rs` es solo transporte —los tipos de *query*/*body* que ningún
+  agente MCP necesita ver y las respuestas atadas a un status concreto—: `HealthResponse`
+  (`src/http.rs:342`), `ImapUnavailableResponse` (`358`), `SelectMailboxDto` (`369`),
+  `ListMessagesQuery` (`422`), `FetchMessageQuery` (`451`), `MailboxQuery` (`626`),
+  `FlagUpdateDto` (`636`), `MoveCopyDto` (`670`) y `ErrorResponse` (`788`).
+  Es exactamente la Decisión 8: los mismos tipos sirven a la API HTTP y a los esquemas MCP,
+  sin duplicar ninguno.
 - **Envoltorio de error**: `ErrorResponse { error: &'static str, message: String }`
-  (`src/http.rs:1586`); el `401` usa `Unauthorized` (`src/http.rs:1635`) y `UnauthorizedResponse`
-  (`src/http.rs:1639`) y emite `WWW-Authenticate: Bearer`.
+  (`src/http.rs:788`); el `401` usa `Unauthorized` (`src/http.rs:902`) y `UnauthorizedResponse`
+  (`src/http.rs:906`) y emite `WWW-Authenticate: Bearer`.
 - **Códigos `error` estables reales** (verificados por `grep` de los `ErrorResponse`/`error_response`
   en `src/http.rs`): `unauthorized` (`401`), `invalid_request` (`400`), `mailbox_not_found`
   (`404`), `message_not_found` (`404`), `attachment_not_found` (`404`), `message_too_large`
   (`413`), `payload_too_large` (`413`), `message_not_parsable` (`422`), `capability_not_supported`
   (`501`), `idle_not_configured` (`501`), `smtp_error` (`502`) e `imap_unavailable` (`503`).
   **`imap_tls` NO es un código**: es el nombre del campo `AppState.imap_tls: TlsMode`
-  (`src/http.rs:423`) y un `kind()` de log (`"tls"`, `src/imap.rs:2117`); los fallos de TLS se
+  (`src/service.rs:257`) y un `kind()` de log (`"tls"`, `src/imap.rs:117`); los fallos de TLS se
   exponen al cliente como `imap_unavailable`.
-- **Paginación**: `parse_bounded_u32(..., 50, 200)` (`src/http.rs:1165`), invocado para `limit` en
-  `src/http.rs:1220` ⇒ defecto **50**, máximo **200**. Son los topes que las tools deben respetar.
+- **Paginación**: `parse_bounded_u32(..., 50, 200)` (`src/http.rs:545`), invocado para `limit` en
+  `ListMessagesQuery::into_query` (`src/http.rs:600`) ⇒ defecto **50**, máximo **200**. Son los topes
+  que las tools deben respetar (y `mcp.rs` los replica en `validate_limit`, `src/mcp.rs:153`).
 - **Sesión IMAP compartida**: `ConnectionManager` guarda la sesión en
-  `session: tokio::sync::Mutex<Option<Box<dyn ImapSession>>>` (`src/imap.rs:1296`), serializada por
-  un mutex asíncrono.
+  `session: tokio::sync::Mutex<Option<Box<dyn ImapSession>>>` (`src/imap.rs:1339`), serializada por
+  un mutex asíncrono. *(Ancla corregida: estaba mal de antes, ya en el inventario inicial.)*
 - **Logging**: `src/main.rs:13-16` instala `tracing_subscriber::fmt()...with_writer(std::io::stderr)`.
   **Verificado: los logs YA van a `stderr`**, así que el aislamiento de `stdout` en modo stdio no
   exige migrar el logging: solo hay que asegurarse de no escribir nada más en `stdout`. El cambio
   en `main.rs` es mínimo (documentarlo y servir el transporte).
-- **Arranque**: `TcpListener::bind((config.host, config.port))` (`src/main.rs:33`) y
-  `axum::serve(listener, build_router(state))` (`src/main.rs:58`).
-- **Configuración**: `Config::from_env` (`src/config.rs:478`) delega en `Config::from_lookup`
-  (`src/config.rs:497`), con `ConfigError` (`src/config.rs:344`) y `public_message()`/`kind()` que
-  **nombran la variable sin exponer su valor**. **No existe hoy ningún parseo booleano**: todas las
-  variables son String/puerto/tamaño/ruta/URL/Duración.
+- **Arranque**: `TcpListener::bind((config.host, config.port))` (`src/main.rs:48`) y
+  `axum::serve(listener, build_router(state))` (`src/main.rs:73`).
+- **Configuración**: `Config::from_env` (`src/config.rs:555`) delega en `Config::from_lookup`
+  (`src/config.rs:583`), con `ConfigError` (`src/config.rs:370`) y `public_message()`/`kind()` que
+  **nombran la variable sin exponer su valor**. **No existía ningún parseo booleano de entorno**:
+  todas las variables eran String/puerto/tamaño/ruta/URL/Duración (los booleanos solo aparecían en
+  *query params*, `parse_strict_bool`, `src/http.rs:467`).
 - **Dependencias actuales relevantes**: `axum 0.8.9`, `base64 0.22`, `reqwest 0.12`
-  (`default-features = false`, rustls), `schemars` ausente. `rust-version = "1.88"`.
+  (`default-features = false`, rustls). **`schemars` ya no está ausente**: §1 lo declaró como
+  dependencia **opcional** (`1.2.2`, feature `derive`) detrás de la feature de Cargo `mcp`, junto
+  con `rmcp` (`3.5.1`). `rust-version = "1.88"`.
 - **SDK elegido**: `rmcp` **3.5.1** (Apache-2.0, `rust-version 1.88`, repo
   `modelcontextprotocol/rust-sdk`). Su transporte HTTP es un **servicio Tower**
   (`rmcp::transport::streamable_http_server::{StreamableHttpService, StreamableHttpServerConfig}`),
@@ -99,35 +120,71 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
    `tower::ServiceExt::oneshot`. Reutiliza los handlers, pero obliga a un salto HTTP en bucle, a
    inyectar la API key en el proceso y a parsear códigos de estado — arquitectónicamente pobre y
    con un coste de serialización/deserialización por operación que no aporta nada.
-   *Coste*: es un **refactor sensible** de código legacy con specs y 313 tests ⇒ el paso 2 de
+   *Coste*: es un **refactor sensible** de código legacy con specs y **318 tests en el baseline
+   medido al iniciar la implementación** ⇒ el paso 2 de
    `tasks.md` lo aísla y exige que los tests existentes sigan en verde antes de añadir nada.
 2. **`nest_service` de un servicio Tower de `rmcp` frente a un segundo listener.** El transporte
    `StreamableHttpService` se anida en el `axum::Router` existente (`nest_service`) bajo un path
    configurable (defecto `/mcp`), compartiendo listener y estado. *Alternativa descartada*: levantar
    un servidor HTTP aparte para MCP ⇒ puerto y proceso extra, dos capas de auth que sincronizar y
    un arranque más complejo, sin ninguna ventaja.
+   **Supuesto que quedó *verificado*, no supuesto**: que `route_layer` (aplicado al sub-router que
+   *contiene* el `nest_service`) cubre también el servicio anidado. El orden importa —el `nest_service`
+   se monta **antes** del `route_layer` (`src/http.rs:1370-1375` y `1377`) para que el middleware
+   envuelva la ruta MCP— y se comprobó con dos tests, no por lectura:
+   `tests/mcp_http.rs::mcp_endpoint_without_credential_is_rejected_by_the_shared_middleware` y
+   `::mcp_endpoint_with_a_wrong_credential_is_rejected` (ambos `401` con el envoltorio existente).
 3. **Higiene de dependencias.** Se activa `rmcp` con `default-features = false` y **features
-   explícitas**: `transport-io` (stdio), `transport-streamable-http-server`, `macros` y
+   explícitas**: `server`, `transport-io` (stdio), `transport-streamable-http-server`, `macros` y
    `schemars`. Los motivos:
+   - **`server` es obligatoria, no un extra.** En `rmcp 3.5.1` (`src/lib.rs`), `#[cfg(feature =
+     "server")]` gatea el módulo `transport`, los re-exports `ServerHandler` y `ServiceExt` y los de
+     las macros (`#[tool_router]`/`#[tool_handler]`/`#[tool]`, estos tras `all(feature = "macros",
+     feature = "server")`). Sin `server` el servidor MCP **no se puede ni nombrar**. *Verificado con
+     un crate sonda*: la lista de features **sin** `server` **no compila** (`unresolved imports
+     rmcp::ServerHandler, rmcp::ServiceExt, rmcp::tool, rmcp::tool_handler, rmcp::tool_router` y
+     `cannot find server in handler` / `cannot find transport in rmcp`); **con** `server` compila y
+     monta el transporte en `axum`. La feature `server` = `transport-async-rw` + `schemars` +
+     `pastey` + `uuid`, todo ya presente en el árbol por las demás features, así que **no añade
+     ninguna versión nueva**.
    - **NO** se activa la feature `auth` de `rmcp`: arrastraría `oauth2 ^5` y `reqwest ^0.13.2`,
      mientras el proyecto ya usa `reqwest 0.12` para el webhook ⇒ **dos `reqwest` en el árbol**.
-   - El `default` de `rmcp` incluye `base64 ^0.23`, mientras el proyecto usa **`base64 0.22`** ⇒
-     usar `default-features = false` evita dos versiones de `base64`.
+     *Verificado*: `cargo tree -d --features mcp` **no** muestra un segundo `reqwest` (sigue un único
+     `reqwest 0.12.28`); `http` tampoco se duplica ⇒ el objetivo de no arrastrar `auth` se cumple.
+   - **El argumento del `base64` queda RETIRADO por falso** (era: «el `default` de `rmcp` incluye
+     `base64 ^0.23` mientras el proyecto usa `base64 0.22` ⇒ `default-features = false` evita dos
+     versiones»). *Medido*, es inválido por dos motivos: **(a)** `base64 0.23.1` **ya estaba en el
+     árbol antes de este change** (entra por `async-imap`, por `lettre`/`email-encoding` y por
+     `hyper-util`/`axum`); el par `base64 0.22.1 + 0.23.1` es **idéntico con y sin la feature**
+     (`cargo tree -d` en ambos modos). **(b)** Además, `transport-streamable-http-server` →
+     `server-side-http` **activa explícitamente la feature `base64` de `rmcp`**, así que
+     `default-features = false` no lo evitaría en ningún caso. Se mantiene `default-features = false`
+     (no queremos arrastrar los `default` de `rmcp`), pero **no por este motivo**: la duplicación de
+     `base64` es **preexistente y ajena a este change**.
    - `schemars 1.2.2` comparte el **major** (`^1.0`) con la dependencia de `rmcp`: **sin duplicar
-     tipos**.
+     tipos**. *Verificado*: `schemars` resuelve a **1.2.3** (caret de `1.2.2`) y hay **una sola
+     versión** en el árbol, compartiendo el `^1.0` que pide `rmcp` ⇒ no hay dos sistemas de esquemas
+     ni tipos duplicados.
+   - **Evidencia medida de la promesa central de la spec** (`tasks.md` §1): `cargo tree` **sin** la
+     feature → **0** apariciones de `rmcp`/`schemars`; `cargo tree --features mcp` → **4** paquetes
+     (`rmcp`, `rmcp-macros`, `schemars`, `schemars_derive`). La opcionalidad es un hecho medido, no
+     una intención.
+   - **Duplicaciones nuevas y transitivas** que sí introduce la feature, **ninguna de las cuales
+     afecta al código del proyecto**: `cpufeatures (0.2.17 / 0.3.1)` (la nueva entra por `chacha20` ←
+     `rand` ← `rmcp`) y `getrandom (0.2.17 / 0.4.3)` (la nueva por `rand`/`uuid` ← `rmcp`).
    - Versiones a fijar en la implementación: `rmcp = "3.5.1"`, `schemars = "1.2.2"`.
    *Alternativa descartada*: **`rust-mcp-sdk` 2.0.0** (MIT, menos tracción, API propia); se
    prefiere el SDK de referencia del ecosistema MCP (`rmcp`).
 4. **El buzón es un parámetro, no un estado global.** `select_mailbox` **sí** se expone como tool
    (es lo único que devuelve el estado del buzón: `total`/`unseen`/`uidnext`/`uidvalidity`), pero
    con la salvedad de que la sesión IMAP es **compartida y serializada por un `Mutex`**
-   (`src/imap.rs:1296`): toda tool que necesite otro buzón lo **pasa explícitamente** y no depende
-   de una selección previa implícita.
+   (`session: tokio::sync::Mutex<Option<Box<dyn ImapSession>>>`, `src/imap.rs:1339`): toda tool que
+   necesite otro buzón lo **pasa explícitamente** y no depende de una selección previa implícita.
 5. **Configuración fail-closed de las tres variables nuevas.** `APIMAIL_MCP_STDIO` (bool, def.
    `false`), `APIMAIL_MCP_HTTP` (bool, def. `false`) y `APIMAIL_MCP_PATH` (def. `/mcp`). Reglas:
    - Booleanas: se acepta `true`/`false` (**case-insensitive**) y `1`/`0`; cualquier otro valor ⇒
      error de configuración **nombrando la variable**. Es el **primer booleano de `Config`** (el
-     proyecto ya parsea booleanos para *query params* con `parse_strict_bool`, `src/http.rs:1087`,
+     proyecto ya parsea booleanos para *query params* con `parse_strict_bool`, `src/http.rs:467`,
      p. ej. `flagged`, pero no para variables de entorno); se documenta la decisión de admitir
      `true`/`false`/`1`/`0` case-insensitive.
    - `APIMAIL_MCP_PATH` debe empezar por `/`, **no** puede ser `/` ni colisionar con el prefijo
@@ -143,20 +200,22 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
    - Sin ninguna variable MCP ⇒ comportamiento actual intacto.
 6. **Sin OAuth en esta iteración (decisión explícita).** La feature `auth` de `rmcp` **no** se
    activa (ver Decisión 3). El transporte HTTP reutiliza el `Authorization: Bearer` existente,
-   aplicado por `require_api_key` (`src/http.rs:2108`) dentro de `protected`. Se documenta que
+   aplicado por `require_api_key` (`src/http.rs:1276`) dentro de `protected`. Se documenta que
    ChatGPT exige OAuth 2.1 + DCR y que eso queda para un change posterior.
 7. **La configuración del transporte HTTP viaja en `AppState`, no en la firma de `build_router`.**
    `AppState` gana un campo `mcp_path: Option<String>` poblado desde `Config`
    (`Some(path)` = montar el transporte en ese path; `None` = sin transporte HTTP), de modo que
-   **`build_router` conserva su firma** (`src/http.rs:2158`) y los **313 tests existentes no
-   cambian** (construyen el estado con los constructores actuales, `AppState::from_config` /
-   `with_services` / `with_mailer` / `with_idle`, y sin variables MCP el valor es `None`).
+   **`build_router` conserva su firma** (`src/http.rs:1334`) y los **318 tests del baseline medido
+   al iniciar la implementación no cambian** (construyen el estado con los constructores
+   actuales, `AppState::from_config` / `with_services` / `with_mailer` / `with_idle`, y sin
+   variables MCP el valor es `None`).
    *Concreto*: el campo y sus consumidores se declaran bajo `#[cfg(feature = "mcp")]`, así el build
    por defecto no contiene ni una línea de MCP y no aparecen warnings de código muerto; con la
-   feature, `build_router` anida `crate::mcp::service(state.clone())` en `protected` cuando el campo
-   es `Some`.
+   feature, `build_router` anida `crate::mcp::streamable_http_service(state.clone())` en `protected`
+   cuando el campo es `Some` (`src/http.rs:1370-1375`).
    *Alternativa descartada*: añadir un parámetro `mcp: Option<...>` a `build_router` ⇒ cambio de
-   firma que obliga a tocar los 313 tests y todos los helpers de test, sin ninguna ventaja.
+   firma que obliga a tocar los **318 tests del baseline** y todos los helpers de test, sin ninguna
+   ventaja.
 8. **`schemars` permanece opcional pese a que los derives `JsonSchema` recaen sobre tipos no
    gateados.** Hay una tensión real: las tools necesitan `inputSchema`/`outputSchema`, y la promesa
    es que el build por defecto **no** compila `schemars`. Resolución elegida: los tipos de
@@ -180,6 +239,13 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
   por SEP-2567 ⇒ núcleo *stateless*): clientes y SDKs van a remolque y puede forzar retrabajo.
   *Mitigación*: fijar versión del SDK, leer la revisión desde la constante del propio SDK y
   revalidar antes de cada *bump*.
+  **Hallazgo que desmintió lo que creíamos** (medido, no supuesto): pedir `2026-07-28` **negocia
+  `2025-11-25`**. En el SDK anclado (`rmcp 3.5.1`) esa revisión es a la vez `ProtocolVersion::LATEST`
+  **y** `ProtocolVersion::NO_INITIALIZE` (SEP-2567 trasladó el ciclo de vida a `_meta` por petición),
+  así que a esa revisión **no queda handshake que negociar** y el servidor cae a
+  `LATEST_WITH_INITIALIZE` (`V_2025_11_25`). Lo fijan sendos tests de `tests/mcp_server.rs`
+  (`tool_cycle_runs_in_process_over_a_pipe` y `binary_keeps_stdout_protocol_only`, ambos contra la
+  constante `NEGOTIATED_VERSION`): se asevera **lo que el SDK hace**, no lo que el cliente pide.
 - **Superficie de seguridad ampliada**: exponer **escritura** (`send_message`, `update_flags`,
   `move_message`, `copy_message`, `delete_message`) a agentes externos multiplica el riesgo de fuga
   y de acciones no deseadas. *Mitigación*: reutilizar la API key (**una sola frontera de auth**),
@@ -188,8 +254,8 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
 - **Juventud de `rmcp`** (push diario, evolución rápida). *Mitigación*: fijar `rmcp = "3.5.1"`,
   revisar el CHANGELOG antes de actualizar y confirmar los nombres públicos usados.
 - **Riesgo de regresión del refactor de `http.rs`**. *Mitigación*: TDD con tests de
-  caracterización y el criterio de que los **313 tests existentes sigan en verde** sin cambiar
-  ningún contrato HTTP.
+  caracterización y el criterio de que los **318 tests del baseline medido al iniciar la
+  implementación sigan en verde** sin cambiar ningún contrato HTTP.
 - **Doble sistema de esquemas** si además se hace `plans/PLAN-003.md`: `schemars` (MCP, JSON Schema
   2020-12) conviviendo con `ToSchema` de `utoipa` para los **mismos** tipos. *Mitigación*: admitir
   una derivación por sistema y mantenerlas sincronizadas (o tipos *mirror* explícitos).
@@ -201,9 +267,9 @@ Estado real del código sobre el que se construye (verificado leyendo los ficher
 
 Ficheros y firmas afectadas:
 
-- `Cargo.toml` (**no se toca hasta implementar**): `[features] mcp = ["dep:rmcp", "dep:schemars"]`
-  (default OFF) y deps **opcionales** `rmcp` (`default-features = false`, features
-  `transport-io`, `transport-streamable-http-server`, `macros`, `schemars`) y
+- `Cargo.toml` (**ya declarada en §1 del andamiaje**): `[features] mcp = ["dep:rmcp",
+  "dep:schemars"]` (default OFF) y deps **opcionales** `rmcp` (`default-features = false`, features
+  `server`, `transport-io`, `transport-streamable-http-server`, `macros`, `schemars`) y
   `schemars = { version = "1.2.2", optional = true }`.
 - `src/service.rs` (**nuevo**): capa de servicio con los DTOs y `ServiceError` compartidos. Los
   tipos de entrada/salida de las tools llevan el derive condicional
@@ -217,7 +283,8 @@ Ficheros y firmas afectadas:
 - `src/config.rs`: campos `mcp_stdio`, `mcp_http`, `mcp_path`; parseo booleano y variantes de
   `ConfigError` (`public_message()` y `kind()`); de ellos sale el `mcp_path` que recibe `AppState`.
 - `src/main.rs`: bifurcación stdio vs HTTP; en stdio **no** se crea `TcpListener` (`src/main.rs:33`).
-- `src/lib.rs`: nuevo módulo `mcp` y re-exports (hoy lista módulos en `src/lib.rs:6-12`).
+- `src/lib.rs`: nuevo módulo `mcp` y re-exports (los módulos se listan hoy en
+  `src/lib.rs:6-15`, y el gate `#[cfg(feature = "mcp")]` está en las líneas 10-11 y 31-32).
 - `.github/workflows/ci.yml`: **job nuevo** (`test-mcp`) que compile y testee con
   `--features mcp`, **sin** alterar el job `test` por defecto (que sigue sin la feature).
 - `README.md`, `docs/API.md`, `.env.example` y `.env.j2`: habilitación de la feature, variables
@@ -229,10 +296,15 @@ del binario **solo** en el build con `--features mcp`; el build por defecto no l
 ## A confirmar en implementación
 
 - **Re-verificar la versión exacta de `rmcp`** en crates.io al empezar (la spec fija `rmcp =
-  "3.5.1"`; el SDK evoluciona muy rápido).
+  "3.5.1"`; el SDK evoluciona muy rápido). **RESUELTO**: se fijó `rmcp = "3.5.1"` y `schemars` resolvió
+  a `1.2.3` dentro del `^1.0` de `rmcp` (Decisión 3).
 - **Confirmar la revisión de protocolo desde la constante del SDK**: existe
   `ProtocolVersion::V_2026_07_28` en `rmcp-3.5.1/src/model/meta.rs`, y esa revisión elimina las
   sesiones (`Mcp-Session-Id`) por SEP-2567. Leerla de la constante y no de fuentes externas.
+  **RESUELTO y corregido por medición**: `V_2026_07_28` es también `NO_INITIALIZE`, así que el
+  servidor **negocia `2025-11-25`** (`LATEST_WITH_INITIALIZE`) — ver Risks y
+  `tests/mcp_server.rs`.
 - Confirmar que los **nombres públicos** del transporte (`StreamableHttpService`,
   `StreamableHttpServerConfig`) y las **macros** (`#[tool]`, `#[tool_router]`, `#[tool_handler]`)
-  se mantienen en la versión fijada.
+  se mantienen en la versión fijada. **RESUELTO**: son los que usa `src/mcp.rs`
+  (`streamable_http_service`, `#[tool_router]`/`#[tool_handler]` y los `#[tool]`).

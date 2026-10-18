@@ -28,6 +28,21 @@ exclude = [
     "/.env.example",
 ]
 
+[features]
+# Servidor MCP (Model Context Protocol). Opt-in y **por defecto OFF**: sin esta feature el
+# crate no compila `rmcp`/`schemars` ni monta endpoint MCP alguno.
+# Higiene de dependencias (ver openspec/changes/mcp-server/design.md):
+# - `rmcp` con `default-features = false` porque su `default` arrastra `base64 ^0.23`
+#   mientras el proyecto usa `base64 0.22` ⇒ dos `base64` en el árbol.
+# - NO se activa la feature `auth` de `rmcp`: arrastraría `oauth2` y `reqwest ^0.13`
+#   mientras el proyecto usa `reqwest 0.12` para el webhook ⇒ dos `reqwest`.
+# - SÍ se activa `server`: `rmcp::ServerHandler`, `ServiceExt`, `rmcp::transport` y los
+#   re-exports de las macros (`#[tool_router]`, `#[tool_handler]`, `#[tool]`) están tras
+#   `#[cfg(feature = "server")]`. Verificado compilando: sin ella el servidor MCP no se
+#   puede ni nombrar. No añade versiones nuevas (`server` = `transport-async-rw` +
+#   `schemars` + `pastey` + `uuid`, todas ya presentes por `macros`/`server-side-http`).
+mcp = ["dep:rmcp", "dep:schemars"]
+
 [dependencies]
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 axum = "0.8.9"
@@ -36,6 +51,14 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
 mail-parser = { version = "0.11", features = ["full_encoding"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+rmcp = { version = "3.5.1", optional = true, default-features = false, features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+schemars = { version = "1.2.2", optional = true, features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_urlencoded = "0.7"
