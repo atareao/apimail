@@ -382,6 +382,48 @@ async fn status_reports_state_mailbox_and_last_error() {
     let _ = post(&app, "/api/idle/stop", Some(&bearer())).await;
 }
 
+/// Pins the *shape* of the `200` body: the DTO lives in [`apimail::idle`] and is
+/// consumed verbatim by the operation, so no field may be added, renamed or lost.
+#[tokio::test]
+async fn status_body_has_exactly_the_reported_fields() {
+    let config = config_with_webhook(Some(WEBHOOK_URL));
+    let connector = FakeIdleConnector::new(mailbox_status(Some(43)), Vec::new(), Vec::new());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = app(
+        &config,
+        connector.clone(),
+        Arc::new(FakeWebhook { deliveries: tx }),
+    );
+
+    let stopped = get(&app, "/api/idle/status", Some(&bearer())).await;
+    assert_eq!(stopped.status(), StatusCode::OK);
+    let json = body_json(stopped).await;
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["last_error", "mailbox", "status"],
+        "unexpected fields in the stopped body: {json}"
+    );
+
+    let _ = post(&app, "/api/idle/start", Some(&bearer())).await;
+
+    let running = get(&app, "/api/idle/status", Some(&bearer())).await;
+    assert_eq!(running.status(), StatusCode::OK);
+    let json = body_json(running).await;
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["last_error", "mailbox", "status"],
+        "unexpected fields in the running body: {json}"
+    );
+
+    let _ = post(&app, "/api/idle/stop", Some(&bearer())).await;
+}
+
 #[tokio::test]
 async fn stop_reports_stopped_and_is_idempotent() {
     let config = config_with_webhook(Some(WEBHOOK_URL));

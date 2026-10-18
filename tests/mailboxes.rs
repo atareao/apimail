@@ -359,6 +359,61 @@ async fn listing_reports_null_delimiter_and_empty_attributes() {
     );
 }
 
+/// Pins the *shape* of the `200` body: the listing DTOs move to the service
+/// layer, and no field may be added, renamed or lost.
+#[tokio::test]
+async fn listing_body_has_exactly_the_reported_fields() {
+    let response = get_mailboxes(
+        app_with(FakeConnector::with_mailboxes(
+            vec![inbox()],
+            SelectResponse::NotFound,
+        )),
+        Some(&format!("Bearer {API_KEY}")),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["mailboxes"], "unexpected fields in the body: {json}");
+
+    let mailbox = json["mailboxes"][0]
+        .as_object()
+        .expect("each mailbox must be a JSON object");
+    let mut keys: Vec<&str> = mailbox.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["attributes", "delimiter", "name"],
+        "unexpected fields in a mailbox: {json}"
+    );
+}
+
+/// Pins the *shape* of the `503` body: exactly the shared `{"error","message"}`
+/// envelope, with no extra field.
+#[tokio::test]
+async fn unavailable_body_has_exactly_the_reported_fields() {
+    let response = get_mailboxes(
+        app_with(FakeConnector::unreachable()),
+        Some(&format!("Bearer {API_KEY}")),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = body_json(response).await;
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["error", "message"],
+        "unexpected fields in the body: {json}"
+    );
+}
+
 #[tokio::test]
 async fn protocol_errors_return_stable_503_without_third_party_text() {
     for (failure, expected) in [

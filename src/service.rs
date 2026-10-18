@@ -109,7 +109,9 @@ use crate::idle::{
     HttpWebhookSender, IdleConnector, IdleSettings, IdleSupervisor, TokioIdleConnector,
     WebhookSender,
 };
-use crate::imap::{Backoff, ConnectionManager, ImapConnector, ImapError, TokioImapConnector};
+use crate::imap::{
+    Backoff, ConnectionManager, ImapConnector, ImapError, MailboxInfo, TokioImapConnector,
+};
 use crate::queue::{NotificationQueue, QueueError, WebhookQueue};
 use crate::smtp::{MailSender, SmtpError, SmtpSender};
 
@@ -467,6 +469,40 @@ pub struct ImapStatusResponse {
     pub tls: &'static str,
 }
 
+/// One mailbox in the `GET /api/mailboxes` response.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct MailboxDto {
+    /// Mailbox name.
+    pub name: String,
+    /// Hierarchy delimiter, or `null` for a flat namespace.
+    pub delimiter: Option<String>,
+    /// Mailbox attributes in IMAP style (`\NoSelect`, …).
+    pub attributes: Vec<String>,
+}
+
+impl From<MailboxInfo> for MailboxDto {
+    fn from(info: MailboxInfo) -> Self {
+        Self {
+            name: info.name,
+            delimiter: info.delimiter,
+            attributes: info.attributes,
+        }
+    }
+}
+
+/// JSON payload returned by a successful `GET /api/mailboxes`.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct MailboxListResponse {
+    /// The account's mailboxes.
+    pub mailboxes: Vec<MailboxDto>,
+}
+
 /// Failure of an application operation.
 ///
 /// The variant decides the stable `error` code (via [`kind`](Self::kind)) and
@@ -581,6 +617,30 @@ pub async fn imap_status(state: &AppState) -> Result<ImapStatusResponse, Service
         host: state.account.imap.host.clone(),
         port: state.account.imap.port,
         tls: state.imap_tls.as_str(),
+    })
+}
+
+/// Lists the account's mailboxes over the shared, lazily-established IMAP
+/// session, never exposing a credential.
+///
+/// This operation only ever issues `LIST`, and [`ImapError::MailboxNotFound`] is
+/// produced by `SELECT` alone, so no `404` can originate here: every failure of
+/// the underlying session is an availability failure and is flattened into one
+/// code, exactly as the published error table requires.
+///
+/// # Errors
+///
+/// [`ServiceError::ImapUnavailable`] (`503`), carrying the credential-free
+/// [`ImapError::public_message`] of the underlying failure and the failure itself
+/// as its `source`.
+pub async fn list_mailboxes(state: &AppState) -> Result<MailboxListResponse, ServiceError> {
+    let mailboxes = state
+        .imap
+        .list_mailboxes()
+        .await
+        .map_err(ServiceError::imap_unavailable)?;
+    Ok(MailboxListResponse {
+        mailboxes: mailboxes.into_iter().map(MailboxDto::from).collect(),
     })
 }
 

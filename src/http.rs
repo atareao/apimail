@@ -319,8 +319,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::idle::IdleError;
 use crate::imap::{
-    Address, FetchFormat, ImapError, MailboxInfo, MailboxStatus, Message, MessageEnvelope,
-    ParsedMessageError, SearchCriteria, SearchDate, SystemFlag,
+    Address, FetchFormat, ImapError, MailboxStatus, Message, MessageEnvelope, ParsedMessageError,
+    SearchCriteria, SearchDate, SystemFlag,
 };
 use crate::mime::ParsedAttachment;
 use crate::smtp::{MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage};
@@ -363,34 +363,6 @@ struct ImapUnavailableResponse {
     error: &'static str,
     /// Human-readable explanation.
     message: String,
-}
-
-/// One mailbox in the `GET /api/mailboxes` response.
-#[derive(Debug, Serialize)]
-struct MailboxDto {
-    /// Mailbox name.
-    name: String,
-    /// Hierarchy delimiter, or `null` for a flat namespace.
-    delimiter: Option<String>,
-    /// Mailbox attributes in IMAP style (`\NoSelect`, …).
-    attributes: Vec<String>,
-}
-
-impl From<MailboxInfo> for MailboxDto {
-    fn from(info: MailboxInfo) -> Self {
-        Self {
-            name: info.name,
-            delimiter: info.delimiter,
-            attributes: info.attributes,
-        }
-    }
-}
-
-/// JSON payload returned by a successful `GET /api/mailboxes`.
-#[derive(Debug, Serialize)]
-struct MailboxListResponse {
-    /// The account's mailboxes.
-    mailboxes: Vec<MailboxDto>,
 }
 
 /// `POST /api/mailboxes/select` request body.
@@ -1421,13 +1393,16 @@ async fn imap_status(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `GET /api/mailboxes` handler: lists the account's mailboxes.
-async fn list_mailboxes(State(state): State<AppState>) -> Result<Response, MailboxError> {
-    let mailboxes = state.imap.list_mailboxes().await?;
-    let response = MailboxListResponse {
-        mailboxes: mailboxes.into_iter().map(MailboxDto::from).collect(),
-    };
-    Ok((StatusCode::OK, Json(response)).into_response())
+/// `GET /api/mailboxes` handler: thin wrapper over
+/// [`crate::service::list_mailboxes`].
+///
+/// The failure branch is rendered by the shared [`ServiceError`] envelope; only
+/// `503 imap_unavailable` can originate here (the operation never selects a
+/// mailbox).
+async fn list_mailboxes(
+    State(state): State<AppState>,
+) -> Result<Json<service::MailboxListResponse>, ServiceError> {
+    Ok(Json(service::list_mailboxes(&state).await?))
 }
 
 /// `POST /api/mailboxes/select` handler: selects a mailbox, reporting its
