@@ -14,30 +14,84 @@
 //! [`crate::http`] is the *transport*, and it owns what is purely HTTP: the
 //! routes, the request DTOs (query and body), the `StatusCode` and the shared
 //! `{"error":…,"message":…}` envelope. Handlers there are thin wrappers over the
-//! operations of this module.
+//! operations of this module **as they migrate**, one operation at a time: today
+//! `whoami`, `account` and `imap_status`; the rest still hold their own logic
+//! and their own per-route error type in [`crate::http`].
 //!
 //! # Published HTTP error table
 //!
 //! This table is the contract of the API and is **unchanged** by the migration
-//! of operations into this module. The `ServiceError` column says who can
-//! produce each row *today*: operations already migrated here do it through
-//! [`ServiceError`], while the rest still use their own per-route error type in
-//! [`crate::http`] until they migrate, one operation at a time.
+//! of operations into this module. Its third column is the **frontier**: the
+//! layer that *owns* each code — the one that must produce it, for every
+//! transport, once its operation has migrated. A code is owned by the transport
+//! when the condition that produces it exists only in that transport; it is
+//! owned by the service when it is a domain outcome, so that HTTP and MCP get
+//! one single producer instead of two implementations.
 //!
-//! | HTTP | `error`                | Produced today by                              |
-//! |------|------------------------|------------------------------------------------|
-//! | 401  | `unauthorized`         | `http::Unauthorized` (the auth middleware)     |
-//! | 400  | `invalid_request`      | `http::MailboxError`, `http::MessageError`, `http::SendError` |
-//! | 404  | `mailbox_not_found`    | `http::MailboxError`, `http::MessageError`     |
-//! | 404  | `message_not_found`    | `http::MessageError`                           |
-//! | 404  | `attachment_not_found` | `http::MessageError`                           |
-//! | 413  | `message_too_large`    | `http::MessageError`                           |
-//! | 413  | `payload_too_large`    | `http::SendError`                              |
-//! | 422  | `message_not_parsable` | `http::MessageError`                           |
-//! | 501  | `capability_not_supported` | `http::MessageError`                       |
-//! | 501  | `idle_not_configured`  | `http::IdleHttpError`                          |
-//! | 502  | `smtp_error`           | `http::SendError`                              |
-//! | 503  | `imap_unavailable`     | [`ServiceError::ImapUnavailable`], `http::MailboxError`, `http::MessageError` |
+//! Until an operation migrates, its code is still produced by that operation's
+//! per-route error type in [`crate::http`] and [`ServiceError`] has no variant
+//! for it yet: variants are added **with their operation**, never ahead of it,
+//! so this table carries no speculative row.
+//!
+//! | HTTP | `error`                    | Owner               |
+//! |------|----------------------------|---------------------|
+//! | 401  | `unauthorized`             | transport           |
+//! | 400  | `invalid_request`          | transport **and** service |
+//! | 404  | `mailbox_not_found`        | service             |
+//! | 404  | `message_not_found`        | service             |
+//! | 404  | `attachment_not_found`     | service             |
+//! | 413  | `message_too_large`        | service             |
+//! | 413  | `payload_too_large`        | transport **and** service |
+//! | 422  | `message_not_parsable`     | service             |
+//! | 501  | `capability_not_supported` | service             |
+//! | 501  | `idle_not_configured`      | service             |
+//! | 502  | `smtp_error`               | service             |
+//! | 503  | `imap_unavailable`         | service             |
+//!
+//! ## What the transport owns, and why
+//!
+//! - `unauthorized` (`401`): the auth middleware is the only place that sees the
+//!   `Authorization` header, and the header is HTTP dialect.
+//! - The `invalid_request` (`400`) that comes from **parsing** the input — the
+//!   `serde`, query-string, base64 and type decoding of a request. A malformed
+//!   request is not a domain failure: it means the caller did not speak the
+//!   transport's dialect. MCP has its own input schema and reports its own.
+//! - The `payload_too_large` (`413`) of the **HTTP request body limit**
+//!   ([`AppState::message_body_limit`] plus `DefaultBodyLimit::disable()`, which
+//!   hands the size check to the send handler so it answers with this JSON
+//!   envelope). That limit exists only because an HTTP request has a body; an
+//!   MCP call has none and can never produce this rejection.
+//!
+//! ## What the service owns, and why
+//!
+//! Everything else — the `404`s (`mailbox_not_found`, `message_not_found`,
+//! `attachment_not_found`), the `413` of the **decoded** attachments
+//! (`message_too_large`), `422` (`message_not_parsable`), both `501`s
+//! (`capability_not_supported`, `idle_not_configured`), `502` (`smtp_error`) and
+//! `503` (`imap_unavailable`) — depends on the mail account and on the server,
+//! not on how the caller was written. It is a domain outcome, so it is produced
+//! once, here.
+//!
+//! ## Codes with two producers
+//!
+//! `invalid_request` and `payload_too_large` are produced by **both** layers,
+//! and that is deliberate: the transport produces the ones that only exist in a
+//! transport (a malformed body or query string; the raw HTTP body limit) while
+//! the service produces the **domain** ones, so that an operation never
+//! re-implements a rule a second transport would have to re-implement as well.
+//! [`ServiceError`] gains its `InvalidRequest` variant with the first operation
+//! that needs it.
+//!
+//! This is a conscious deviation from the audit's recommendation that the
+//! service only ever receive *already validated* types and that
+//! `invalid_request` stay entirely in the transport: the **domain rules** — a
+//! non-empty mailbox, `uid != 0`, the total decoded attachment size, the set of
+//! known flags — are validated **here**, precisely so MCP inherits them instead
+//! of reproducing them.
+//!
+//! The `message` of a domain failure is a `&'static str` from the service's own
+//! vocabulary: never text taken from the request, never a value read from the
+//! configuration.
 //!
 //! Two rows share the code `imap_unavailable` but not the same body: the 503 of
 //! `GET /api/imap/status` also carries `"connected": false`, which is that
@@ -47,6 +101,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::Config;
 use crate::config::TlsMode;
@@ -120,9 +175,10 @@ impl AppStateError {
 /// that call them.
 ///
 /// The configured API key is stored only as its SHA-256 digest and the field is
-/// private, so the plaintext secret can neither be read nor formatted. The
-/// manual [`Debug`] implementation redacts the digest as well as the mailer and
-/// the connection manager, which hold the SMTP and IMAP credentials.
+/// private, so the plaintext secret can neither be read nor formatted:
+/// [`AppState::verify_token`] is the only way to compare a token against it. The
+/// manual [`Debug`] implementation redacts the digest, the default sender, the
+/// mailer and the connection manager, which hold the SMTP and IMAP credentials.
 #[derive(Clone)]
 pub struct AppState {
     /// Application name.
@@ -131,21 +187,33 @@ pub struct AppState {
     pub version: &'static str,
     /// SHA-256 digest of the expected API key.
     ///
-    /// Crate-visible, and no further: the HTTP auth middleware lives in another
-    /// module but owns the header parsing, so it is the one that needs to
-    /// compare this digest. It stays unreachable from outside the crate.
-    pub(crate) api_key_hash: [u8; 32],
+    /// Private, and no further: the comparison against an incoming token happens
+    /// in [`AppState::verify_token`], so no other module needs to reach it.
+    api_key_hash: [u8; 32],
     /// Non-sensitive view of the configured mail account (host and port only).
     account: AccountView,
     /// Outgoing mail transport (real at runtime, fake in tests).
+    ///
+    /// Crate-visible **while the handlers of `src/http.rs` are not yet
+    /// migrated**; it goes back to private when the last one is. This is a
+    /// migration artefact, **not** the target pattern: operations must reach the
+    /// transport through a method of this type, the way [`AppState::idle`] does.
     pub(crate) mailer: Arc<dyn MailSender>,
     /// Maximum total size, in bytes, of the decoded attachments of a message.
     max_attachment_bytes: usize,
     /// Maximum size, in bytes, of a message that will be fetched and parsed.
     max_message_bytes: usize,
     /// Sender used when a message omits `from` (the configured SMTP user).
+    ///
+    /// Crate-visible **while the handlers of `src/http.rs` are not yet
+    /// migrated**; it goes back to private when the last one is. This is a
+    /// migration artefact, **not** the target pattern.
     pub(crate) default_from: String,
     /// Lazy, persistent IMAP connection manager.
+    ///
+    /// Crate-visible **while the handlers of `src/http.rs` are not yet
+    /// migrated**; it goes back to private when the last one is. This is a
+    /// migration artefact, **not** the target pattern.
     pub(crate) imap: Arc<ConnectionManager>,
     /// TLS mode of the configured IMAP endpoint, for the status endpoint.
     imap_tls: TlsMode,
@@ -163,6 +231,7 @@ impl std::fmt::Debug for AppState {
             .field("mailer", &"***")
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .field("max_message_bytes", &self.max_message_bytes)
+            .field("default_from", &"***")
             .field("imap", &"***")
             .field("imap_tls", &self.imap_tls)
             .field("idle", &"***")
@@ -308,6 +377,24 @@ impl AppState {
         })
     }
 
+    /// Whether `token` is the configured API key.
+    ///
+    /// The token is hashed to a fixed-size digest and compared against the
+    /// expected digest with `subtle`'s constant-time equality, so the secret is
+    /// never compared in plaintext and its length cannot leak through timing.
+    /// Because both operands always have the same length, the only variable cost
+    /// is hashing the token, which depends solely on input the caller already
+    /// controls.
+    ///
+    /// Parsing the `Authorization` header — the scheme, the whitespace — stays
+    /// in the transport, which is the layer that speaks that dialect: this method
+    /// takes the already-extracted token, so every transport (HTTP today, MCP
+    /// tomorrow) authenticates against the very same digest.
+    pub(crate) fn verify_token(&self, token: &str) -> bool {
+        let candidate: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        candidate.ct_eq(&self.api_key_hash).into()
+    }
+
     /// The IDLE subscription supervisor, controlled by the `/api/idle/*` routes.
     pub fn idle(&self) -> &IdleSupervisor {
         &self.idle
@@ -382,31 +469,63 @@ pub struct ImapStatusResponse {
 
 /// Failure of an application operation.
 ///
-/// The variant decides the stable `error` code (via [`code`](Self::code)) and
+/// The variant decides the stable `error` code (via [`kind`](Self::kind)) and
 /// the message a transport may expose (via
 /// [`public_message`](Self::public_message)); the status code is a transport
 /// decision and is **not** modelled here, so the same failure can be rendered as
 /// an HTTP response or as an MCP tool error.
 ///
+/// The accessor names follow the crate-wide convention established by
+/// [`AppStateError`], [`ConfigError`](crate::config::ConfigError) and
+/// [`AccountError`](crate::config::AccountError): `public_message()` plus
+/// `kind()`, never `code()`.
+///
+/// The enum is `#[non_exhaustive]` because it is public, it is published on
+/// crates.io and it is meant to grow: a new variant must never be a breaking
+/// change for a downstream consumer. Inside the crate the transports still match
+/// it **exhaustively** (no wildcard arm), so a new variant is a compile error
+/// until it is mapped, and no failure mode can ever be silently rendered with
+/// the wrong status.
+///
 /// Today this enum only holds the variants the operations owned by this module
 /// can produce: `whoami` and `account` cannot fail, and `imap_status` can only
-/// fail with `ImapUnavailable`. The remaining rows of the module's error table
-/// are added, one operation at a time, as their handlers migrate. The HTTP
-/// transport matches this enum **exhaustively** (no wildcard arm), so a new
-/// variant is a compile error until it is mapped, and no failure mode can ever
-/// be silently rendered with the wrong status.
+/// fail with `imap_unavailable`. The remaining rows of the module's error table
+/// are added, one operation at a time, as their handlers migrate.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ServiceError {
     /// The IMAP session or server is unavailable (`503`, `imap_unavailable`).
-    #[error("{0}")]
-    ImapUnavailable(String),
+    ///
+    /// The message is a `&'static str` of this module's own vocabulary, and the
+    /// underlying failure is kept as the [`source`](std::error::Error::source)
+    /// for logs only: it may embed hosts, certificates or addresses, so it is
+    /// never part of what a caller reads.
+    #[error("{message}")]
+    ImapUnavailable {
+        /// Credential-free, stable message of the underlying IMAP failure.
+        message: &'static str,
+        /// The IMAP failure this response describes.
+        #[source]
+        source: ImapError,
+    },
 }
 
 impl ServiceError {
+    /// Builds the `imap_unavailable` failure around the underlying [`ImapError`].
+    ///
+    /// Both fields are derived here, in one place, so the public message can
+    /// never drift away from the cause it describes.
+    pub(crate) fn imap_unavailable(source: ImapError) -> Self {
+        Self::ImapUnavailable {
+            message: source.public_message(),
+            source,
+        }
+    }
+
     /// Stable, machine-filterable `error` code of the shared envelope.
-    pub fn code(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
-            Self::ImapUnavailable(_) => "imap_unavailable",
+            Self::ImapUnavailable { .. } => "imap_unavailable",
         }
     }
 
@@ -414,10 +533,10 @@ impl ServiceError {
     ///
     /// It never propagates third-party text directly: the underlying
     /// [`ImapError::public_message`] already groups its variants into stable
-    /// families.
-    pub fn public_message(&self) -> &str {
+    /// families, and the message is fixed at construction time.
+    pub fn public_message(&self) -> &'static str {
         match self {
-            Self::ImapUnavailable(message) => message,
+            Self::ImapUnavailable { message, .. } => message,
         }
     }
 }
@@ -448,18 +567,120 @@ pub fn account(state: &AppState) -> &AccountView {
 ///
 /// # Errors
 ///
-/// [`ServiceError::ImapUnavailable`], carrying the credential-free
-/// [`ImapError::public_message`] of the underlying failure.
+/// [`ServiceError::ImapUnavailable`] (`503`), carrying the credential-free
+/// [`ImapError::public_message`] of the underlying failure and the failure
+/// itself as its `source`.
 pub async fn imap_status(state: &AppState) -> Result<ImapStatusResponse, ServiceError> {
     state
         .imap
         .status()
         .await
-        .map_err(|error| ServiceError::ImapUnavailable(error.public_message().to_string()))?;
+        .map_err(ServiceError::imap_unavailable)?;
     Ok(ImapStatusResponse {
         connected: true,
         host: state.account.imap.host.clone(),
         port: state.account.imap.port,
         tls: state.imap_tls.as_str(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Third-party text that must never reach a caller: a host, an address and
+    /// a credential, as they appear in the strings `async-imap`, rustls and the
+    /// operating system hand back.
+    const THIRD_PARTY_TEXT: &str = "user@internal.example at 10.0.0.7:993";
+
+    /// Every `ImapError` family an unavailable session can report, paired with
+    /// the service message it must produce.
+    ///
+    /// The service flattens them all into one code, so what this assertion pins
+    /// is the *mapping*: `imap_unavailable` plus the credential-free message of
+    /// the family the cause belongs to.
+    fn cases() -> [(ImapError, &'static str); 4] {
+        [
+            (
+                ImapError::Unavailable(THIRD_PARTY_TEXT.to_string()),
+                "could not connect to the IMAP server",
+            ),
+            (
+                ImapError::Tcp(std::io::Error::other(THIRD_PARTY_TEXT)),
+                "could not connect to the IMAP server",
+            ),
+            (
+                ImapError::Tls(THIRD_PARTY_TEXT.to_string()),
+                "IMAP TLS handshake failed",
+            ),
+            (
+                ImapError::Login(THIRD_PARTY_TEXT.to_string()),
+                "IMAP authentication or command failed",
+            ),
+        ]
+    }
+
+    #[test]
+    fn imap_unavailable_kind_is_stable_and_message_matches_the_cause() {
+        for (cause, expected) in cases() {
+            let error = ServiceError::imap_unavailable(cause);
+
+            assert_eq!(error.kind(), "imap_unavailable");
+            assert!(
+                !error.public_message().is_empty(),
+                "the public message must never be empty"
+            );
+            assert_eq!(
+                error.public_message(),
+                expected,
+                "the message must be the one of the cause's family"
+            );
+        }
+    }
+
+    #[test]
+    fn imap_unavailable_never_leaks_third_party_text() {
+        for (cause, expected) in cases() {
+            let error = ServiceError::imap_unavailable(cause);
+
+            assert_eq!(error.public_message(), expected);
+            assert!(
+                !error.public_message().contains("internal.example"),
+                "the public message leaked a host name: {}",
+                error.public_message()
+            );
+            assert!(!error.public_message().contains("10.0.0.7"));
+            assert!(!error.public_message().contains("user@"));
+            // `Display` is what a `tracing::error!(%error)` prints, so it must
+            // be as safe as `public_message`.
+            assert_eq!(error.to_string(), error.public_message());
+        }
+    }
+
+    #[test]
+    fn imap_unavailable_keeps_the_cause_reachable_for_logs() {
+        let error =
+            ServiceError::imap_unavailable(ImapError::Unavailable(THIRD_PARTY_TEXT.to_string()));
+
+        let source = std::error::Error::source(&error).expect("the cause must be kept");
+        assert!(
+            source.to_string().contains(THIRD_PARTY_TEXT),
+            "the source must be the original failure, not a rewrite: {source}"
+        );
+        assert!(
+            !error.public_message().contains(THIRD_PARTY_TEXT),
+            "the cause must stay out of the public message"
+        );
+    }
+
+    /// A string taken from a request must never become a public message: the
+    /// vocabulary is the service's own, fixed at construction time.
+    #[test]
+    fn imap_unavailable_message_is_static_domain_vocabulary() {
+        let error =
+            ServiceError::imap_unavailable(ImapError::Login("attacker-controlled".to_string()));
+
+        let message: &'static str = error.public_message();
+        assert_eq!(message, "IMAP authentication or command failed");
+    }
 }

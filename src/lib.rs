@@ -31,8 +31,5 @@ pub use queue::{
     NotificationQueue, QueueError, QueueLimits, QueueStats, QueuedNotification, StoredWatermark,
     WebhookQueue,
 };
-pub use service::{
-    AccountView, AppState, AppStateError, EndpointView, ImapStatusResponse, ServiceError,
-    WhoamiResponse,
-};
+pub use service::{AppState, AppStateError, ServiceError};
 pub use smtp::{MailSender, MessageError, OutgoingAttachment, OutgoingMessage, SmtpError};

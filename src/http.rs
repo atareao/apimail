@@ -28,7 +28,10 @@
 //! **fixed-size** `[u8; 32]` buffer. Because both operands always have the same
 //! length, the comparison cannot leak the secret's length through timing; the
 //! only variable cost is hashing the attacker-supplied token, which depends
-//! solely on the input the attacker already controls.
+//! solely on the input the attacker already controls. This module owns parsing
+//! the header; the comparison itself is [`AppState::verify_token`], in the
+//! service layer, so a second transport authenticates against the same digest
+//! instead of re-implementing it.
 //!
 //! Between the scheme and the token any run of ASCII spaces or tabs is accepted,
 //! but whitespace inside the token is not.
@@ -313,8 +316,6 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 
 use crate::idle::IdleError;
 use crate::imap::{
@@ -1312,14 +1313,39 @@ impl From<SmtpMessageError> for SendError {
 /// Single point of truth mapping a [`ServiceError`] to the HTTP status of the
 /// published error table (see the table in [`crate::service`]).
 ///
-/// The *body* stays a per-route decision — the `503` of `GET /api/imap/status`
-/// adds `"connected": false` to the shared envelope — but the status of every
-/// domain failure is decided here, in one place, and the match is **exhaustive**
-/// on purpose: adding a variant to [`ServiceError`] is a compile error until its
-/// status is chosen, so no failure mode can silently inherit the wrong one.
+/// The status of every domain failure is decided here, in one place, and the
+/// match is **exhaustive** on purpose: adding a variant to [`ServiceError`] is a
+/// compile error until its status is chosen, so no failure mode can silently
+/// inherit the wrong one. The body is the shared envelope built by the
+/// [`IntoResponse`] implementation below, with one deliberate exception: the
+/// `503` of `GET /api/imap/status` also carries `"connected": false`, and that
+/// route renders itself.
 fn status_for(error: &ServiceError) -> StatusCode {
     match error {
-        ServiceError::ImapUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ServiceError::ImapUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// Renders a [`ServiceError`] as the shared `{"error":…,"message":…}` envelope.
+///
+/// This is the **one** place where a domain failure becomes an HTTP response, so
+/// a migrating handler only has to propagate the error (`?`, or `ServiceError` in
+/// its return type) instead of rebuilding the envelope by hand. The status comes
+/// from [`status_for`]; the body is the pair [`ServiceError::kind`] plus
+/// [`ServiceError::public_message`], which is transport-agnostic — MCP will read
+/// the very same two values.
+///
+/// A route that needs a *different* body — `GET /api/imap/status` adds
+/// `"connected": false` to its `503` — keeps its own rendering on purpose rather
+/// than growing a flag here.
+impl IntoResponse for ServiceError {
+    fn into_response(self) -> Response {
+        let status = status_for(&self);
+        let body = Json(ErrorResponse {
+            error: self.kind(),
+            message: self.public_message().to_string(),
+        });
+        (status, body).into_response()
     }
 }
 
@@ -1376,6 +1402,10 @@ async fn account(State(state): State<AppState>) -> Response {
 /// `GET /api/imap/status` handler: thin wrapper over
 /// [`crate::service::imap_status`], which ensures a live IMAP session and
 /// reports the outcome without exposing any credential.
+///
+/// The failure branch is the one route that renders its own body instead of the
+/// shared [`ServiceError`] envelope: it adds `"connected": false`. Its status
+/// still comes from [`status_for`], and its `error`/`message` from the service.
 async fn imap_status(State(state): State<AppState>) -> Response {
     match service::imap_status(&state).await {
         Ok(status) => (StatusCode::OK, Json(status)).into_response(),
@@ -1383,7 +1413,7 @@ async fn imap_status(State(state): State<AppState>) -> Response {
             status_for(&error),
             Json(ImapUnavailableResponse {
                 connected: false,
-                error: error.code(),
+                error: error.kind(),
                 message: error.public_message().to_string(),
             }),
         )
@@ -1795,7 +1825,7 @@ async fn idle_queue(State(state): State<AppState>) -> Response {
 
 /// Authorization middleware: rejects requests without a valid `Bearer` API key.
 async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if is_authorized(&request, &state.api_key_hash) {
+    if is_authorized(&request, &state) {
         next.run(request).await
     } else {
         Unauthorized.into_response()
@@ -1804,9 +1834,11 @@ async fn require_api_key(State(state): State<AppState>, request: Request, next: 
 
 /// Returns `true` when the request carries the expected key as a `Bearer` token.
 ///
-/// The token is hashed to a fixed-size digest and compared against the expected
-/// digest in constant time.
-fn is_authorized(request: &Request, expected_hash: &[u8; 32]) -> bool {
+/// This function owns what is HTTP dialect — the `Authorization` header and the
+/// `Bearer` scheme, including the whitespace rules — and delegates the
+/// comparison itself to [`AppState::verify_token`], which lives in the service
+/// layer so that every transport authenticates against the same digest.
+fn is_authorized(request: &Request, state: &AppState) -> bool {
     let Some(value) = request.headers().get(header::AUTHORIZATION) else {
         return false;
     };
@@ -1816,8 +1848,7 @@ fn is_authorized(request: &Request, expected_hash: &[u8; 32]) -> bool {
     let Some(token) = bearer_token(value) else {
         return false;
     };
-    let candidate: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    candidate.ct_eq(expected_hash).into()
+    state.verify_token(token)
 }
 
 /// Extracts the token from an `Authorization` header value using the `Bearer`
@@ -1933,5 +1964,50 @@ mod tests {
             "the message must name the offending variable"
         );
         assert_eq!(error.kind(), "queue");
+    }
+
+    /// Pins the shared `IntoResponse for ServiceError` rendering, which has **no
+    /// consuming handler yet**: `whoami` and `account` cannot fail, and
+    /// `imap_status` deliberately renders its own body, so nothing exercises this
+    /// implementation in the request path. It is the scaffolding the ~70 migrated
+    /// operations will rely on, hence it is verified directly here — status,
+    /// `Content-Type` and the exact `{"error","message"}` envelope — instead of
+    /// being trusted.
+    ///
+    /// The cause carries third-party text (a user, a host, an address); none of
+    /// it may reach the body.
+    #[tokio::test]
+    async fn service_error_renders_the_shared_envelope_with_its_own_status() {
+        let error = ServiceError::imap_unavailable(ImapError::Unavailable(
+            "auth failed for user@internal.example at 10.0.0.7:993".to_string(),
+        ));
+
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body should be readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "imap_unavailable",
+                "message": "could not connect to the IMAP server",
+            }),
+            "the envelope must be exactly the shared {{error, message}} pair"
+        );
+        assert!(
+            !json.to_string().contains("internal.example"),
+            "the rendering leaked third-party text: {json}"
+        );
     }
 }

@@ -81,7 +81,13 @@ async fn whoami_body_has_exactly_the_authenticated_field() {
     let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
 
     let object = json.as_object().expect("the body must be a JSON object");
-    assert_eq!(object.len(), 1, "unexpected fields in the body: {json}");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["authenticated"],
+        "unexpected fields in the body: {json}"
+    );
     assert_eq!(json["authenticated"], serde_json::json!(true));
 }
 

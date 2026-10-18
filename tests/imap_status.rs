@@ -284,9 +284,9 @@ async fn unreachable_server_returns_503() {
     let json = body_json(response).await;
     assert_eq!(json["connected"], false);
     assert_eq!(json["error"], "imap_unavailable");
-    assert!(
-        json["message"].is_string(),
-        "message should be a string: {json}"
+    assert_eq!(
+        json["message"], "could not connect to the IMAP server",
+        "the 503 message must be the stable `ImapError::public_message`: {json}"
     );
     let text = json.to_string();
     for secret in [IMAP_USER, IMAP_PASSWORD] {
