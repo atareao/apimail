@@ -7,6 +7,8 @@ pub mod config;
 pub mod http;
 pub mod idle;
 pub mod imap;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod mime;
 pub mod queue;
 pub mod service;
@@ -26,6 +28,8 @@ pub use imap::{
     MessageEnvelope, MessagePage, ParsedMessageError, QueryError, SearchCriteria, SearchDate,
     SendFuture, SystemFlag, TokioImapConnector,
 };
+#[cfg(feature = "mcp")]
+pub use mcp::{ApimailMcp, McpServeError, WhoamiOutput};
 pub use mime::{MimeError, ParsedAttachment, ParsedMessage};
 pub use queue::{
     NotificationQueue, QueueError, QueueLimits, QueueStats, QueuedNotification, StoredWatermark,
