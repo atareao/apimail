@@ -295,6 +295,33 @@ async fn queue_state_is_reported_with_an_api_key() {
     assert_eq!(json["oldest_pending_secs"], serde_json::Value::Null);
 }
 
+/// Pins the *shape* of the `200` body: the DTO lives in [`apimail::queue`] and
+/// is consumed verbatim by the operation, so no field may be added, renamed or
+/// lost.
+#[tokio::test]
+async fn queue_body_has_exactly_the_reported_fields() {
+    let config = config_from(None, &[]);
+    let state = build_state(&config, Arc::new(FakeWebhook::accepting()));
+    let app = build_router(state);
+
+    let json = queue_state(&app).await;
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "delivered",
+            "dropped",
+            "failed",
+            "oldest_pending_secs",
+            "pending",
+            "persistent"
+        ],
+        "unexpected fields in the body: {json}"
+    );
+}
+
 #[tokio::test]
 async fn queue_state_requires_an_api_key() {
     let config = config_from(None, &[]);

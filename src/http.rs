@@ -28,7 +28,10 @@
 //! **fixed-size** `[u8; 32]` buffer. Because both operands always have the same
 //! length, the comparison cannot leak the secret's length through timing; the
 //! only variable cost is hashing the attacker-supplied token, which depends
-//! solely on the input the attacker already controls.
+//! solely on the input the attacker already controls. This module owns parsing
+//! the header; the comparison itself is `AppState::verify_token`, in the
+//! service layer, so a second transport authenticates against the same digest
+//! instead of re-implementing it.
 //!
 //! Between the scheme and the token any run of ASCII spaces or tabs is accepted,
 //! but whitespace inside the token is not.
@@ -65,17 +68,28 @@
 //! ```
 //!
 //! `to` is required (at least one address) and `from` defaults to the configured
-//! SMTP user. Attachment content is base64-encoded and is decoded **here**, at
-//! the HTTP boundary; the total **decoded** size must not exceed
-//! `APIMAIL_MAX_ATTACHMENT_BYTES`. Every address is validated as a mailbox. On
-//! success the route returns HTTP `200`, `Content-Type: application/json` and
-//! `{"status":"sent"}`. Failures use the `{"error":...,"message":...}` pattern:
+//! SMTP user. Attachment content is base64-encoded and is decoded by the
+//! operation that sends it ([`crate::service::send_message`]), not at the HTTP
+//! boundary: the total **decoded** size is what must not exceed
+//! `APIMAIL_MAX_ATTACHMENT_BYTES`, and that rule has to hold for every transport.
+//! Every address is validated as a mailbox. On success the route returns HTTP
+//! `200`, `Content-Type: application/json` and `{"status":"sent"}`. Failures use
+//! the `{"error":...,"message":...}` pattern:
 //!
 //! - `400` (`invalid_request`) — malformed JSON, missing recipients, invalid
 //!   address or invalid base64.
 //! - `413` (`payload_too_large`) — the raw request body exceeds the per-route
 //!   body limit, or the decoded attachments exceed the attachment limit.
 //! - `502` (`smtp_error`) — the SMTP server rejects or fails the delivery.
+//!
+//! The `413` has **two producers and they are not interchangeable**: the *raw
+//! body* limit below is the transport's, and the limit over the *decoded*
+//! attachments is the service's ([`crate::service::ServiceError::PayloadTooLarge`]),
+//! rendered with the very same envelope. The same is true of the `400`: a body
+//! that is not JSON at all is the transport's, while a decoded body that breaks a
+//! domain rule (no recipient, an address that is not a mailbox, invalid base64)
+//! is the service's ([`crate::service::ServiceError::InvalidRequest`]). Both are
+//! documented in the error table of [`crate::service`].
 //!
 //! The per-route body limit is **not** enforced by axum's `DefaultBodyLimit`
 //! (which would answer with a plain-text `413`): the route disables it and the
@@ -84,7 +98,8 @@
 //! JSON error envelope. The body limit is
 //! `max_attachment_bytes * 4 / 3 + BODY_LIMIT_SLACK` (base64 expansion plus a
 //! small, documented slack for the rest of the JSON); the authoritative
-//! *decoded* check is still [`AppState::max_attachment_bytes`].
+//! *decoded* check is still [`AppState::max_attachment_bytes`], owned by the
+//! service operation.
 //!
 //! Requests for unknown routes still return `404`, and requests using an
 //! unhandled method (for example `POST /api/health`) still return `405`; the
@@ -134,8 +149,8 @@
 //!   `mailbox`.
 //! - `404` (`mailbox_not_found`) — the server answered `NO` for the mailbox.
 //! - `503` (`imap_unavailable`) — the session or server is unavailable; the
-//!   message is the stable [`ImapError::public_message`] and never
-//!   [`Display`](std::fmt::Display) text from a third party.
+//!   message is the stable [`public_message`](crate::imap::ImapError::public_message)
+//!   and never [`Display`](std::fmt::Display) text from a third party.
 //! - `401` (`unauthorized`) — missing or invalid API key.
 //!
 //! # Message reading contract
@@ -310,327 +325,17 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use subtle::ConstantTimeEq;
 
-use crate::Config;
-use crate::config::TlsMode;
-use crate::idle::{
-    HttpWebhookSender, IdleConnector, IdleError, IdleSettings, IdleSupervisor, TokioIdleConnector,
-    WebhookSender,
-};
-use crate::imap::{
-    Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
-    MailboxStatus, Message, MessageEnvelope, ParsedMessageError, SearchCriteria, SearchDate,
-    SystemFlag, TokioImapConnector,
-};
-use crate::mime::ParsedAttachment;
-use crate::queue::{NotificationQueue, QueueError, WebhookQueue};
-use crate::smtp::{
-    MailSender, MessageError as SmtpMessageError, OutgoingAttachment, OutgoingMessage, SmtpError,
-    SmtpSender,
-};
+use crate::idle::IdleStatus;
+use crate::imap::{FetchFormat, SearchCriteria, SearchDate, SystemFlag};
+use crate::queue::QueueStats;
 
-/// Application name, resolved from `Cargo.toml`.
-pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
-/// Application version, resolved from `Cargo.toml`.
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Slack added to the computed body limit, on top of the base64 expansion of the
-/// attachment bytes, to cover the rest of the JSON envelope.
-const BODY_LIMIT_SLACK: usize = 64 * 1024;
-
-/// Errors produced while building [`AppState`].
-///
-/// It wraps the service constructors and the delivery queue so a single
-/// `Result` covers the real SMTP transport, the IMAP connector and the queue
-/// file, none of which opens a connection or performs I/O beyond the queue file
-/// at construction time.
-#[derive(Debug, thiserror::Error)]
-pub enum AppStateError {
-    /// Building the SMTP transport failed.
-    #[error(transparent)]
-    Smtp(#[from] SmtpError),
-    /// Building the IMAP connector failed.
-    #[error(transparent)]
-    Imap(#[from] ImapError),
-    /// Building the delivery queue failed (an unusable `APIMAIL_QUEUE_PATH`).
-    #[error(transparent)]
-    Queue(#[from] QueueError),
-}
-
-impl AppStateError {
-    /// Stable, log-safe description; delegates to the wrapped error's public
-    /// message.
-    ///
-    /// The wrapped [`SmtpError`]/[`ImapError`] already group their variants into
-    /// stable, credential-free families, so this never propagates the raw
-    /// [`Display`](std::fmt::Display) text produced by `lettre`, `async-imap`,
-    /// rustls or the operating system. A queue failure names the variable but
-    /// never the path.
-    pub fn public_message(&self) -> String {
-        match self {
-            Self::Smtp(error) => error.public_message().to_string(),
-            Self::Imap(error) => error.public_message().to_string(),
-            Self::Queue(_) => {
-                "invalid APIMAIL_QUEUE_PATH: the queue file could not be created or written"
-                    .to_string()
-            }
-        }
-    }
-
-    /// Stable machine-filterable tag, for **logs only**.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Smtp(_) => "smtp",
-            Self::Imap(_) => "imap",
-            Self::Queue(_) => "queue",
-        }
-    }
-}
-
-/// Shared state exposed to handlers.
-///
-/// The configured API key is stored only as its SHA-256 digest and the field is
-/// private, so the plaintext secret can neither be read nor formatted. The
-/// manual [`Debug`] implementation redacts the digest as well as the mailer and
-/// the connection manager, which hold the SMTP and IMAP credentials.
-#[derive(Clone)]
-pub struct AppState {
-    /// Application name.
-    pub name: &'static str,
-    /// Application version.
-    pub version: &'static str,
-    /// SHA-256 digest of the expected API key.
-    api_key_hash: [u8; 32],
-    /// Non-sensitive view of the configured mail account (host and port only).
-    account: AccountView,
-    /// Outgoing mail transport (real at runtime, fake in tests).
-    mailer: Arc<dyn MailSender>,
-    /// Maximum total size, in bytes, of the decoded attachments of a message.
-    max_attachment_bytes: usize,
-    /// Maximum size, in bytes, of a message that will be fetched and parsed.
-    max_message_bytes: usize,
-    /// Sender used when a message omits `from` (the configured SMTP user).
-    default_from: String,
-    /// Lazy, persistent IMAP connection manager.
-    imap: Arc<ConnectionManager>,
-    /// TLS mode of the configured IMAP endpoint, for the status endpoint.
-    imap_tls: TlsMode,
-    /// IDLE subscription supervisor (dedicated connection + webhook).
-    idle: Arc<IdleSupervisor>,
-}
-
-impl std::fmt::Debug for AppState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppState")
-            .field("name", &self.name)
-            .field("version", &self.version)
-            .field("api_key_hash", &"***")
-            .field("account", &self.account)
-            .field("mailer", &"***")
-            .field("max_attachment_bytes", &self.max_attachment_bytes)
-            .field("max_message_bytes", &self.max_message_bytes)
-            .field("imap", &"***")
-            .field("imap_tls", &self.imap_tls)
-            .field("idle", &"***")
-            .finish()
-    }
-}
-
-/// Builds the delivery queue from `config`, failing closed.
-///
-/// With `APIMAIL_QUEUE_PATH` set the queue is persistent: any I/O failure (a
-/// path that cannot be created, opened or written) is reported as
-/// [`QueueError`] and aborts startup, naming the variable. Without a path the
-/// queue lives in memory only and nothing is ever written to disk. Either way
-/// the concrete [`WebhookQueue`] is erased behind the [`NotificationQueue`]
-/// trait the supervisor and worker depend on.
-fn build_queue(config: &Config) -> Result<Arc<dyn NotificationQueue>, QueueError> {
-    let limits = config.queue_limits();
-    match &config.queue_path {
-        Some(path) => Ok(Arc::new(WebhookQueue::persistent(path.clone(), limits)?)),
-        None => Ok(Arc::new(WebhookQueue::in_memory(limits))),
-    }
-}
-
-impl AppState {
-    /// Builds the application state from the loaded [`Config`].
-    ///
-    /// This constructs the real SMTP transport, the real IMAP connector and the
-    /// delivery queue from `config` — it opens no connection, but building any of
-    /// them (resolving a TLS configuration, or creating the queue file) can fail,
-    /// hence the `Result`.
-    ///
-    /// The expected key is hashed to a fixed-size digest here (not on every
-    /// request) so the middleware can compare two equal-length buffers in
-    /// constant time. [`Config`] guarantees a non-empty key; the assertion below
-    /// documents that invariant in debug builds.
-    pub fn from_config(config: &Config) -> Result<Self, AppStateError> {
-        debug_assert!(
-            !config.api_key.is_empty(),
-            "AppState must not be built with an empty API key"
-        );
-        let mailer: Arc<dyn MailSender> =
-            Arc::new(SmtpSender::from_endpoint(&config.account.smtp)?);
-        let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
-        Self::with_services(config, mailer, connector)
-    }
-
-    /// Builds the application state with an injected [`MailSender`].
-    ///
-    /// Used by tests to avoid the network. It delegates to
-    /// [`with_services`](Self::with_services) with a real [`TokioImapConnector`]
-    /// built from `config` (which opens no connection). The connector can still
-    /// fail to build (for example, resolving its TLS configuration), so the
-    /// fallible construction is propagated instead of panicking.
-    pub fn with_mailer(
-        config: &Config,
-        mailer: Arc<dyn MailSender>,
-    ) -> Result<Self, AppStateError> {
-        let connector: Arc<dyn ImapConnector> = Arc::new(TokioImapConnector::from_config(config)?);
-        Self::with_services(config, mailer, connector)
-    }
-
-    /// Builds the application state with both services injected.
-    ///
-    /// Used by tests to exercise the HTTP layer without touching the network. It
-    /// delegates to [`with_idle`](Self::with_idle) with a real
-    /// [`TokioIdleConnector`] and an [`HttpWebhookSender`], both of which are
-    /// infallible to build (their TLS/HTTP clients are resolved lazily). The
-    /// delivery queue is built from `config` and can fail closed when
-    /// `APIMAIL_QUEUE_PATH` is unusable, hence the `Result`.
-    pub fn with_services(
-        config: &Config,
-        mailer: Arc<dyn MailSender>,
-        imap_connector: Arc<dyn ImapConnector>,
-    ) -> Result<Self, AppStateError> {
-        let idle_connector: Arc<dyn IdleConnector> = Arc::new(TokioIdleConnector::new(
-            config.account.imap.clone(),
-            config.imap_timeout,
-        ));
-        let webhook_sender: Arc<dyn WebhookSender> =
-            Arc::new(HttpWebhookSender::new(config.webhook_timeout));
-        Self::with_idle(
-            config,
-            mailer,
-            imap_connector,
-            idle_connector,
-            webhook_sender,
-        )
-    }
-
-    /// Builds the application state with every service injected.
-    ///
-    /// Used by tests to exercise the HTTP layer, including the IDLE routes,
-    /// without touching the network: the dedicated-connection factory and the
-    /// webhook client are supplied by the caller. The subscription is built from
-    /// `config` (`APIMAIL_WEBHOOK_URL`, `APIMAIL_IDLE_MAILBOX`,
-    /// `APIMAIL_WEBHOOK_TIMEOUT_SECS` and `APIMAIL_MAX_MESSAGE_BYTES`) but is not
-    /// started until `POST /api/idle/start`.
-    ///
-    /// The delivery queue is built from `config` with `build_queue`, so an
-    /// unusable `APIMAIL_QUEUE_PATH` fails the whole construction instead of
-    /// silently degrading to an in-memory queue.
-    pub fn with_idle(
-        config: &Config,
-        mailer: Arc<dyn MailSender>,
-        imap_connector: Arc<dyn ImapConnector>,
-        idle_connector: Arc<dyn IdleConnector>,
-        webhook_sender: Arc<dyn WebhookSender>,
-    ) -> Result<Self, AppStateError> {
-        let queue = build_queue(config)?;
-        let idle = Arc::new(IdleSupervisor::new(
-            idle_connector,
-            webhook_sender,
-            IdleSettings {
-                mailbox: config.idle_mailbox.clone(),
-                webhook_url: config.webhook_url.clone(),
-                webhook_timeout: config.webhook_timeout,
-                max_message_bytes: config.max_message_bytes,
-            },
-            Backoff::default(),
-            queue,
-        ));
-        Ok(Self {
-            name: APP_NAME,
-            version: APP_VERSION,
-            api_key_hash: Sha256::digest(config.api_key.as_bytes()).into(),
-            account: AccountView {
-                imap: EndpointView {
-                    host: config.account.imap.host.clone(),
-                    port: config.account.imap.port,
-                },
-                smtp: EndpointView {
-                    host: config.account.smtp.host.clone(),
-                    port: config.account.smtp.port,
-                },
-            },
-            mailer,
-            max_attachment_bytes: config.max_attachment_bytes,
-            max_message_bytes: config.max_message_bytes,
-            default_from: config.account.smtp.username.clone(),
-            imap: Arc::new(ConnectionManager::new(imap_connector, Backoff::default())),
-            imap_tls: config.account.imap.tls,
-            idle,
-        })
-    }
-
-    /// The IDLE subscription supervisor, controlled by the `/api/idle/*` routes.
-    pub fn idle(&self) -> &IdleSupervisor {
-        &self.idle
-    }
-
-    /// Maximum total size, in bytes, of the decoded attachments of a message.
-    pub fn max_attachment_bytes(&self) -> usize {
-        self.max_attachment_bytes
-    }
-
-    /// Maximum size, in bytes, of a message that will be fetched and parsed.
-    ///
-    /// Values reported or fetched above this bound are rejected before any MIME
-    /// parsing, so untrusted content cannot exhaust memory.
-    pub fn max_message_bytes(&self) -> usize {
-        self.max_message_bytes
-    }
-
-    /// Upper bound for the raw JSON request body of `POST /api/messages`.
-    ///
-    /// The body carries base64-encoded attachments, which expand the raw bytes
-    /// by a factor of ≈ 4/3; `BODY_LIMIT_SLACK` covers the rest of the JSON
-    /// envelope. All arithmetic saturates, so an extreme configured limit cannot
-    /// overflow.
-    pub fn message_body_limit(&self) -> usize {
-        self.max_attachment_bytes
-            .saturating_mul(4)
-            .saturating_div(3)
-            .saturating_add(BODY_LIMIT_SLACK)
-    }
-}
-
-/// Public view of a single mail endpoint: host and port only.
-#[derive(Debug, Clone, Serialize)]
-pub struct EndpointView {
-    /// Server host name or address.
-    pub host: String,
-    /// Server port.
-    pub port: u16,
-}
-
-/// Public view of the mail account, exposed by `GET /api/account`.
-///
-/// It intentionally carries neither the username nor the password.
-#[derive(Debug, Clone, Serialize)]
-pub struct AccountView {
-    /// Incoming (IMAP) endpoint.
-    pub imap: EndpointView,
-    /// Outgoing (SMTP) endpoint.
-    pub smtp: EndpointView,
-}
+// The application state and its construction error belong to the service layer
+// (`crate::service`); the re-export keeps the historical `crate::http::AppState`
+// path — and the intra-doc links of this module — working.
+use crate::service::{self, ServiceError};
+pub use crate::service::{APP_NAME, APP_VERSION, AppState, AppStateError};
 
 /// JSON payload returned by `GET /api/health`.
 #[derive(Debug, Serialize)]
@@ -643,34 +348,12 @@ pub struct HealthResponse {
     pub version: &'static str,
 }
 
-/// JSON payload returned by `GET /api/whoami`.
-#[derive(Debug, Serialize)]
-struct WhoamiResponse {
-    /// Always `true`: reached only after successful authentication.
-    authenticated: bool,
-}
-
-/// JSON payload returned by a successful `POST /api/messages`.
-#[derive(Debug, Serialize)]
-struct SentResponse {
-    /// Always `sent`: reached only after the transport accepted the message.
-    status: &'static str,
-}
-
-/// JSON payload returned by a successful `GET /api/imap/status`.
-#[derive(Debug, Serialize)]
-struct ImapStatusResponse {
-    /// Always `true`: reached only after a live session was ensured.
-    connected: bool,
-    /// IMAP server host.
-    host: String,
-    /// IMAP server port.
-    port: u16,
-    /// Configured TLS mode label.
-    tls: &'static str,
-}
-
 /// JSON payload returned by a failing `GET /api/imap/status`.
+///
+/// The success DTO lives in the service layer
+/// ([`crate::service::ImapStatusResponse`]); this one is the transport's
+/// rendering of a [`ServiceError::ImapUnavailable`], which is why it stays here:
+/// no other route answers `503` with a `connected` field.
 #[derive(Debug, Serialize)]
 struct ImapUnavailableResponse {
     /// Always `false`.
@@ -681,34 +364,6 @@ struct ImapUnavailableResponse {
     message: String,
 }
 
-/// One mailbox in the `GET /api/mailboxes` response.
-#[derive(Debug, Serialize)]
-struct MailboxDto {
-    /// Mailbox name.
-    name: String,
-    /// Hierarchy delimiter, or `null` for a flat namespace.
-    delimiter: Option<String>,
-    /// Mailbox attributes in IMAP style (`\NoSelect`, …).
-    attributes: Vec<String>,
-}
-
-impl From<MailboxInfo> for MailboxDto {
-    fn from(info: MailboxInfo) -> Self {
-        Self {
-            name: info.name,
-            delimiter: info.delimiter,
-            attributes: info.attributes,
-        }
-    }
-}
-
-/// JSON payload returned by a successful `GET /api/mailboxes`.
-#[derive(Debug, Serialize)]
-struct MailboxListResponse {
-    /// The account's mailboxes.
-    mailboxes: Vec<MailboxDto>,
-}
-
 /// `POST /api/mailboxes/select` request body.
 #[derive(Debug, Deserialize)]
 struct SelectMailboxDto {
@@ -716,321 +371,46 @@ struct SelectMailboxDto {
     mailbox: String,
 }
 
-/// JSON payload returned by a successful `POST /api/mailboxes/select`.
-#[derive(Debug, Serialize)]
-struct MailboxStatusResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Number of messages (`EXISTS`).
-    exists: u32,
-    /// Messages with the `\Recent` flag (`RECENT`).
-    recent: u32,
-    /// First unseen message (`UNSEEN`), if reported.
-    unseen: Option<u32>,
-    /// UID validity (`UIDVALIDITY`), if reported.
-    uid_validity: Option<u32>,
-    /// Next UID (`UIDNEXT`), if reported.
-    uid_next: Option<u32>,
-    /// Defined message flags in IMAP style (`\Seen`, …).
-    flags: Vec<String>,
-}
-
-impl MailboxStatusResponse {
-    /// Builds the response from the selected mailbox status.
-    fn new(mailbox: String, status: MailboxStatus) -> Self {
-        Self {
-            mailbox,
-            exists: status.exists,
-            recent: status.recent,
-            unseen: status.unseen,
-            uid_validity: status.uid_validity,
-            uid_next: status.uid_next,
-            flags: status.flags,
-        }
-    }
-}
-
-/// Failure modes of the mailbox routes, mapped to the documented statuses.
+/// Failure modes of `POST /api/mailboxes/select`, mapped to the documented
+/// statuses.
+///
+/// The transport owns one of them — the `400` of a request that does not speak
+/// HTTP's dialect (a malformed JSON body, a blank `mailbox`) — plus the wrapper
+/// ([`Domain`](Self::Domain)) around a [`ServiceError`] of the migrated
+/// operation, which is rendered by the shared `IntoResponse` implementation of
+/// the service layer instead of a second envelope built here.
+///
+/// The `404`/`501`/`503` of the route are the service's and travel here as a
+/// [`Domain`](Self::Domain) value: the transport never decides their status, nor
+/// rewrites their message.
 #[derive(Debug)]
-enum MailboxError {
-    /// The request payload is malformed or misses a non-empty `mailbox`
+enum SelectMailboxError {
+    /// The body is not a decodable `SelectMailboxDto`, or its `mailbox` is blank
     /// (`400`).
     InvalidRequest(String),
-    /// The server answered `NO`: the mailbox does not exist (`404`).
-    NotFound,
-    /// The IMAP session or server is unavailable (`503`).
-    Unavailable(String),
+    /// A domain failure of the operation, rendered by the service layer.
+    Domain(ServiceError),
 }
 
-impl IntoResponse for MailboxError {
+impl IntoResponse for SelectMailboxError {
     fn into_response(self) -> Response {
         let (status, error, message) = match self {
             Self::InvalidRequest(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
-            Self::NotFound => (
-                StatusCode::NOT_FOUND,
-                "mailbox_not_found",
-                "mailbox not found".to_string(),
-            ),
-            Self::Unavailable(message) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "imap_unavailable", message)
-            }
+            // One single rendering of a domain failure: the shared envelope of the
+            // service layer, never a second copy of it.
+            Self::Domain(error) => return error.into_response(),
         };
         (status, Json(ErrorResponse { error, message })).into_response()
     }
 }
 
-/// Maps an [`ImapError`] to the mailbox routes' failure model.
-///
-/// A missing mailbox becomes `404`; every other failure becomes `503` carrying
-/// the stable, credential-free [`ImapError::public_message`].
-impl From<ImapError> for MailboxError {
-    fn from(error: ImapError) -> Self {
-        match error {
-            ImapError::MailboxNotFound => Self::NotFound,
-            other => Self::Unavailable(other.public_message().to_string()),
-        }
+/// Maps a [`ServiceError`] into the select route's failure model: the domain
+/// failure travels untouched and is rendered by the service layer, so the thin
+/// handler only has to propagate it with `?`.
+impl From<ServiceError> for SelectMailboxError {
+    fn from(error: ServiceError) -> Self {
+        Self::Domain(error)
     }
-}
-
-/// One address in a message envelope.
-#[derive(Debug, Serialize)]
-struct AddressDto {
-    /// Display name, or `null`.
-    name: Option<String>,
-    /// `mailbox@host`, or `null`.
-    address: Option<String>,
-}
-
-impl From<&Address> for AddressDto {
-    fn from(address: &Address) -> Self {
-        Self {
-            name: address.name.clone(),
-            address: address.address.clone(),
-        }
-    }
-}
-
-/// A message envelope in the message responses.
-#[derive(Debug, Serialize)]
-struct EnvelopeDto {
-    /// `From` addresses.
-    from: Vec<AddressDto>,
-    /// `To` addresses.
-    to: Vec<AddressDto>,
-    /// `Cc` addresses.
-    cc: Vec<AddressDto>,
-    /// Raw `Subject` header.
-    subject: Option<String>,
-    /// Raw `Date` header.
-    date: Option<String>,
-    /// `Message-ID`.
-    message_id: Option<String>,
-}
-
-impl From<&MessageEnvelope> for EnvelopeDto {
-    fn from(envelope: &MessageEnvelope) -> Self {
-        Self {
-            from: envelope.from.iter().map(AddressDto::from).collect(),
-            to: envelope.to.iter().map(AddressDto::from).collect(),
-            cc: envelope.cc.iter().map(AddressDto::from).collect(),
-            subject: envelope.subject.clone(),
-            date: envelope.date.clone(),
-            message_id: envelope.message_id.clone(),
-        }
-    }
-}
-
-/// The metadata shared by the listing and the single-message responses.
-#[derive(Debug, Serialize)]
-struct MessageDto {
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Sequence number within the mailbox.
-    seq: u32,
-    /// Flags in IMAP style (`\Seen`, …).
-    flags: Vec<String>,
-    /// `RFC822.SIZE`, if reported.
-    size: Option<u32>,
-    /// `INTERNALDATE` in RFC 3339 form, if reported.
-    internal_date: Option<String>,
-    /// Parsed envelope, if reported.
-    envelope: Option<EnvelopeDto>,
-}
-
-impl From<&Message> for MessageDto {
-    fn from(message: &Message) -> Self {
-        Self {
-            uid: message.uid,
-            seq: message.seq,
-            flags: message.flags.clone(),
-            size: message.size,
-            internal_date: message.internal_date.clone(),
-            envelope: message.envelope.as_ref().map(EnvelopeDto::from),
-        }
-    }
-}
-
-/// JSON payload returned by a successful `GET /api/messages`.
-#[derive(Debug, Serialize)]
-struct MessageListResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Total number of messages matching the search.
-    total: u32,
-    /// Applied page size.
-    limit: u32,
-    /// Applied page offset.
-    offset: u32,
-    /// The messages in this page.
-    messages: Vec<MessageDto>,
-}
-
-/// JSON payload returned by a successful `GET /api/messages/{uid}`.
-///
-/// The `headers_base64` and `raw_base64` fields are present only for the matching
-/// `format`, hence the conditional serialization.
-#[derive(Debug, Serialize)]
-struct MessageDetailResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Sequence number within the mailbox.
-    seq: u32,
-    /// Flags in IMAP style (`\Seen`, …).
-    flags: Vec<String>,
-    /// `RFC822.SIZE`, if reported.
-    size: Option<u32>,
-    /// `INTERNALDATE` in RFC 3339 form, if reported.
-    internal_date: Option<String>,
-    /// Parsed envelope, if reported.
-    envelope: Option<EnvelopeDto>,
-    /// Requested format label: `summary`, `headers` or `full`.
-    format: &'static str,
-    /// Raw header block, base64-encoded (only for `format=headers`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    headers_base64: Option<String>,
-    /// Full RFC822 source, base64-encoded (only for `format=full`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    raw_base64: Option<String>,
-}
-
-impl MessageDetailResponse {
-    /// Builds the response from the fetched message and the requested format.
-    ///
-    /// The raw bytes come from the domain message (`headers`/`body`); the fake
-    /// sessions in tests populate them directly.
-    fn new(mailbox: String, message: Message, format: FetchFormat) -> Self {
-        let metadata = MessageDto::from(&message);
-        let (format_label, headers_base64, raw_base64) = match format {
-            FetchFormat::Summary => ("summary", None, None),
-            FetchFormat::Headers => (
-                "headers",
-                message
-                    .headers
-                    .as_deref()
-                    .map(|bytes| STANDARD.encode(bytes)),
-                None,
-            ),
-            FetchFormat::Full => (
-                "full",
-                None,
-                message.body.as_deref().map(|bytes| STANDARD.encode(bytes)),
-            ),
-        };
-        Self {
-            mailbox,
-            uid: metadata.uid,
-            seq: metadata.seq,
-            flags: metadata.flags,
-            size: metadata.size,
-            internal_date: metadata.internal_date,
-            envelope: metadata.envelope,
-            format: format_label,
-            headers_base64,
-            raw_base64,
-        }
-    }
-}
-
-/// JSON payload returned by a successful `GET /api/messages/{uid}/body`.
-///
-/// `text` and `html` are always present; each is `null` when the message carries
-/// no such body and none can be derived.
-#[derive(Debug, Serialize)]
-struct MessageBodyResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Derived plain-text body, or `null`.
-    text: Option<String>,
-    /// Decoded HTML body, or `null`.
-    html: Option<String>,
-}
-
-/// One attachment in the `GET /api/messages/{uid}/attachments` response.
-///
-/// The content is intentionally omitted: it is only ever returned by the
-/// single-attachment route, base64-encoded inside the JSON body.
-#[derive(Debug, Serialize)]
-struct ParsedAttachmentDto {
-    /// Positional identifier within the parsed attachment list.
-    id: u32,
-    /// Decoded file name, or `null`.
-    filename: Option<String>,
-    /// MIME content type, or `null`.
-    content_type: Option<String>,
-    /// Decoded content length, in bytes.
-    size: usize,
-    /// Whether the part is marked `inline`.
-    inline: bool,
-    /// `Content-ID`, or `null`.
-    content_id: Option<String>,
-}
-
-impl From<&ParsedAttachment> for ParsedAttachmentDto {
-    fn from(attachment: &ParsedAttachment) -> Self {
-        Self {
-            id: attachment.id,
-            filename: attachment.filename.clone(),
-            content_type: attachment.content_type.clone(),
-            size: attachment.size,
-            inline: attachment.inline,
-            content_id: attachment.content_id.clone(),
-        }
-    }
-}
-
-/// JSON payload returned by a successful `GET /api/messages/{uid}/attachments`.
-#[derive(Debug, Serialize)]
-struct AttachmentListResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// The message's attachments, without their content.
-    attachments: Vec<ParsedAttachmentDto>,
-}
-
-/// JSON payload returned by a successful
-/// `GET /api/messages/{uid}/attachments/{id}`.
-#[derive(Debug, Serialize)]
-struct AttachmentResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Positional identifier of the attachment.
-    id: u32,
-    /// Decoded file name, or `null`.
-    filename: Option<String>,
-    /// MIME content type, or `null`.
-    content_type: Option<String>,
-    /// Decoded content length, in bytes.
-    size: usize,
-    /// The attachment's decoded content, base64-encoded.
-    content_base64: String,
 }
 
 /// Query string of `GET /api/messages`, decoded loosely into optional strings.
@@ -1349,41 +729,6 @@ fn parse_destination(value: String) -> Result<String, MessageError> {
     Ok(trimmed.to_string())
 }
 
-/// JSON payload returned by a successful `PATCH /api/messages/{uid}/flags`.
-#[derive(Debug, Serialize)]
-struct FlagUpdateResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Resulting flags in IMAP style (`\Seen`, …).
-    flags: Vec<String>,
-}
-
-/// JSON payload returned by a successful move or copy.
-#[derive(Debug, Serialize)]
-struct MoveCopyResponse {
-    /// Selected (source) mailbox name.
-    mailbox: String,
-    /// Unique identifier within the source mailbox.
-    uid: u32,
-    /// Destination mailbox name.
-    to: String,
-    /// `moved` for a move, `copied` for a copy.
-    status: &'static str,
-}
-
-/// JSON payload returned by a successful `DELETE /api/messages/{uid}`.
-#[derive(Debug, Serialize)]
-struct DeleteResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Always `deleted`.
-    status: &'static str,
-}
-
 /// Decodes a raw query string into `T`, mapping a failure to `invalid_request`.
 fn parse_raw_query<T>(raw: Option<String>) -> Result<T, MessageError>
 where
@@ -1397,187 +742,44 @@ where
 }
 
 /// Failure modes of the message routes, mapped to the documented statuses.
+///
+/// The transport owns one of them — the `400` of a request that does not speak
+/// HTTP's dialect (a malformed `uid`, query string or body) — plus the wrapper
+/// ([`Domain`](Self::Domain)) around a [`ServiceError`] of the operation behind
+/// each handler, which is rendered by the shared `IntoResponse` implementation of
+/// the service layer instead of a second envelope built here.
+///
+/// Every domain failure of a message route — the two `404`s, the `501` of a
+/// missing extension and the `503` — travels here as a [`Domain`](Self::Domain)
+/// value: the transport never decides their status, nor rewrites their message.
+/// The per-route variants that used to carry them disappeared with the last
+/// producer, `DELETE /api/messages/{uid}`.
 #[derive(Debug)]
 enum MessageError {
     /// The request is malformed (`400`).
     InvalidRequest(String),
-    /// The server answered `NO`: the mailbox does not exist (`404`).
-    MailboxNotFound,
-    /// The requested message does not exist (`404`).
-    MessageNotFound,
-    /// The requested attachment does not exist (`404`).
-    AttachmentNotFound,
-    /// The message exceeds the configured parsing size limit (`413`).
-    TooLarge,
-    /// The message exists but its MIME content cannot be parsed (`422`).
-    Unparsable,
-    /// The server does not announce the extension the operation needs (`501`).
-    CapabilityNotSupported(String),
-    /// The IMAP session or server is unavailable (`503`).
-    Unavailable(String),
+    /// A domain failure of an operation, rendered by the service layer.
+    Domain(ServiceError),
 }
 
 impl IntoResponse for MessageError {
     fn into_response(self) -> Response {
         let (status, error, message) = match self {
             Self::InvalidRequest(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
-            Self::MailboxNotFound => (
-                StatusCode::NOT_FOUND,
-                "mailbox_not_found",
-                "mailbox not found".to_string(),
-            ),
-            Self::MessageNotFound => (
-                StatusCode::NOT_FOUND,
-                "message_not_found",
-                "message not found".to_string(),
-            ),
-            Self::AttachmentNotFound => (
-                StatusCode::NOT_FOUND,
-                "attachment_not_found",
-                "attachment not found".to_string(),
-            ),
-            Self::TooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "message_too_large",
-                "message exceeds the configured size limit".to_string(),
-            ),
-            Self::Unparsable => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "message_not_parsable",
-                "message cannot be parsed".to_string(),
-            ),
-            Self::CapabilityNotSupported(message) => (
-                StatusCode::NOT_IMPLEMENTED,
-                "capability_not_supported",
-                message,
-            ),
-            Self::Unavailable(message) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "imap_unavailable", message)
-            }
+            // One single rendering of a domain failure: the shared envelope of the
+            // service layer, never a second copy of it.
+            Self::Domain(error) => return error.into_response(),
         };
         (status, Json(ErrorResponse { error, message })).into_response()
     }
 }
 
-/// Maps an [`ImapError`] to the message routes' failure model.
-///
-/// Missing mailboxes and messages become `404`, a missing extension becomes
-/// `501` and every other failure becomes `503`, always carrying the stable,
-/// credential-free [`ImapError::public_message`].
-impl From<ImapError> for MessageError {
-    fn from(error: ImapError) -> Self {
-        match &error {
-            ImapError::MailboxNotFound => Self::MailboxNotFound,
-            ImapError::MessageNotFound => Self::MessageNotFound,
-            ImapError::InvalidFlags => Self::InvalidRequest("invalid flags".to_string()),
-            ImapError::CapabilityNotSupported => {
-                Self::CapabilityNotSupported(error.public_message().to_string())
-            }
-            other => Self::Unavailable(other.public_message().to_string()),
-        }
-    }
-}
-
-/// Maps a [`ParsedMessageError`] to the message routes' failure model.
-///
-/// The IMAP variant reuses the existing [`From<ImapError>`] mapping; the size
-/// guard and the parser refusal become `413` and `422` respectively, each with a
-/// fixed message that never echoes third-party text.
-impl From<ParsedMessageError> for MessageError {
-    fn from(error: ParsedMessageError) -> Self {
-        match error {
-            ParsedMessageError::Imap(error) => Self::from(error),
-            ParsedMessageError::TooLarge { .. } => Self::TooLarge,
-            ParsedMessageError::Unparsable => Self::Unparsable,
-        }
-    }
-}
-
-/// One attachment of the `POST /api/messages` request body.
-#[derive(Debug, Deserialize)]
-struct AttachmentDto {
-    /// File name presented to the recipient.
-    filename: String,
-    /// Optional MIME content type.
-    #[serde(default)]
-    content_type: Option<String>,
-    /// Attachment content, base64-encoded.
-    data_base64: String,
-}
-
-/// `POST /api/messages` request body.
-#[derive(Debug, Deserialize)]
-struct SendMessageDto {
-    /// Optional sender; defaults to the configured SMTP user.
-    #[serde(default)]
-    from: Option<String>,
-    /// Primary recipients (at least one is required).
-    #[serde(default)]
-    to: Vec<String>,
-    /// Carbon-copy recipients.
-    #[serde(default)]
-    cc: Vec<String>,
-    /// Blind carbon-copy recipients.
-    #[serde(default)]
-    bcc: Vec<String>,
-    /// Subject line.
-    #[serde(default)]
-    subject: String,
-    /// Optional plain-text body.
-    #[serde(default)]
-    text: Option<String>,
-    /// Optional HTML body.
-    #[serde(default)]
-    html: Option<String>,
-    /// Attachments.
-    #[serde(default)]
-    attachments: Vec<AttachmentDto>,
-}
-
-impl SendMessageDto {
-    /// Validates the request and converts it into an [`OutgoingMessage`].
-    ///
-    /// The effective sender is resolved here (to `default_from` when `from` is
-    /// absent) so downstream transports — including test fakes — always observe
-    /// the sender that will actually be used.
-    fn into_outgoing(
-        self,
-        default_from: &str,
-        limit: usize,
-    ) -> Result<OutgoingMessage, SmtpMessageError> {
-        if self.to.is_empty() {
-            return Err(SmtpMessageError::MissingRecipient);
-        }
-
-        let mut total = 0usize;
-        let mut attachments = Vec::with_capacity(self.attachments.len());
-        for attachment in self.attachments {
-            let data = STANDARD
-                .decode(attachment.data_base64.as_bytes())
-                .map_err(|_| SmtpMessageError::InvalidBase64 {
-                    filename: attachment.filename.clone(),
-                })?;
-            total = total.saturating_add(data.len());
-            attachments.push(OutgoingAttachment {
-                filename: attachment.filename,
-                content_type: attachment.content_type,
-                data,
-            });
-        }
-        if total > limit {
-            return Err(SmtpMessageError::TooLarge { total, limit });
-        }
-
-        Ok(OutgoingMessage {
-            from: Some(self.from.unwrap_or_else(|| default_from.to_string())),
-            to: self.to,
-            cc: self.cc,
-            bcc: self.bcc,
-            subject: self.subject,
-            text: self.text,
-            html: self.html,
-            attachments,
-        })
+/// Maps a [`ServiceError`] into the transport's failure model: the domain failure
+/// travels untouched and is rendered by the service layer, so a thin handler
+/// only has to propagate it with `?`.
+impl From<ServiceError> for MessageError {
+    fn from(error: ServiceError) -> Self {
+        Self::Domain(error)
     }
 }
 
@@ -1591,15 +793,28 @@ struct ErrorResponse {
 }
 
 /// Failure modes of `POST /api/messages`, mapped to the documented statuses.
+///
+/// The transport owns two of them — the `413` of the **raw HTTP request body**
+/// and the `400` of a body that is not a [`SendMessageDto`](service::SendMessageDto)
+/// at all — plus the wrapper ([`Domain`](Self::Domain)) around the
+/// [`ServiceError`] of the operation, which is rendered by the shared
+/// `IntoResponse` implementation of the service layer instead of a second
+/// envelope built here.
+///
+/// The other failures of the route — an unparsable payload that breaks a domain
+/// rule (`400`), the **decoded** attachments exceeding their limit (`413`) and a
+/// failed delivery (`502`) — are the service's, and travel here as a
+/// [`Domain`](Self::Domain) value: the transport never decides their status, nor
+/// rewrites their message.
 #[derive(Debug)]
 enum SendError {
-    /// Invalid request payload (`400`).
+    /// The body is not a decodable `SendMessageDto` (`400`).
     InvalidRequest(String),
-    /// The request is too large — the raw body or the decoded attachments exceed
-    /// the configured limit (`413`).
+    /// The raw request body exceeds the per-route body limit (`413`); the decoded
+    /// attachments have their own `413`, owned by the service.
     PayloadTooLarge(String),
-    /// The SMTP transport failed (`502`).
-    Smtp(String),
+    /// A domain failure of the operation, rendered by the service layer.
+    Domain(ServiceError),
 }
 
 impl IntoResponse for SendError {
@@ -1609,20 +824,72 @@ impl IntoResponse for SendError {
             Self::PayloadTooLarge(message) => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
             }
-            Self::Smtp(message) => (StatusCode::BAD_GATEWAY, "smtp_error", message),
+            // One single rendering of a domain failure: the shared envelope of the
+            // service layer, never a second copy of it.
+            Self::Domain(error) => return error.into_response(),
         };
         (status, Json(ErrorResponse { error, message })).into_response()
     }
 }
 
-/// Single point of truth mapping a validation failure to its HTTP status: an
-/// oversized attachment is `413`, anything else is a `400`.
-impl From<SmtpMessageError> for SendError {
-    fn from(error: SmtpMessageError) -> Self {
-        match error {
-            SmtpMessageError::TooLarge { .. } => Self::PayloadTooLarge(error.to_string()),
-            other => Self::InvalidRequest(other.to_string()),
-        }
+/// Maps a [`ServiceError`] into the send route's failure model: the domain failure
+/// travels untouched and is rendered by the service layer, so the thin handler
+/// only has to propagate it with `?`.
+impl From<ServiceError> for SendError {
+    fn from(error: ServiceError) -> Self {
+        Self::Domain(error)
+    }
+}
+
+/// Single point of truth mapping a [`ServiceError`] to the HTTP status of the
+/// published error table (see the table in [`crate::service`]).
+///
+/// The status of every domain failure is decided here, in one place, and the
+/// match is **exhaustive** on purpose: adding a variant to [`ServiceError`] is a
+/// compile error until its status is chosen, so no failure mode can silently
+/// inherit the wrong one. The body is the shared envelope built by the
+/// [`IntoResponse`] implementation below, with one deliberate exception: the
+/// `503` of `GET /api/imap/status` also carries `"connected": false`, and that
+/// route renders itself.
+fn status_for(error: &ServiceError) -> StatusCode {
+    match error {
+        ServiceError::ImapUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        ServiceError::CapabilityNotSupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        ServiceError::MailboxNotFound
+        | ServiceError::MessageNotFound
+        | ServiceError::AttachmentNotFound => StatusCode::NOT_FOUND,
+        ServiceError::MessageTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        ServiceError::MessageNotParsable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        ServiceError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
+        ServiceError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        ServiceError::SmtpFailure { .. } => StatusCode::BAD_GATEWAY,
+        // A `STORE` that cannot be rendered is the second domain producer of
+        // `invalid_request`, next to the send operation's.
+        ServiceError::InvalidFlags { .. } => StatusCode::BAD_REQUEST,
+        ServiceError::IdleNotConfigured => StatusCode::NOT_IMPLEMENTED,
+    }
+}
+
+/// Renders a [`ServiceError`] as the shared `{"error":…,"message":…}` envelope.
+///
+/// This is the **one** place where a domain failure becomes an HTTP response, so
+/// a migrating handler only has to propagate the error (`?`, or `ServiceError` in
+/// its return type) instead of rebuilding the envelope by hand. The status comes
+/// from `status_for`; the body is the pair [`ServiceError::kind`] plus
+/// [`ServiceError::public_message`], which is transport-agnostic — MCP will read
+/// the very same two values.
+///
+/// A route that needs a *different* body — `GET /api/imap/status` adds
+/// `"connected": false` to its `503` — keeps its own rendering on purpose rather
+/// than growing a flag here.
+impl IntoResponse for ServiceError {
+    fn into_response(self) -> Response {
+        let status = status_for(&self);
+        let body = Json(ErrorResponse {
+            error: self.kind(),
+            message: self.public_message().to_string(),
+        });
+        (status, body).into_response()
     }
 }
 
@@ -1666,35 +933,31 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-async fn whoami() -> Json<WhoamiResponse> {
-    Json(WhoamiResponse {
-        authenticated: true,
-    })
+/// `GET /api/whoami` handler: thin wrapper over [`crate::service::whoami`].
+async fn whoami() -> Json<service::WhoamiResponse> {
+    Json(service::whoami())
 }
 
+/// `GET /api/account` handler: thin wrapper over [`crate::service::account`].
 async fn account(State(state): State<AppState>) -> Response {
-    Json(&state.account).into_response()
+    Json(service::account(&state)).into_response()
 }
 
-/// `GET /api/imap/status` handler: ensures a live IMAP session and reports the
-/// outcome without exposing any credential.
+/// `GET /api/imap/status` handler: thin wrapper over
+/// [`crate::service::imap_status`], which ensures a live IMAP session and
+/// reports the outcome without exposing any credential.
+///
+/// The failure branch is the one route that renders its own body instead of the
+/// shared [`ServiceError`] envelope: it adds `"connected": false`. Its status
+/// still comes from [`status_for`], and its `error`/`message` from the service.
 async fn imap_status(State(state): State<AppState>) -> Response {
-    match state.imap.status().await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ImapStatusResponse {
-                connected: true,
-                host: state.account.imap.host.clone(),
-                port: state.account.imap.port,
-                tls: state.imap_tls.as_str(),
-            }),
-        )
-            .into_response(),
+    match service::imap_status(&state).await {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
         Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            status_for(&error),
             Json(ImapUnavailableResponse {
                 connected: false,
-                error: "imap_unavailable",
+                error: error.kind(),
                 message: error.public_message().to_string(),
             }),
         )
@@ -1702,49 +965,54 @@ async fn imap_status(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `GET /api/mailboxes` handler: lists the account's mailboxes.
-async fn list_mailboxes(State(state): State<AppState>) -> Result<Response, MailboxError> {
-    let mailboxes = state.imap.list_mailboxes().await?;
-    let response = MailboxListResponse {
-        mailboxes: mailboxes.into_iter().map(MailboxDto::from).collect(),
-    };
-    Ok((StatusCode::OK, Json(response)).into_response())
+/// `GET /api/mailboxes` handler: thin wrapper over
+/// [`crate::service::list_mailboxes`].
+///
+/// The failure branch is rendered by the shared [`ServiceError`] envelope; only
+/// `503 imap_unavailable` can originate here (the operation never selects a
+/// mailbox).
+async fn list_mailboxes(
+    State(state): State<AppState>,
+) -> Result<Json<service::MailboxListResponse>, ServiceError> {
+    Ok(Json(service::list_mailboxes(&state).await?))
 }
 
-/// `POST /api/mailboxes/select` handler: selects a mailbox, reporting its
+/// `POST /api/mailboxes/select` handler: thin wrapper over
+/// [`crate::service::select_mailbox`], which selects a mailbox and reports its
 /// status.
 ///
 /// The body is read as raw bytes and parsed here so a malformed payload gets
 /// the shared JSON error envelope (`400 invalid_request`) instead of axum's
 /// plain-text rejection. A missing or blank (`trim`-empty) `mailbox` is also
-/// rejected with a `400`.
+/// rejected with a `400`. The `404` of a missing mailbox and the `503` of an
+/// unavailable session are the service's and are rendered by its shared
+/// `IntoResponse` implementation.
 async fn select_mailbox(
     State(state): State<AppState>,
     body: Bytes,
-) -> Result<Response, MailboxError> {
+) -> Result<Response, SelectMailboxError> {
     // A fixed message: the serde error could echo part of the attacker-supplied
     // payload, so it must not be reflected back to the client.
     let dto: SelectMailboxDto = serde_json::from_slice(&body)
-        .map_err(|_| MailboxError::InvalidRequest("invalid JSON body".to_string()))?;
+        .map_err(|_| SelectMailboxError::InvalidRequest("invalid JSON body".to_string()))?;
 
     let mailbox = dto.mailbox.trim();
     if mailbox.is_empty() {
-        return Err(MailboxError::InvalidRequest(
+        return Err(SelectMailboxError::InvalidRequest(
             "`mailbox` must not be empty".to_string(),
         ));
     }
 
-    let status = state.imap.select_mailbox(mailbox).await?;
-    let response = MailboxStatusResponse::new(mailbox.to_string(), status);
+    let response = service::select_mailbox(&state, mailbox.to_string()).await?;
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `GET /api/messages` handler: searches a mailbox and returns one page.
+/// `GET /api/messages` handler: thin wrapper over
+/// [`crate::service::list_messages`].
 ///
 /// The query string is decoded with [`RawQuery`] + `serde_urlencoded` so every
-/// rejection is the shared JSON `400` envelope; the mailbox is selected, the
-/// search is run and only the requested window is fetched, all on the same live
-/// session.
+/// rejection is the shared JSON `400` envelope; the service then runs the search
+/// and the fetch of one page on the single live session.
 async fn list_messages(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
@@ -1752,55 +1020,36 @@ async fn list_messages(
     let query: ListMessagesQuery = parse_raw_query(raw)?;
     let (mailbox, criteria, limit, offset) = query.into_query()?;
 
-    let page = state
-        .imap
-        .list_messages(&mailbox, criteria, limit, offset)
-        .await?;
-
-    let response = MessageListResponse {
-        mailbox,
-        total: page.total,
-        limit: page.limit,
-        offset: page.offset,
-        messages: page.messages.iter().map(MessageDto::from).collect(),
-    };
+    let response = service::list_messages(&state, mailbox, criteria, limit, offset).await?;
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `GET /api/messages/{uid}` handler: fetches a single message.
+/// `GET /api/messages/{uid}` handler: thin wrapper over
+/// [`crate::service::fetch_message`].
 ///
 /// The `uid` is extracted as a string and parsed here so a non-numeric value is
-/// answered with the shared JSON `400` instead of axum's plain-text rejection.
+/// answered with the shared JSON `400` instead of axum's plain-text rejection;
+/// the service receives an already-typed, positive identifier.
 async fn fetch_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, MessageError> {
-    let uid: u32 = uid.parse().map_err(|_| {
-        MessageError::InvalidRequest("`uid` must be a numeric identifier".to_string())
-    })?;
-    if uid == 0 {
-        // UID 0 is not a valid IMAP message identifier.
-        return Err(MessageError::InvalidRequest(
-            "`uid` must be a positive integer".to_string(),
-        ));
-    }
-
+    let uid = parse_uid(&uid)?;
     let query: FetchMessageQuery = parse_raw_query(raw)?;
     let (mailbox, format) = query.into_query()?;
 
-    let message = state.imap.fetch_message(&mailbox, uid, format).await?;
-    let response = MessageDetailResponse::new(mailbox, message, format);
+    let response = service::fetch_message(&state, mailbox, uid, format).await?;
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `GET /api/messages/{uid}/body` handler: fetches the single message, parses
-/// its MIME content and returns its plain-text and HTML bodies.
+/// `GET /api/messages/{uid}/body` handler: thin wrapper over
+/// [`crate::service::message_body`].
 ///
 /// The `uid` path parameter and the `mailbox` query parameter are validated
 /// first (shared JSON `400` envelope), so no IMAP command is sent for an invalid
-/// request. Oversized and unparsable messages are reported by the domain layer
-/// and mapped to `413`/`422`.
+/// request. Oversized and unparsable messages are reported by the service and
+/// rendered as `413`/`422` by the shared [`ServiceError`] envelope.
 async fn get_message_body(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1809,25 +1058,13 @@ async fn get_message_body(
     let uid = parse_uid(&uid)?;
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
 
-    let parsed = state
-        .imap
-        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
-        .await?;
-
-    Ok((
-        StatusCode::OK,
-        Json(MessageBodyResponse {
-            mailbox,
-            uid,
-            text: parsed.text,
-            html: parsed.html,
-        }),
-    )
-        .into_response())
+    let response = service::message_body(&state, mailbox, uid).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `GET /api/messages/{uid}/attachments` handler: fetches the single message,
-/// parses it and returns the metadata of each attachment, without their content.
+/// `GET /api/messages/{uid}/attachments` handler: thin wrapper over
+/// [`crate::service::list_attachments`], which parses the message and reports the
+/// metadata of each attachment, without their content.
 async fn list_attachments(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1836,26 +1073,14 @@ async fn list_attachments(
     let uid = parse_uid(&uid)?;
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
 
-    let parsed = state
-        .imap
-        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
-        .await?;
-
-    let response = AttachmentListResponse {
-        mailbox,
-        uid,
-        attachments: parsed
-            .attachments
-            .iter()
-            .map(ParsedAttachmentDto::from)
-            .collect(),
-    };
+    let response = service::list_attachments(&state, mailbox, uid).await?;
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `GET /api/messages/{uid}/attachments/{id}` handler: fetches the single
-/// message, parses it and returns the decoded content of the attachment
-/// identified by the positional `id`, base64-encoded inside the JSON body.
+/// `GET /api/messages/{uid}/attachments/{id}` handler: thin wrapper over
+/// [`crate::service::attachment`], which returns the decoded content of the
+/// attachment identified by the positional `id`, base64-encoded inside the JSON
+/// body.
 ///
 /// The content is never reflected into an HTTP header, so a hostile `filename`
 /// or `content_type` cannot inject one.
@@ -1868,37 +1093,20 @@ async fn get_attachment(
     let id = parse_attachment_id(&id)?;
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
 
-    let parsed = state
-        .imap
-        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
-        .await?;
-    let attachment = parsed
-        .attachment(id)
-        .ok_or(MessageError::AttachmentNotFound)?;
-
-    Ok((
-        StatusCode::OK,
-        Json(AttachmentResponse {
-            mailbox,
-            uid,
-            id,
-            filename: attachment.filename.clone(),
-            content_type: attachment.content_type.clone(),
-            size: attachment.size,
-            content_base64: STANDARD.encode(&attachment.content),
-        }),
-    )
-        .into_response())
+    let response = service::attachment(&state, mailbox, uid, id).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `PATCH /api/messages/{uid}/flags` handler: applies flag additions/removals to
-/// a single message and returns its resulting flags.
+/// `PATCH /api/messages/{uid}/flags` handler: thin wrapper over
+/// [`crate::service::update_flags`].
 ///
 /// The `uid` path parameter and the `mailbox` query parameter are validated
 /// first (shared JSON `400` envelope). The body is read as raw bytes and parsed
 /// here so a malformed payload or an unknown flag is a `400` rather than axum's
 /// plain-text rejection; validation rejects an empty or contradictory update
-/// **before** any IMAP command is sent.
+/// **before** any IMAP command is sent. The domain outcomes — the two `404`s, the
+/// `400 invalid_request` of a `STORE` that cannot be rendered and the `503` — are
+/// the service's and are rendered by its shared `IntoResponse` implementation.
 async fn update_flags(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1914,20 +1122,17 @@ async fn update_flags(
         .map_err(|_| MessageError::InvalidRequest("invalid JSON body".to_string()))?;
     let (add, remove) = dto.into_flags()?;
 
-    let flags = state.imap.update_flags(&mailbox, uid, add, remove).await?;
-    Ok((
-        StatusCode::OK,
-        Json(FlagUpdateResponse {
-            mailbox,
-            uid,
-            flags,
-        }),
-    )
-        .into_response())
+    let response = service::update_flags(&state, mailbox, uid, add, remove).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `POST /api/messages/{uid}/move` handler: moves a single message to another
-/// mailbox.
+/// `POST /api/messages/{uid}/move` handler: thin wrapper over
+/// [`crate::service::move_message`].
+///
+/// The `uid`, the `mailbox` and the body's `to` are validated here (shared JSON
+/// `400` envelope); the move itself — `UID MOVE`, or the `UIDPLUS` emulation —
+/// and its domain outcomes (the two `404`s, the `501` of a server that announces
+/// neither capability and the `503`) belong to the operation.
 async fn move_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1938,21 +1143,15 @@ async fn move_message(
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
     let to = parse_body_destination(&body)?;
 
-    state.imap.move_message(&mailbox, uid, &to).await?;
-    Ok((
-        StatusCode::OK,
-        Json(MoveCopyResponse {
-            mailbox,
-            uid,
-            to,
-            status: "moved",
-        }),
-    )
-        .into_response())
+    let response = service::move_message(&state, mailbox, uid, to).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `POST /api/messages/{uid}/copy` handler: copies a single message to another
-/// mailbox.
+/// `POST /api/messages/{uid}/copy` handler: thin wrapper over
+/// [`crate::service::copy_message`].
+///
+/// Same split as [`move_message`]: the request's own validation stays here and
+/// every domain outcome — the two `404`s and the `503` — is the operation's.
 async fn copy_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1963,20 +1162,18 @@ async fn copy_message(
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
     let to = parse_body_destination(&body)?;
 
-    state.imap.copy_message(&mailbox, uid, &to).await?;
-    Ok((
-        StatusCode::OK,
-        Json(MoveCopyResponse {
-            mailbox,
-            uid,
-            to,
-            status: "copied",
-        }),
-    )
-        .into_response())
+    let response = service::copy_message(&state, mailbox, uid, to).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `DELETE /api/messages/{uid}` handler: deletes a single message.
+/// `DELETE /api/messages/{uid}` handler: thin wrapper over
+/// [`crate::service::delete_message`].
+///
+/// The `uid` and the `mailbox` are validated here (shared JSON `400` envelope);
+/// the deletion itself — the purge the operation owns, which requires `UIDPLUS`
+/// and never falls back to a global `EXPUNGE` — and its domain outcomes (the two
+/// `404`s, the `501` of a server that does not announce the extension and the
+/// `503`) belong to the operation.
 async fn delete_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1985,16 +1182,8 @@ async fn delete_message(
     let uid = parse_uid(&uid)?;
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
 
-    state.imap.delete_message(&mailbox, uid).await?;
-    Ok((
-        StatusCode::OK,
-        Json(DeleteResponse {
-            mailbox,
-            uid,
-            status: "deleted",
-        }),
-    )
-        .into_response())
+    let response = service::delete_message(&state, mailbox, uid).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
 /// Parses the required `to` field of a move/copy body and validates it.
@@ -2007,12 +1196,22 @@ fn parse_body_destination(body: &[u8]) -> Result<String, MessageError> {
     parse_destination(dto.to)
 }
 
-/// `POST /api/messages` handler: reads the body, validates it, then sends it.
+/// `POST /api/messages` handler: reads and decodes the body, then sends it.
+///
+/// A **thin wrapper** over [`service::send_message`], which owns every rule of an
+/// outgoing message (recipients, addresses, base64 attachments and their decoded
+/// size) so a second transport inherits them instead of re-implementing them.
+/// What stays here is exactly what only an HTTP request has: its own body and the
+/// `serde` dialect of that body.
 ///
 /// The route disables axum's `DefaultBodyLimit`; the body is read here with
 /// [`to_bytes`] against [`AppState::message_body_limit`] so that exceeding the
 /// limit is answered with the shared JSON envelope (`413 payload_too_large`)
-/// rather than axum's plain-text rejection. A malformed JSON body is a `400`.
+/// rather than axum's plain-text rejection — that limit exists only because an
+/// HTTP request *has* a body, which is why it is the transport's `413` and not
+/// the service's. A body that is not a
+/// [`SendMessageDto`](service::SendMessageDto) is likewise the transport's `400`.
+/// The `200` body is the operation's own [`service::SentResponse`].
 async fn send_message(
     State(state): State<AppState>,
     request: Request,
@@ -2023,90 +1222,59 @@ async fn send_message(
             SendError::PayloadTooLarge(format!("request body exceeds the limit: {error}"))
         })?;
 
-    let dto: SendMessageDto = serde_json::from_slice(&body)
+    let dto: service::SendMessageDto = serde_json::from_slice(&body)
         .map_err(|error| SendError::InvalidRequest(error.to_string()))?;
 
-    let message = dto.into_outgoing(&state.default_from, state.max_attachment_bytes)?;
-    message.validate()?;
-    state
-        .mailer
-        .send(message)
-        .await
-        .map_err(|error| SendError::Smtp(error.public_message().to_string()))?;
-
-    Ok((StatusCode::OK, Json(SentResponse { status: "sent" })).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(service::send_message(&state, dto).await?),
+    )
+        .into_response())
 }
 
-/// Failure mode of the IDLE control routes.
+/// `POST /api/idle/start` handler: thin wrapper over
+/// [`crate::service::idle_start`].
 ///
-/// Only `start` can fail: it answers `501` when no webhook URL is configured and
-/// opens no connection. `stop` and `status` always succeed.
-#[derive(Debug)]
-enum IdleHttpError {
-    /// No webhook URL is configured (`501`).
-    NotConfigured,
-}
-
-impl IntoResponse for IdleHttpError {
-    fn into_response(self) -> Response {
-        let (status, error, message) = match self {
-            Self::NotConfigured => (
-                StatusCode::NOT_IMPLEMENTED,
-                "idle_not_configured",
-                "idle notifications are not configured".to_string(),
-            ),
-        };
-        (status, Json(ErrorResponse { error, message })).into_response()
-    }
-}
-
-impl From<IdleError> for IdleHttpError {
-    fn from(error: IdleError) -> Self {
-        // Explicit match (no wildcard): adding a variant to `IdleError` must be a
-        // compile error here, so a new failure mode can never be silently mapped
-        // to `NotConfigured`.
-        match error {
-            IdleError::NotConfigured => Self::NotConfigured,
-        }
-    }
-}
-
-/// `POST /api/idle/start` handler: starts the IDLE subscription.
-///
-/// Idempotent and safe against concurrent calls; the domain supervisor returns
-/// the resulting status. Without a configured webhook it reports `501` through
-/// [`IdleHttpError`].
-async fn idle_start(State(state): State<AppState>) -> Result<Response, IdleHttpError> {
-    let status = state.idle().start().await?;
+/// Idempotent and safe against concurrent calls; the domain operation returns the
+/// resulting status. Without a configured webhook it answers `501`
+/// `idle_not_configured` through the shared [`ServiceError`] envelope.
+async fn idle_start(State(state): State<AppState>) -> Result<Response, ServiceError> {
+    let status = service::idle_start(&state).await?;
     Ok((StatusCode::OK, Json(status)).into_response())
 }
 
-/// `POST /api/idle/stop` handler: stops the IDLE subscription.
+/// `POST /api/idle/stop` handler: thin wrapper over
+/// [`crate::service::idle_stop`].
 ///
-/// Idempotent: stopping a subscription that is not running is a no-op.
+/// Idempotent: stopping a subscription that is not running is a no-op, and the
+/// operation is infallible, so there is no failure branch.
 async fn idle_stop(State(state): State<AppState>) -> Response {
-    let status = state.idle().stop().await;
+    let status = service::idle_stop(&state).await;
     (StatusCode::OK, Json(status)).into_response()
 }
 
-/// `GET /api/idle/status` handler: reports the subscription state.
-async fn idle_status(State(state): State<AppState>) -> Response {
-    let status = state.idle().status().await;
-    (StatusCode::OK, Json(status)).into_response()
-}
-
-/// `GET /api/idle/queue` handler: reports the delivery queue's observable state.
+/// `GET /api/idle/status` handler: thin wrapper over
+/// [`crate::service::idle_status`].
 ///
-/// The [`QueueStats`](crate::queue::QueueStats) snapshot already derives
-/// `Serialize`, so it is returned verbatim: `persistent`, `pending`,
-/// `delivered`, `dropped`, `failed` and `oldest_pending_secs`.
-async fn idle_queue(State(state): State<AppState>) -> Response {
-    (StatusCode::OK, Json(state.idle().queue().stats())).into_response()
+/// Infallible, so there is no failure branch; the DTO is the one of the domain
+/// module and no envelope is involved.
+async fn idle_status(State(state): State<AppState>) -> Json<IdleStatus> {
+    Json(service::idle_status(&state).await)
+}
+
+/// `GET /api/idle/queue` handler: thin wrapper over
+/// [`crate::service::idle_queue`].
+///
+/// [`QueueStats`](crate::queue::QueueStats) already derives `Serialize`, so it is
+/// returned verbatim: `persistent`, `pending`, `delivered`, `dropped`, `failed`
+/// and `oldest_pending_secs`.
+async fn idle_queue(State(state): State<AppState>) -> Json<QueueStats> {
+    Json(service::idle_queue(&state))
 }
 
 /// Authorization middleware: rejects requests without a valid `Bearer` API key.
 async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if is_authorized(&request, &state.api_key_hash) {
+    if is_authorized(&request, &state) {
         next.run(request).await
     } else {
         Unauthorized.into_response()
@@ -2115,9 +1283,11 @@ async fn require_api_key(State(state): State<AppState>, request: Request, next: 
 
 /// Returns `true` when the request carries the expected key as a `Bearer` token.
 ///
-/// The token is hashed to a fixed-size digest and compared against the expected
-/// digest in constant time.
-fn is_authorized(request: &Request, expected_hash: &[u8; 32]) -> bool {
+/// This function owns what is HTTP dialect — the `Authorization` header and the
+/// `Bearer` scheme, including the whitespace rules — and delegates the
+/// comparison itself to [`AppState::verify_token`], which lives in the service
+/// layer so that every transport authenticates against the same digest.
+fn is_authorized(request: &Request, state: &AppState) -> bool {
     let Some(value) = request.headers().get(header::AUTHORIZATION) else {
         return false;
     };
@@ -2127,8 +1297,7 @@ fn is_authorized(request: &Request, expected_hash: &[u8; 32]) -> bool {
     let Some(token) = bearer_token(value) else {
         return false;
     };
-    let candidate: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    candidate.ct_eq(expected_hash).into()
+    state.verify_token(token)
 }
 
 /// Extracts the token from an `Authorization` header value using the `Bearer`
@@ -2155,6 +1324,13 @@ fn bearer_token(value: &str) -> Option<&str> {
 /// The returned router is self-contained and can be exercised in tests via
 /// `tower::ServiceExt::oneshot` without binding a socket. `GET /api/health`
 /// stays public; every other route sits behind `require_api_key`.
+///
+/// When the application state carries an MCP path (`Some`, i.e. the
+/// configuration enabled the Streamable HTTP transport) the `rmcp` service is
+/// nested **inside** the protected sub-router, before `route_layer`, so the
+/// endpoint shares this listener and this middleware instead of opening a second
+/// port or a second authentication path. With `None` — always the case without
+/// the `mcp` feature — no MCP route exists at all and the path answers `404`.
 pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/whoami", get(whoami))
@@ -2184,11 +1360,24 @@ pub fn build_router(state: AppState) -> Router {
             get(list_messages)
                 .post(send_message)
                 .layer(DefaultBodyLimit::disable()),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_key,
-        ));
+        );
+
+    // The MCP Streamable HTTP transport joins the *protected* sub-router, not the
+    // root one: nesting it here, before `route_layer`, is what makes the existing
+    // `require_api_key` middleware cover it too — the same listener, the same
+    // authentication, no second port.
+    #[cfg(feature = "mcp")]
+    let protected = match state.mcp_path() {
+        Some(path) => {
+            protected.nest_service(path, crate::mcp::streamable_http_service(state.clone()))
+        }
+        None => protected,
+    };
+
+    let protected = protected.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_api_key,
+    ));
 
     Router::new()
         .route("/api/health", get(health))
@@ -2199,6 +1388,8 @@ pub fn build_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imap::ImapError;
+    use crate::smtp::SmtpError;
 
     #[test]
     fn app_state_error_public_message_never_leaks_third_party_text() {
@@ -2243,5 +1434,50 @@ mod tests {
             "the message must name the offending variable"
         );
         assert_eq!(error.kind(), "queue");
+    }
+
+    /// Pins the shared `IntoResponse for ServiceError` rendering, which has **no
+    /// consuming handler yet**: `whoami` and `account` cannot fail, and
+    /// `imap_status` deliberately renders its own body, so nothing exercises this
+    /// implementation in the request path. It is the scaffolding the ~70 migrated
+    /// operations will rely on, hence it is verified directly here — status,
+    /// `Content-Type` and the exact `{"error","message"}` envelope — instead of
+    /// being trusted.
+    ///
+    /// The cause carries third-party text (a user, a host, an address); none of
+    /// it may reach the body.
+    #[tokio::test]
+    async fn service_error_renders_the_shared_envelope_with_its_own_status() {
+        let error = ServiceError::imap_unavailable(ImapError::Unavailable(
+            "auth failed for user@internal.example at 10.0.0.7:993".to_string(),
+        ));
+
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body should be readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "imap_unavailable",
+                "message": "could not connect to the IMAP server",
+            }),
+            "the envelope must be exactly the shared {{error, message}} pair"
+        );
+        assert!(
+            !json.to_string().contains("internal.example"),
+            "the rendering leaked third-party text: {json}"
+        );
     }
 }

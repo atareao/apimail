@@ -30,6 +30,21 @@ async fn main() -> ExitCode {
         }
     };
 
+    // MCP over stdio is a *different* server, not a second listener: it takes
+    // over standard input/output and binds no TCP port, so the branch has to
+    // happen before the listener is created. The HTTP path below is untouched.
+    #[cfg(feature = "mcp")]
+    if config.mcp_stdio {
+        tracing::info!("apimail serving MCP over stdio");
+        return match apimail::mcp::serve_stdio(&config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                tracing::error!(kind = error.kind(), "MCP stdio server failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let listener = match TcpListener::bind((config.host.as_str(), config.port)).await {
         Ok(listener) => listener,
         Err(error) => {

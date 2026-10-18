@@ -32,6 +32,11 @@ saliente por SMTP, y recibir mensajes en tiempo real mediante la extensión
 > completa de códigos de estado y de códigos `error`. Este README es la **guía de uso**
 > (arranque, variables de entorno, despliegue y ejemplos rápidos).
 
+> **Servidor MCP (opt-in)**: la misma cuenta de correo se puede exponer como servidor
+> MCP con 17 tools (12 de lectura y 5 de escritura), sobre **stdio** o **Streamable
+> HTTP**, compilando con la feature `mcp` (desactivada por defecto). Ver
+> [Servidor MCP](#servidor-mcp-model-context-protocol).
+
 ## Requisitos
 
 - **Rust edition 2024** (se recomienda una toolchain reciente; el proyecto se
@@ -192,6 +197,224 @@ error de arranque, sin *fallback* silencioso.
 > El modo TLS `none` se acepta (útil para servidores de prueba locales como
 > MailHog o GreenMail) pero registra un **aviso**: las credenciales viajarían en
 > claro.
+
+## Servidor MCP (Model Context Protocol)
+
+Además de la API HTTP, apimail puede exponerse como **servidor MCP**, para que un
+agente (opencode, Claude Code, Claude Desktop, Cursor…) lea y escriba en la cuenta
+de correo. El MCP **no** es un backend aparte: cada tool delega en la **misma capa
+de servicio** que su ruta HTTP equivalente, así que hereda sus reglas y devuelve
+los **mismos códigos `error`** (`imap_unavailable`, `mailbox_not_found`,
+`invalid_request`…). Nada que un agente pueda hacer por MCP es más (ni menos)
+permisivo que por HTTP.
+
+### Habilitarlo: es opt-in (feature `mcp`)
+
+La superficie MCP vive tras la feature de Cargo `mcp`, **desactivada por
+defecto**. Hay que compilar con ella:
+
+```bash
+cargo build --release --features mcp          # build local
+cargo install --path . --features mcp         # instalación local
+```
+
+Sin la feature, el binario **no cambia**: ni se compilan las dependencias del SDK
+(`rmcp`, `schemars`) ni se monta ruta ni transporte MCP alguno (`GET /mcp`
+responde `404`). Todas las variables de esta sección son, por tanto, inútiles —y
+**contraproducentes**— en un build por defecto (ver más abajo, *fail-closed*).
+
+> **En contenedor.** La imagen publicada se construye con las features por
+> defecto, así que **no** trae MCP: servir MCP desde un contenedor exige adaptar el
+> build de la imagen (`Dockerfile`) para que pase `--features mcp`. Además,
+> `compose.yml` entrega al contenedor una lista **explícita** de variables (sin
+> `env_file`, a propósito), de modo que las tres variables MCP solo llegan al
+> contenedor si se añaden a esa lista.
+
+### Variables de entorno
+
+| Variable              | Descripción                                        | Valor por defecto |
+| --------------------- | -------------------------------------------------- | ----------------- |
+| `APIMAIL_MCP_STDIO`   | Sirve MCP por **entrada/salida estándar**          | `false`           |
+| `APIMAIL_MCP_HTTP`    | Sirve MCP por **Streamable HTTP**                  | `false`           |
+| `APIMAIL_MCP_PATH`    | Ruta donde se monta el transporte HTTP             | `/mcp`            |
+
+Con las tres sin definir, MCP permanece **apagado** y el comportamiento es el de
+siempre. `APIMAIL_MCP_STDIO` y `APIMAIL_MCP_HTTP` aceptan `true`/`false`
+(indiferente mayúsculas) y `1`/`0`; cualquier otro valor es un error.
+
+- **Mutuamente excluyentes:** un proceso sirve **un** transporte (stdio **o**
+  HTTP). Poner las dos a `true` **aborta el arranque** nombrando ambas variables.
+- **Fail-closed:** definir **cualquiera** de las tres en un binario compilado
+  **sin** la feature `mcp` **aborta el arranque** nombrando la variable; nunca se
+  ignora en silencio. Un flag con un valor distinto de `true`/`false`/`1`/`0`, y
+  una `APIMAIL_MCP_PATH` que no sea absoluta, que sea `/` o que caiga dentro del
+  prefijo reservado `/api` (el de la API HTTP: `/api/health`, `/api/messages`…)
+  también abortan el arranque. Los valores **no** se recortan: en blanco es un
+  error de despliegue, no una invitación al valor por defecto.
+
+> Como el arranque es fail-closed, las plantillas `.env.example` y `.env.j2`
+> llevan las tres variables **comentadas**. Dejarlas *activadas* con el valor por
+> defecto rompería un despliegue normal.
+
+### Transporte stdio
+
+El cliente MCP **lanza el binario** y habla JSON-RPC por sus tuberías: no se abre
+ningún puerto. Todo lo que el servidor escribe en `stdout` es protocolo (los
+diagnósticos van a `stderr`), así que un mensaje suelto en `stdout` corrompería el
+flujo. El arranque sigue siendo fail-closed: si falta `APIMAIL_API_KEY` o algún
+dato obligatorio de la cuenta, el proceso aborta antes de escribir un solo byte de
+protocolo.
+
+Ejemplo para **opencode** (`opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "apimail": {
+      "type": "local",
+      "command": ["/usr/local/bin/apimail"],
+      "enabled": true,
+      "environment": {
+        "APIMAIL_MCP_STDIO": "true",
+        "APIMAIL_API_KEY": "una-clave-secreta",
+        "APIMAIL_IMAP_HOST": "imap.example.com",
+        "APIMAIL_IMAP_USER": "me@example.com",
+        "APIMAIL_IMAP_PASSWORD": "secreto",
+        "APIMAIL_SMTP_HOST": "smtp.example.com",
+        "APIMAIL_SMTP_USER": "me@example.com",
+        "APIMAIL_SMTP_PASSWORD": "secreto"
+      }
+    }
+  }
+}
+```
+
+El mismo bloque sirve para **Claude Code** (`.mcp.json` del proyecto) y **Claude
+Desktop** (`claude_desktop_config.json`), con `mcpServers` en lugar de `mcp`,
+`command` como cadena en lugar de array y `env` en lugar de `environment`:
+
+```json
+{
+  "mcpServers": {
+    "apimail": {
+      "command": "/usr/local/bin/apimail",
+      "env": {
+        "APIMAIL_MCP_STDIO": "true",
+        "APIMAIL_API_KEY": "una-clave-secreta",
+        "APIMAIL_IMAP_HOST": "imap.example.com",
+        "APIMAIL_IMAP_USER": "me@example.com",
+        "APIMAIL_IMAP_PASSWORD": "secreto",
+        "APIMAIL_SMTP_HOST": "smtp.example.com",
+        "APIMAIL_SMTP_USER": "me@example.com",
+        "APIMAIL_SMTP_PASSWORD": "secreto"
+      }
+    }
+  }
+}
+```
+
+### Transporte Streamable HTTP
+
+Con `APIMAIL_MCP_HTTP=true` el transporte se **anida en el mismo listener** que la
+API (**no abre ningún puerto**), en `APIMAIL_MCP_PATH` (por defecto `/mcp`), y
+**exige la misma API key** que el resto de rutas protegidas:
+
+```http
+Authorization: Bearer <APIMAIL_API_KEY>
+```
+
+Sin ella la respuesta es `401` con el envoltorio de error habitual. El servidor
+mantiene sesiones en memoria y devuelve un `Mcp-Session-Id` en el `initialize` que
+el cliente debe repetir en cada petición posterior.
+
+```bash
+export APIMAIL_MCP_HTTP=true
+cargo run --features mcp
+```
+
+Ejemplo para un cliente MCP **remoto** (opencode; sirve igual para cualquier
+cliente que acepte una URL y cabeceras):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "apimail": {
+      "type": "remote",
+      "url": "http://127.0.0.1:3000/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": { "Authorization": "Bearer una-clave-secreta" }
+    }
+  }
+}
+```
+
+`oauth: false` es importante en opencode: ante un `401` intentaría el flujo de
+OAuth 2.1 (con *Dynamic Client Registration*), que apimail no implementa; con la
+clave estática en `headers` y OAuth desactivado, la conexión es directa. Los
+clientes con la forma `mcpServers` que soportan transporte HTTP (Cursor, por
+ejemplo) usan la misma idea: `url` más `headers`.
+
+> **Sin OAuth en esta iteración.** El transporte reutiliza la autenticación por
+> API key, no hay OAuth 2.1 ni *Dynamic Client Registration*, así que los clientes
+> que los **exigen** (ChatGPT es el caso conocido) **no** funcionan todavía. Queda
+> como trabajo posterior. Los que aceptan un `Bearer` estático —opencode, Claude
+> Code/Desktop y Cursor— sí.
+
+### Las 17 tools
+
+Doce de **lectura**:
+
+| Tool                | Qué hace                                                                                                                     |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `whoami`            | Confirma que la llamada está autenticada (siempre `authenticated: true`: si no, habría fallado la autenticación).            |
+| `get_account`       | Devuelve los endpoints configurados (host y puerto de IMAP y de SMTP); **nunca** credenciales.                               |
+| `imap_status`       | Estado de la sesión IMAP, que se conecta *lazy* en el primer uso; un fallo es `imap_unavailable`.                             |
+| `list_mailboxes`    | Lista los buzones con su delimitador de jerarquía y sus atributos IMAP (por ejemplo `\NoSelect`).                            |
+| `select_mailbox`    | Selecciona un buzón (`SELECT`) y devuelve contadores, no leídos, *UID validity*, *next UID* y banderas; deja la selección activa para las llamadas siguientes. |
+| `list_messages`     | Una página de mensajes con metadatos y *envelopes*. Filtros: `from`, `to`, `subject`, `text`, `since`/`before` (`YYYY-MM-DD`), `seen`, `flagged`; `limit` (1..=200, def. 50) y `offset`. |
+| `get_message`       | Un mensaje por UID. `format` es `summary` (por defecto), `headers` (añade el bloque de cabeceras en crudo) o `full` (todo el origen RFC 822); los bloques en crudo viajan en base64. Leer **no** marca el mensaje como leído. |
+| `get_message_body`  | Cuerpo en texto plano y HTML del mensaje (`null` si no tiene ninguno); el HTML llega **verbatim**, sin sanear.                |
+| `list_attachments`  | Adjuntos de un mensaje: posición, nombre, tipo, tamaño, si son *inline* y su *content id*, **sin** el contenido.              |
+| `get_attachment`    | Contenido decodificado de un adjunto, identificado por UID y por su `id` posicional (`0` es válido); llega en base64.         |
+| `idle_status`       | Estado de la suscripción IDLE: `running` o `stopped`, el buzón vigilado y su último código de error.                          |
+| `idle_queue`        | Estado de la cola de entrega del webhook: si es persistente, cuántas notificaciones hay pendientes, entregadas, descartadas y fallidas, y la antigüedad de la más antigua. |
+
+Cinco de **escritura**:
+
+| Tool             | Qué hace                                                                                                                        |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `send_message`   | Envía un mensaje por SMTP y devuelve `status: sent`. Exige **al menos un destinatario**: sin `to` falla como `invalid_request` y no se envía nada. `from` toma por defecto el usuario SMTP; los adjuntos van en base64 y su tamaño **decodificado** está acotado por el límite configurado. |
+| `update_flags`   | Añade y/o quita banderas de sistema (`\Seen`, `\Answered`, `\Flagged`, `\Draft`, `\Deleted`) de un mensaje. Solo cambian las banderas nombradas; las demás quedan intactas. `add` y `remove` no pueden estar vacíos ni compartir una bandera. |
+| `move_message`   | Mueve un mensaje al buzón `to` (**obligatorio**) y devuelve `status: moved`; el mensaje sale del buzón origen. Usa `UID MOVE` si el servidor lo anuncia y, si no, la emulación de `UIDPLUS` (`COPY`, marcar `\Deleted`, `UID EXPUNGE`); un servidor que no anuncie ninguno de los dos falla como `capability_not_supported`. |
+| `copy_message`   | Copia un mensaje al buzón `to` (**obligatorio**) y devuelve `status: copied`; el original se queda donde estaba, con sus banderas. No necesita extensiones del servidor (`UID COPY`). |
+| `delete_message` | **Destructiva e irreversible**: purga el mensaje y devuelve `status: deleted`. Ver la advertencia de abajo.                        |
+
+> **Advertencia: las cinco tools de escritura son reales.** No son un simulacro
+> ni un modo de prueba: `send_message` **envía correo de verdad** y las otras cuatro
+> **modifican la cuenta**. En particular, **`delete_message` purga el mensaje y
+> NO lo mueve a la Papelera**: marca el mensaje `\Deleted` y ejecuta un `EXPUNGE`
+> dirigido, así que el mensaje **desaparece del buzón para siempre** — no queda
+> copia en ningún buzón, no hay «deshacer» y ningún cliente podrá restaurarlo; la
+> única vuelta atrás es la copia de seguridad del servidor de correo. Como usa
+> `UID EXPUNGE`, **exige que el servidor anuncie `UIDPLUS`**; si no lo hace, falla
+> como `capability_not_supported` y **no envía ningún comando** (nunca cae a un
+> `EXPUNGE` global, que arrastraría mensajes ajenos a la llamada). Si lo que se
+> quiere es **conservar** el mensaje, hay que usar `move_message` o
+> `copy_message`.
+
+**No** se exponen por MCP las tres rutas que quedan fuera del CRUD del buzón:
+`GET /api/health`, `POST /api/idle/start` y `POST /api/idle/stop`. La
+suscripción IDLE se puede **observar** (`idle_status`, `idle_queue`), pero no
+arrancar ni parar.
+
+> **Errores y protocolo.** Un fallo de una tool llega como **error de tool**
+> (`isError: true`, el flujo no se rompe) con el texto `"<kind>: <mensaje>"`, el
+> mismo par código/mensaje que el envoltorio `error` de la API HTTP, y sin
+> credenciales ni texto de terceros. La **revisión del protocolo no la fija
+> apimail**: se negocia con el SDK anclado (`rmcp 3.5.1`).
 
 ## Despliegue en un contenedor
 

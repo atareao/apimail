@@ -142,9 +142,24 @@ _verify-health:
     exit 1
 
 # ── Calidad ─────────────────────────────────────────────────────
+# Cada job del CI (.github/workflows/ci.yml) ejecuta CUATRO pasos:
+# fmt, clippy, doc y test. `check-all` los encadena TODOS (job `test`) y
+# `check-all-mcp` los encadena con la feature `mcp` (job `test-mcp`).
+# No encadenes el conjunto a mano: ejecutar solo fmt+clippy+test deja el
+# árbol "verde" mientras el CI falla por un warning del rustdoc (enlaces
+# rotos incluidos). `cargo doc` es el único paso que los detecta.
 
-# Ejecuta todos los checks Rust
-check-all: fmt clippy test
+# Ejecuta los CUATRO checks del CI: fmt, clippy, doc y test (job `test`)
+check-all: fmt clippy doc test
+
+# `fmt` no depende de la feature, así que `check-all-mcp` reutiliza la receta `fmt`
+# (sin `fmt-mcp` duplicado); clippy/doc/test sí llevan `--features mcp`.
+
+# Ejecuta los CUATRO checks del CI con la feature MCP (job `test-mcp`)
+check-all-mcp: fmt
+    cargo clippy --features mcp --all-targets -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --features mcp --no-deps
+    cargo test --features mcp --no-fail-fast
 
 # Tests Rust
 test:
@@ -158,9 +173,16 @@ clippy:
 fmt:
     cargo fmt --check
 
+# Documentación (falla con cualquier warning del rustdoc: enlaces rotos incluidos)
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
 # Check que existe un change proposal activo en openspec
+# NOTA: `openspec` 1.13.2 NO tiene `openspec new change` (ese subcomando no existe; `openspec change`
+# solo ofrece `show`, `list` y `validate`). El change se crea a mano: el directorio
+# openspec/changes/<feature>/ con su .openspec.yaml + los artefactos. Plantillas: `openspec templates`.
 check-spec:
-    @ls openspec/changes/*/proposal.md 2>/dev/null || (echo "❌ No active change proposal found. Run: openspec new change <feature>" && exit 1)
+    @ls openspec/changes/*/proposal.md 2>/dev/null || (echo "❌ No hay ningún change proposal activo en openspec/changes/." && echo "   'openspec new change' NO existe en openspec 1.13.2. Crea el directorio a mano:" && echo "     openspec/changes/<feature>/.openspec.yaml   # schema: spec-driven, created: <YYYY-MM-DD>, goal: ..." && echo "     openspec/changes/<feature>/proposal.md      # ver openspec templates (proposal)" && echo "     openspec/changes/<feature>/design.md        # ver openspec templates (design)" && echo "     openspec/changes/<feature>/tasks.md         # ver openspec templates (tasks)" && echo "     openspec/changes/<feature>/specs/<capability>/spec.md" && echo "   Valida con: openspec validate <feature> --strict" && exit 1)
     @echo "✅ Active change proposal found."
 
 # Limpia todo
@@ -176,8 +198,10 @@ help:
     @echo "  just deploy [tag]  - Despliega la imagen de GHCR (por defecto latest)"
     @echo "  just deploy-local  - Construye en local y despliega"
     @echo "  just health        - Consulta el endpoint /api/health"
-    @echo "  just check-all     - Ejecuta todos los checks Rust"
+    @echo "  just check-all     - Ejecuta los CUATRO checks del CI (fmt, clippy, doc, test)"
+    @echo "  just check-all-mcp - Los CUATRO checks del CI con la feature MCP"
     @echo "  just test          - cargo test"
     @echo "  just clippy        - cargo clippy"
     @echo "  just fmt           - cargo fmt --check"
+    @echo "  just doc           - cargo doc con RUSTDOCFLAGS=-D warnings"
     @echo "  just check-spec    - Verifica change proposal activo"

@@ -1,5 +1,63 @@
 # PLAN-002.md — apimail
 
+## ✅ ESTADO DE CIERRE (2026-10-18)
+
+**Este plan está IMPLEMENTADO, ARCHIVADO y FUSIONADO. La release sigue PENDIENTE.**
+
+| Hecho | Evidencia |
+|---|---|
+| Change **archivado** | `openspec/changes/archive/2026-10-18-mcp-server/` — `proposal.md`, `design.md`, `tasks.md` y las specs nuevas `mcp-server`, `mcp-tools` y `mcp-auth` (+ un delta de `http-api`) |
+| **Fusionado en `development`** | merge del **PR #54** (`ae9d751`, `feature/mcp-server` → `development`) |
+| Entregado | feature de Cargo **`mcp` (default OFF)**; capa de servicio `src/service.rs` (2240 líneas); servidor `src/mcp.rs` (883 líneas) con las **17 tools** (12 de lectura + 5 de escritura); transportes **stdio** y **Streamable HTTP** anidado en el `axum` existente; job **`test-mcp`** del CI |
+| Verificado | `cargo test` → **349**; `cargo test --features mcp` → **364**; `clippy`/`fmt`/`doc` en verde en ambos modos |
+| **Release** | ⏳ **PENDIENTE** — **no está en ningún tag** (`git tag --contains ae9d751` no devuelve nada; el tag más reciente es `v0.4.4`): sin publicar en crates.io ni como imagen |
+
+### Qué se desvió del plan (esto es lo valioso)
+
+1. **Faltaba la feature `server` de `rmcp`.** El plan enumeraba `transport-io`,
+   `transport-streamable-http-server`, `macros` y `schemars`, pero **no** `server`. En `rmcp 3.5.1`
+   `#[cfg(feature = "server")]` **gatea** el módulo `transport`, los re-exports `ServerHandler` y
+   `ServiceExt` y los de las macros: **sin ella el servidor MCP ni se puede nombrar**. Verificado con
+   un crate sonda (sin `server`: `unresolved imports` / `cannot find transport in rmcp`); con
+   `server`, compila y monta el transporte en `axum`. **Es obligatoria, no un extra.**
+2. **El transporte HTTP reutiliza la auth en vez de OAuth.** El plan pedía **OAuth 2.1** (PKCE + DCR,
+   flujo completo de `rmcp`) con la API key como camino degradado. Se entregó **solo la API key**
+   (`Authorization: Bearer`) aplicada por el middleware existente, y **no** se activa la feature
+   `auth` de `rmcp` (arrastraría un segundo `oauth2`/`reqwest`). ChatGPT queda fuera; es trabajo
+   posterior. Resultado: **una sola frontera de auth**.
+3. **La justificación del `base64` resultó falsa.** El argumento escrito para `default-features =
+   false` era «el `default` de `rmcp` arrastra `base64 ^0.23` mientras el proyecto usa `base64 0.22`
+   ⇒ dos `base64` en el árbol». **Medido, es inválido**: `base64 0.23.1` **ya estaba** en el árbol
+   (vía `hyper-util`/`axum`) y `transport-streamable-http-server` → `server-side-http` **activa
+   explícitamente** la feature `base64` de `rmcp`, así que el par `0.22.1 + 0.23.1` es **idéntico con
+   y sin la feature** (`cargo tree -d` en ambos modos). La decisión se mantuvo por otros motivos
+   (higiene de la feature `auth`), pero **el motivo escrito era falso y quedó retirado** en el
+   `design.md` del change.
+4. **La revisión del protocolo no es la que se iba a implementar.** El plan fijaba **`2026-07-28`**.
+   Medido, el servidor **negocia `2025-11-25`**: en `rmcp 3.5.1` esa revisión
+   (`ProtocolVersion::V_2026_07_28`) es a la vez `LATEST` y `NO_INITIALIZE` — SEP-2567 trasladó el
+   ciclo de vida a `_meta` por petición —, así que a esa revisión **no queda handshake que negociar**
+   y el servidor cae a `LATEST_WITH_INITIALIZE` (`V_2025_11_25`). Lo fijan dos tests de
+   `tests/mcp_server.rs` (`tool_cycle_runs_in_process_over_a_pipe` y
+   `binary_keeps_stdout_protocol_only`) contra la constante `NEGOTIATED_VERSION`: se asevera **lo que
+   el SDK hace**, no lo que el cliente pide.
+5. **Apareció un refactor que el plan no preveía**: extraer una **capa de servicio**
+   (`src/service.rs`) para que los handlers HTTP y las tools MCP compartan DTOs y `ServiceError`.
+   Sin él, las tools habrían duplicado la lógica de la API.
+
+**Preguntas abiertas de §9 — resueltas:** MCP es **opt-in** (feature de Cargo, default OFF); entran
+**17 tools** (12 de lectura + 5 de escritura) y **no** `resources`/`prompts`; la API key **convive**
+sin OAuth; el endpoint por defecto es **`/mcp`** (`APIMAIL_MCP_PATH`), anidado en el mismo listener;
+las operaciones administrativas/destructivas no se exponen.
+
+**Pendiente de verdad:** la **release** (tag + crates.io + imagen) — §8 paso 6 / tasks 10.4 — y la
+verificación con un **cliente MCP real** (§8 paso 5 / tasks 10.1, sin marcar).
+
+---
+
+> A partir de aquí, el plan **tal como se escribió**: registro histórico, no estado. Léelo con el
+> cierre de arriba delante.
+
 Trabajo planificado a partir de **`v0.3.0`** (+ `container-image`), ítem **#8 `mcp-server`** de
 `plans/PLAN-001.md` §2.
 
