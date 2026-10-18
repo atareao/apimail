@@ -15,13 +15,16 @@
 //! routes, the request DTOs (query and body), the `StatusCode` and the shared
 //! `{"error":…,"message":…}` envelope. Handlers there are thin wrappers over the
 //! operations of this module **as they migrate**, one operation at a time: today
-//! `whoami`, `account`, `imap_status`, `list_mailboxes`, both IDLE reads
-//! (`idle_status`, `idle_queue`), the five message reads (`list_messages`,
-//! `fetch_message`, `message_body`, `list_attachments`, `attachment`) and the
-//! first **write** operation, `send_message` — which brought its request DTO
-//! ([`SendMessageDto`]) with it, because decoding and validating an outgoing
-//! message is domain work, not HTTP work; the rest still hold their own logic and
-//! their own per-route error type in [`crate::http`].
+//! `whoami`, `account`, `imap_status`, `list_mailboxes`, the mailbox selection
+//! (`select_mailbox`), all four IDLE routes (`idle_status`, `idle_queue`,
+//! `idle_start`, `idle_stop`), the five message reads (`list_messages`,
+//! `fetch_message`, `message_body`, `list_attachments`, `attachment`), three of
+//! the four message mutations (`update_flags`, `move_message`, `copy_message`)
+//! and the first **write** operation, `send_message` — which brought its request
+//! DTO ([`SendMessageDto`]) with it, because decoding and validating an outgoing
+//! message is domain work, not HTTP work. Only `DELETE /api/messages/{uid}`
+//! (`delete_message`) still holds its own logic and its own per-route error type
+//! in [`crate::http`].
 //!
 //! # Published HTTP error table
 //!
@@ -41,7 +44,11 @@
 //! `payload_too_large` now have their **domain** producer
 //! ([`ServiceError::InvalidRequest`] and [`ServiceError::PayloadTooLarge`]) next
 //! to the transport's own, and `smtp_error` its only one
-//! ([`ServiceError::SmtpFailure`]).
+//! ([`ServiceError::SmtpFailure`]). The migration of the mutation routes adds a
+//! **second domain producer** of `invalid_request` —
+//! [`ServiceError::InvalidFlags`], the `STORE` query a flag update cannot be
+//! rendered as — next to the send operation's, and the IDLE control routes give
+//! `idle_not_configured` its only producer, [`ServiceError::IdleNotConfigured`].
 //!
 //! | HTTP | `error`                    | Owner               |
 //! |------|----------------------------|---------------------|
@@ -92,7 +99,10 @@
 //! [`ServiceError`] gained its [`InvalidRequest`](ServiceError::InvalidRequest)
 //! variant with the first operation that needed it — sending a message, whose
 //! validation (a recipient, a mailbox address, the total decoded attachment size)
-//! is a domain rule, not a dialect of HTTP.
+//! is a domain rule, not a dialect of HTTP. A second **domain** producer of the
+//! same code joined it with the mutation routes:
+//! [`InvalidFlags`](ServiceError::InvalidFlags), the refusal of a flag update
+//! that cannot be rendered as a `STORE` query.
 //!
 //! This is a conscious deviation from the audit's recommendation that the
 //! service only ever receive *already validated* types and that
@@ -124,12 +134,13 @@ use subtle::ConstantTimeEq;
 use crate::Config;
 use crate::config::TlsMode;
 use crate::idle::{
-    HttpWebhookSender, IdleConnector, IdleSettings, IdleStatus, IdleSupervisor, TokioIdleConnector,
-    WebhookSender,
+    HttpWebhookSender, IdleConnector, IdleError, IdleSettings, IdleStatus, IdleSupervisor,
+    TokioIdleConnector, WebhookSender,
 };
 use crate::imap::{
     Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
-    Message, MessageEnvelope, ParsedMessageError, SearchCriteria, TokioImapConnector,
+    MailboxStatus, Message, MessageEnvelope, ParsedMessageError, SearchCriteria, SystemFlag,
+    TokioImapConnector,
 };
 use crate::mime::ParsedAttachment;
 use crate::queue::{NotificationQueue, QueueError, QueueStats, WebhookQueue};
@@ -524,6 +535,43 @@ pub struct MailboxListResponse {
     pub mailboxes: Vec<MailboxDto>,
 }
 
+/// JSON payload returned by a successful `POST /api/mailboxes/select`.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct MailboxStatusResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Number of messages (`EXISTS`).
+    pub exists: u32,
+    /// Messages with the `\Recent` flag (`RECENT`).
+    pub recent: u32,
+    /// First unseen message (`UNSEEN`), if reported.
+    pub unseen: Option<u32>,
+    /// UID validity (`UIDVALIDITY`), if reported.
+    pub uid_validity: Option<u32>,
+    /// Next UID (`UIDNEXT`), if reported.
+    pub uid_next: Option<u32>,
+    /// Defined message flags in IMAP style (`\Seen`, …).
+    pub flags: Vec<String>,
+}
+
+impl MailboxStatusResponse {
+    /// Builds the response from the selected mailbox's name and status.
+    fn new(mailbox: String, status: MailboxStatus) -> Self {
+        Self {
+            mailbox,
+            exists: status.exists,
+            recent: status.recent,
+            unseen: status.unseen,
+            uid_validity: status.uid_validity,
+            uid_next: status.uid_next,
+            flags: status.flags,
+        }
+    }
+}
+
 /// One address in a message envelope.
 ///
 /// The field order is the declaration order, which is the serialisation order of
@@ -789,6 +837,39 @@ pub struct AttachmentResponse {
     pub content_base64: String,
 }
 
+/// JSON payload returned by a successful `PATCH /api/messages/{uid}/flags`.
+///
+/// The type moved here with its operation, so the output schema of the operation
+/// is owned by the layer that produces it. The field order is the declaration
+/// order, which is the serialisation order of the published body, so it is part
+/// of the contract.
+#[derive(Debug, Serialize)]
+pub struct FlagUpdateResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// Resulting flags in IMAP style (`\Seen`, …).
+    pub flags: Vec<String>,
+}
+
+/// JSON payload returned by a successful move or copy.
+///
+/// The type moved here with its operations, so the output schema is owned by the
+/// layer that produces it. The field order is the declaration order, which is the
+/// serialisation order of the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct MoveCopyResponse {
+    /// Selected (source) mailbox name.
+    pub mailbox: String,
+    /// Unique identifier within the source mailbox.
+    pub uid: u32,
+    /// Destination mailbox name.
+    pub to: String,
+    /// `moved` for a move, `copied` for a copy.
+    pub status: &'static str,
+}
+
 /// JSON payload returned by a successful send.
 #[derive(Debug, Serialize)]
 pub struct SentResponse {
@@ -921,9 +1002,16 @@ impl SendMessageDto {
 /// operation needs, and the send operation adds its three: the *domain*
 /// [`invalid_request`](Self::InvalidRequest) and
 /// [`payload_too_large`](Self::PayloadTooLarge) and the
-/// [`smtp_error`](Self::SmtpFailure) of a rejected delivery. The remaining rows of
-/// the module's error table are added, one operation at a time, as their handlers
-/// migrate.
+/// [`smtp_error`](Self::SmtpFailure) of a rejected delivery. The mutation routes
+/// and the IDLE control routes add two more: the **[`invalid_request`]** a flag
+/// update cannot be rendered as ([`InvalidFlags`](Self::InvalidFlags)) and the
+/// **[`idle_not_configured`]** of a `start` with no configured webhook
+/// ([`IdleNotConfigured`](Self::IdleNotConfigured)). The remaining row of the
+/// module's error table is added, one operation at a time, as its handler
+/// migrates.
+///
+/// [`invalid_request`]: Self::InvalidRequest
+/// [`idle_not_configured`]: Self::IdleNotConfigured
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ServiceError {
@@ -1058,6 +1146,23 @@ pub enum ServiceError {
         #[source]
         source: SmtpError,
     },
+    /// The flag update cannot be rendered as a `STORE` query (`400`,
+    /// `invalid_request`).
+    ///
+    /// `invalid_request` has a second **domain** producer besides the send
+    /// operation's, and this is it. The routes that validate their update first
+    /// cannot trigger it, but the mapping stays explicit so the failure can never
+    /// be flattened into an availability failure (`503`).
+    #[error("invalid flags")]
+    InvalidFlags {
+        /// The session refusal this response describes.
+        #[source]
+        source: ImapError,
+    },
+    /// `idle_start` was asked for without a configured webhook URL (`501`,
+    /// `idle_not_configured`).
+    #[error("idle notifications are not configured")]
+    IdleNotConfigured,
 }
 
 impl ServiceError {
@@ -1105,10 +1210,16 @@ impl ServiceError {
     /// The two missing-object outcomes stay distinct — a missing mailbox is not a
     /// missing message —, a missing server extension keeps its own `501`, and
     /// everything else is an availability failure.
+    ///
+    /// A refusal to render the update as a `STORE` query keeps its own `400`
+    /// (`invalid_request`) instead of falling through to the availability
+    /// failure: the routes that validate their update first cannot trigger it, but
+    /// the code it used to produce as a transport must never change.
     fn message_failure(source: ImapError) -> Self {
         match source {
             ImapError::MailboxNotFound => Self::MailboxNotFound,
             ImapError::MessageNotFound => Self::MessageNotFound,
+            ImapError::InvalidFlags => Self::invalid_flags(source),
             ImapError::CapabilityNotSupported => Self::capability_not_supported(source),
             other => Self::imap_unavailable(other),
         }
@@ -1164,6 +1275,27 @@ impl ServiceError {
         }
     }
 
+    /// Builds the `invalid_request` failure of a flag update that cannot be
+    /// rendered as a `STORE` query.
+    ///
+    /// The cause is kept as the [`source`](std::error::Error::source) for logs
+    /// only; the public message is the fixed, credential-free `"invalid flags"`
+    /// of this module's own vocabulary.
+    pub(crate) fn invalid_flags(source: ImapError) -> Self {
+        Self::InvalidFlags { source }
+    }
+
+    /// Maps the failure surface of the IDLE supervisor's `start`.
+    ///
+    /// The match is exhaustive and explicit (no wildcard arm): adding an
+    /// [`IdleError`] variant is a compile error until its code is chosen, so a new
+    /// failure mode can never be silently flattened into the wrong one.
+    fn idle_failure(source: IdleError) -> Self {
+        match source {
+            IdleError::NotConfigured => Self::IdleNotConfigured,
+        }
+    }
+
     /// Stable, machine-filterable `error` code of the shared envelope.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -1177,6 +1309,8 @@ impl ServiceError {
             Self::InvalidRequest { .. } => "invalid_request",
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::SmtpFailure { .. } => "smtp_error",
+            Self::InvalidFlags { .. } => "invalid_request",
+            Self::IdleNotConfigured => "idle_not_configured",
         }
     }
 
@@ -1205,6 +1339,8 @@ impl ServiceError {
             Self::InvalidRequest { message, .. } => message,
             Self::PayloadTooLarge { message, .. } => message,
             Self::SmtpFailure { message, .. } => message,
+            Self::InvalidFlags { .. } => "invalid flags",
+            Self::IdleNotConfigured => "idle notifications are not configured",
         }
     }
 }
@@ -1280,6 +1416,37 @@ pub async fn list_mailboxes(state: &AppState) -> Result<MailboxListResponse, Ser
     })
 }
 
+/// Selects `mailbox` and reports its status.
+///
+/// The operation composes a single `SELECT` on the shared session, so the
+/// selected mailbox stays active for the operations that follow.
+///
+/// This is the mapping every `SELECT`-driven operation uses: a missing mailbox is
+/// a domain `404`, a server that does not announce the extension is a `501`, and
+/// every other failure of the underlying session is an availability failure
+/// flattened into one code.
+///
+/// # Errors
+///
+/// - [`ServiceError::MailboxNotFound`] (`404`) when the server answers `NO` for
+///   the mailbox.
+/// - [`ServiceError::CapabilityNotSupported`] (`501`) if the session reports a
+///   missing extension.
+/// - [`ServiceError::ImapUnavailable`] (`503`) otherwise, carrying the
+///   credential-free [`ImapError::public_message`] of the underlying failure and
+///   the failure itself as its `source`.
+pub async fn select_mailbox(
+    state: &AppState,
+    mailbox: String,
+) -> Result<MailboxStatusResponse, ServiceError> {
+    let status = state
+        .imap
+        .select_mailbox(&mailbox)
+        .await
+        .map_err(ServiceError::select_failure)?;
+    Ok(MailboxStatusResponse::new(mailbox, status))
+}
+
 /// Reports the state of the IDLE subscription.
 ///
 /// Infallible: the supervisor's snapshot is a plain read of its own task handles,
@@ -1298,6 +1465,33 @@ pub async fn idle_status(state: &AppState) -> IdleStatus {
 /// returned verbatim.
 pub fn idle_queue(state: &AppState) -> QueueStats {
     state.idle().queue().stats()
+}
+
+/// Starts the IDLE subscription.
+///
+/// Idempotent and safe against concurrent calls: starting an already-running
+/// subscription returns its current status without opening a second connection,
+/// and the dedicated connection and the webhook are the supervisor's business, not
+/// the caller's.
+///
+/// # Errors
+///
+/// [`ServiceError::IdleNotConfigured`] (`501`) when no `APIMAIL_WEBHOOK_URL` is
+/// configured. **Nothing is started and no connection is opened.**
+pub async fn idle_start(state: &AppState) -> Result<IdleStatus, ServiceError> {
+    state
+        .idle()
+        .start()
+        .await
+        .map_err(ServiceError::idle_failure)
+}
+
+/// Stops the IDLE subscription.
+///
+/// Infallible: stopping a subscription that is not running is a no-op, and the
+/// supervisor always answers with its resulting status.
+pub async fn idle_stop(state: &AppState) -> IdleStatus {
+    state.idle().stop().await
 }
 
 /// Lists one page of the messages of `mailbox` matching `criteria`.
@@ -1467,6 +1661,108 @@ pub async fn attachment(
         content_type: attachment.content_type.clone(),
         size: attachment.size,
         content_base64: STANDARD.encode(&attachment.content),
+    })
+}
+
+/// Applies `add`/`remove` flags to the single message `uid` of `mailbox` and
+/// reports the resulting flags.
+///
+/// The operation expects **already validated** flags: each one a known system
+/// flag, canonical and deduplicated, with no flag in both lists. That shape is
+/// the transport's business — it is the dialect of the request — while what
+/// happens here is the domain work: `SELECT`, the existence check, the `STORE`
+/// and the read-back of the flags on a single live session.
+///
+/// # Errors
+///
+/// - [`ServiceError::MailboxNotFound`] (`404`) when the server answers `NO` for
+///   the mailbox.
+/// - [`ServiceError::MessageNotFound`] (`404`) when the mailbox holds no message
+///   with that `uid`; **nothing is stored.**
+/// - [`ServiceError::InvalidFlags`] (`400`) when the update cannot be rendered as
+///   a `STORE` query.
+/// - [`ServiceError::CapabilityNotSupported`] (`501`) if the session reports a
+///   missing extension.
+/// - [`ServiceError::ImapUnavailable`] (`503`) for every other session failure.
+pub async fn update_flags(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+    add: Vec<SystemFlag>,
+    remove: Vec<SystemFlag>,
+) -> Result<FlagUpdateResponse, ServiceError> {
+    let flags = state
+        .imap
+        .update_flags(&mailbox, uid, add, remove)
+        .await
+        .map_err(ServiceError::message_failure)?;
+    Ok(FlagUpdateResponse {
+        mailbox,
+        uid,
+        flags,
+    })
+}
+
+/// Moves the single message `uid` of `mailbox` to `to`.
+///
+/// `to` is expected to be already validated as a non-blank destination mailbox;
+/// what happens here is the domain work: `UID MOVE` when the server announces it,
+/// the `COPY` + `STORE` + `EXPUNGE` emulation when it announces `UIDPLUS`, and a
+/// `501` when it announces neither.
+///
+/// # Errors
+///
+/// - [`ServiceError::MailboxNotFound`] (`404`) when the server answers `NO` for
+///   the source mailbox.
+/// - [`ServiceError::MessageNotFound`] (`404`) when the mailbox holds no message
+///   with that `uid`; **nothing is moved.**
+/// - [`ServiceError::CapabilityNotSupported`] (`501`) when the server announces
+///   neither `MOVE` nor `UIDPLUS`; **no command is sent.**
+/// - [`ServiceError::ImapUnavailable`] (`503`) for every other session failure.
+pub async fn move_message(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+    to: String,
+) -> Result<MoveCopyResponse, ServiceError> {
+    state
+        .imap
+        .move_message(&mailbox, uid, &to)
+        .await
+        .map_err(ServiceError::message_failure)?;
+    Ok(MoveCopyResponse {
+        mailbox,
+        uid,
+        to,
+        status: "moved",
+    })
+}
+
+/// Copies the single message `uid` of `mailbox` to `to`.
+///
+/// `to` is expected to be already validated as a non-blank destination mailbox;
+/// `UID COPY` is part of IMAP4rev1, so no capability is required.
+///
+/// # Errors
+///
+/// Same failure surface as [`move_message`], without the `501`: the two `404`s and
+/// the `503` availability failure.
+pub async fn copy_message(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+    to: String,
+) -> Result<MoveCopyResponse, ServiceError> {
+    state
+        .imap
+        .copy_message(&mailbox, uid, &to)
+        .await
+        .map_err(ServiceError::message_failure)?;
+    Ok(MoveCopyResponse {
+        mailbox,
+        uid,
+        to,
+        status: "copied",
     })
 }
 

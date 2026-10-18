@@ -372,6 +372,17 @@ async fn body_json(response: Response) -> Value {
     serde_json::from_slice(&bytes).expect("valid JSON body")
 }
 
+/// Asserts a JSON body carries exactly `expected` as its field names (sorted).
+///
+/// The shape of a body is part of the contract, so the migration of an operation
+/// into the service layer may not add, rename or drop a field.
+fn assert_body_keys(json: &Value, expected: &[&str], what: &str) {
+    let object = json.as_object().expect("the body must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, expected, "unexpected fields in {what}: {json}");
+}
+
 // ---------------------------------------------------------------------------
 // PATCH /api/messages/{uid}/flags
 // ---------------------------------------------------------------------------
@@ -406,6 +417,7 @@ async fn adding_flags_sends_a_store_and_returns_the_resulting_flags() {
     assert_eq!(json["uid"], 42);
     assert_eq!(json["flags"][0], "\\Seen");
     assert_eq!(json["flags"][1], "\\Flagged");
+    assert_body_keys(&json, &["flags", "mailbox", "uid"], "the flags body");
 
     assert_eq!(
         selected.lock().expect("selected log poisoned").as_slice(),
@@ -692,6 +704,7 @@ async fn moving_with_move_support_sends_uid_move() {
     assert_eq!(json["uid"], 42);
     assert_eq!(json["to"], "Archive");
     assert_eq!(json["status"], "moved");
+    assert_body_keys(&json, &["mailbox", "status", "to", "uid"], "the move body");
     assert_eq!(
         ops.lock().expect("ops log poisoned").as_slice(),
         ["move 42 Archive"]
@@ -830,6 +843,10 @@ async fn copying_sends_uid_copy() {
     let connector =
         FakeConnector::new(ConnectOutcome::Session).with_messages(vec![message(42, &["\\Seen"])]);
     let copies = Arc::clone(&connector.copies);
+    let ops = Arc::clone(&connector.ops);
+    let stores = Arc::clone(&connector.stores);
+    let moves = Arc::clone(&connector.moves);
+    let expunges = Arc::clone(&connector.expunges);
     let app = app_with(connector);
 
     let response = call(
@@ -847,9 +864,27 @@ async fn copying_sends_uid_copy() {
     assert_eq!(json["uid"], 42);
     assert_eq!(json["to"], "Archive");
     assert_eq!(json["status"], "copied");
+    assert_body_keys(&json, &["mailbox", "status", "to", "uid"], "the copy body");
     assert_eq!(
         copies.lock().expect("copies log poisoned").as_slice(),
         [(42, "Archive".to_string())]
+    );
+    assert_eq!(
+        ops.lock().expect("ops log poisoned").as_slice(),
+        ["copy 42 Archive"],
+        "a copy is a single UID COPY and nothing else"
+    );
+    assert!(
+        moves.lock().expect("moves log poisoned").is_empty(),
+        "no UID MOVE must be sent"
+    );
+    assert!(
+        stores.lock().expect("stores log poisoned").is_empty(),
+        "no STORE command must be sent"
+    );
+    assert!(
+        expunges.lock().expect("expunges log poisoned").is_empty(),
+        "no EXPUNGE (global or targeted) must be sent"
     );
 }
 
@@ -1142,6 +1177,131 @@ async fn a_malformed_json_body_is_400_without_connecting() {
 }
 
 // ---------------------------------------------------------------------------
+// Error bodies: the exact `error`/`message` pair is part of the contract
+// ---------------------------------------------------------------------------
+
+/// Pins the exact 404 of a missing **message** on all three routes: the code and
+/// the message are both published, so the migration into the service layer must
+/// not drift either of them.
+#[tokio::test]
+async fn a_missing_message_is_404_with_the_documented_message() {
+    for (method, uri, body) in [
+        (
+            Method::PATCH,
+            "/api/messages/42/flags?mailbox=INBOX",
+            Some(json!({"add": ["\\Seen"]})),
+        ),
+        (
+            Method::POST,
+            "/api/messages/42/move?mailbox=INBOX",
+            Some(json!({"to": "Archive"})),
+        ),
+        (
+            Method::POST,
+            "/api/messages/42/copy?mailbox=INBOX",
+            Some(json!({"to": "Archive"})),
+        ),
+    ] {
+        let connector =
+            FakeConnector::new(ConnectOutcome::Session).with_capabilities(Capabilities {
+                has_move: true,
+                has_uidplus: false,
+            });
+        let app = app_with(connector);
+        let response = call(
+            app,
+            method.clone(),
+            uri,
+            body.map(|value| value.to_string()),
+            Some(&bearer()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        let json = body_json(response).await;
+        assert_eq!(json["error"], "message_not_found", "{method} {uri}");
+        assert_eq!(json["message"], "message not found", "{method} {uri}");
+        assert_body_keys(&json, &["error", "message"], "the message 404 body");
+    }
+}
+
+/// Pins the exact 404 of a missing **mailbox** on all three routes.
+#[tokio::test]
+async fn a_missing_mailbox_is_404_with_the_documented_message() {
+    for (method, uri, body) in [
+        (
+            Method::PATCH,
+            "/api/messages/42/flags?mailbox=Missing",
+            Some(json!({"add": ["\\Seen"]})),
+        ),
+        (
+            Method::POST,
+            "/api/messages/42/move?mailbox=Missing",
+            Some(json!({"to": "Archive"})),
+        ),
+        (
+            Method::POST,
+            "/api/messages/42/copy?mailbox=Missing",
+            Some(json!({"to": "Archive"})),
+        ),
+    ] {
+        let app = app_with(
+            FakeConnector::new(ConnectOutcome::Session)
+                .with_select(SelectOutcome::NotFound)
+                .with_capabilities(Capabilities {
+                    has_move: true,
+                    has_uidplus: true,
+                }),
+        );
+        let response = call(
+            app,
+            method.clone(),
+            uri,
+            body.map(|value| value.to_string()),
+            Some(&bearer()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        let json = body_json(response).await;
+        assert_eq!(json["error"], "mailbox_not_found", "{method} {uri}");
+        assert_eq!(json["message"], "mailbox not found", "{method} {uri}");
+    }
+}
+
+/// Pins the exact 501 of a server that announces neither `MOVE` nor `UIDPLUS`:
+/// the code, the message and the invariant that no command is sent.
+#[tokio::test]
+async fn a_missing_capability_is_501_with_the_documented_message() {
+    let connector =
+        FakeConnector::new(ConnectOutcome::Session).with_messages(vec![message(42, &["\\Seen"])]);
+    let ops = Arc::clone(&connector.ops);
+    let app = app_with(connector);
+
+    let response = call(
+        app,
+        Method::POST,
+        "/api/messages/42/move?mailbox=INBOX",
+        Some(json!({"to": "Archive"}).to_string()),
+        Some(&bearer()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "capability_not_supported");
+    assert_eq!(
+        json["message"], "the server does not support this operation",
+        "the 501 message is the fixed one of the missing extension"
+    );
+    assert_body_keys(&json, &["error", "message"], "the 501 body");
+    assert!(
+        ops.lock().expect("ops log poisoned").is_empty(),
+        "a 501 must not send a single command"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Unavailability and authentication
 // ---------------------------------------------------------------------------
 
@@ -1180,7 +1340,13 @@ async fn an_unreachable_server_is_503_for_every_operation() {
             StatusCode::SERVICE_UNAVAILABLE,
             "{method} {uri}"
         );
-        assert_eq!(body_json(response).await["error"], "imap_unavailable");
+        let json = body_json(response).await;
+        assert_eq!(json["error"], "imap_unavailable", "{method} {uri}");
+        assert_eq!(
+            json["message"], "could not connect to the IMAP server",
+            "the 503 carries the stable, credential-free family message"
+        );
+        assert_body_keys(&json, &["error", "message"], "the 503 body");
     }
 }
 

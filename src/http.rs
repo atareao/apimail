@@ -327,8 +327,8 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::idle::{IdleError, IdleStatus};
-use crate::imap::{FetchFormat, ImapError, MailboxStatus, SearchCriteria, SearchDate, SystemFlag};
+use crate::idle::IdleStatus;
+use crate::imap::{FetchFormat, ImapError, SearchCriteria, SearchDate, SystemFlag};
 use crate::queue::QueueStats;
 
 // The application state and its construction error belong to the service layer
@@ -371,79 +371,45 @@ struct SelectMailboxDto {
     mailbox: String,
 }
 
-/// JSON payload returned by a successful `POST /api/mailboxes/select`.
-#[derive(Debug, Serialize)]
-struct MailboxStatusResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Number of messages (`EXISTS`).
-    exists: u32,
-    /// Messages with the `\Recent` flag (`RECENT`).
-    recent: u32,
-    /// First unseen message (`UNSEEN`), if reported.
-    unseen: Option<u32>,
-    /// UID validity (`UIDVALIDITY`), if reported.
-    uid_validity: Option<u32>,
-    /// Next UID (`UIDNEXT`), if reported.
-    uid_next: Option<u32>,
-    /// Defined message flags in IMAP style (`\Seen`, …).
-    flags: Vec<String>,
-}
-
-impl MailboxStatusResponse {
-    /// Builds the response from the selected mailbox status.
-    fn new(mailbox: String, status: MailboxStatus) -> Self {
-        Self {
-            mailbox,
-            exists: status.exists,
-            recent: status.recent,
-            unseen: status.unseen,
-            uid_validity: status.uid_validity,
-            uid_next: status.uid_next,
-            flags: status.flags,
-        }
-    }
-}
-
-/// Failure modes of the mailbox routes, mapped to the documented statuses.
+/// Failure modes of `POST /api/mailboxes/select`, mapped to the documented
+/// statuses.
+///
+/// The transport owns one of them — the `400` of a request that does not speak
+/// HTTP's dialect (a malformed JSON body, a blank `mailbox`) — plus the wrapper
+/// ([`Domain`](Self::Domain)) around a [`ServiceError`] of the migrated
+/// operation, which is rendered by the shared `IntoResponse` implementation of
+/// the service layer instead of a second envelope built here.
+///
+/// The `404`/`501`/`503` of the route are the service's and travel here as a
+/// [`Domain`](Self::Domain) value: the transport never decides their status, nor
+/// rewrites their message.
 #[derive(Debug)]
-enum MailboxError {
-    /// The request payload is malformed or misses a non-empty `mailbox`
+enum SelectMailboxError {
+    /// The body is not a decodable `SelectMailboxDto`, or its `mailbox` is blank
     /// (`400`).
     InvalidRequest(String),
-    /// The server answered `NO`: the mailbox does not exist (`404`).
-    NotFound,
-    /// The IMAP session or server is unavailable (`503`).
-    Unavailable(String),
+    /// A domain failure of the operation, rendered by the service layer.
+    Domain(ServiceError),
 }
 
-impl IntoResponse for MailboxError {
+impl IntoResponse for SelectMailboxError {
     fn into_response(self) -> Response {
         let (status, error, message) = match self {
             Self::InvalidRequest(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
-            Self::NotFound => (
-                StatusCode::NOT_FOUND,
-                "mailbox_not_found",
-                "mailbox not found".to_string(),
-            ),
-            Self::Unavailable(message) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "imap_unavailable", message)
-            }
+            // One single rendering of a domain failure: the shared envelope of the
+            // service layer, never a second copy of it.
+            Self::Domain(error) => return error.into_response(),
         };
         (status, Json(ErrorResponse { error, message })).into_response()
     }
 }
 
-/// Maps an [`ImapError`] to the mailbox routes' failure model.
-///
-/// A missing mailbox becomes `404`; every other failure becomes `503` carrying
-/// the stable, credential-free [`ImapError::public_message`].
-impl From<ImapError> for MailboxError {
-    fn from(error: ImapError) -> Self {
-        match error {
-            ImapError::MailboxNotFound => Self::NotFound,
-            other => Self::Unavailable(other.public_message().to_string()),
-        }
+/// Maps a [`ServiceError`] into the select route's failure model: the domain
+/// failure travels untouched and is rendered by the service layer, so the thin
+/// handler only has to propagate it with `?`.
+impl From<ServiceError> for SelectMailboxError {
+    fn from(error: ServiceError) -> Self {
+        Self::Domain(error)
     }
 }
 
@@ -763,30 +729,6 @@ fn parse_destination(value: String) -> Result<String, MessageError> {
     Ok(trimmed.to_string())
 }
 
-/// JSON payload returned by a successful `PATCH /api/messages/{uid}/flags`.
-#[derive(Debug, Serialize)]
-struct FlagUpdateResponse {
-    /// Selected mailbox name.
-    mailbox: String,
-    /// Unique identifier within the mailbox.
-    uid: u32,
-    /// Resulting flags in IMAP style (`\Seen`, …).
-    flags: Vec<String>,
-}
-
-/// JSON payload returned by a successful move or copy.
-#[derive(Debug, Serialize)]
-struct MoveCopyResponse {
-    /// Selected (source) mailbox name.
-    mailbox: String,
-    /// Unique identifier within the source mailbox.
-    uid: u32,
-    /// Destination mailbox name.
-    to: String,
-    /// `moved` for a move, `copied` for a copy.
-    status: &'static str,
-}
-
 /// JSON payload returned by a successful `DELETE /api/messages/{uid}`.
 #[derive(Debug, Serialize)]
 struct DeleteResponse {
@@ -820,9 +762,8 @@ where
 ///
 /// The domain variants still carried here — `mailbox_not_found`,
 /// `message_not_found`, `capability_not_supported` and `imap_unavailable` — belong
-/// to the **mutation** routes (`PATCH …/flags`, `POST …/move`, `POST …/copy`,
-/// `DELETE /api/messages/{uid}`), which have not migrated yet; they disappear with
-/// their last producer.
+/// to `DELETE /api/messages/{uid}`, the **only** mutation route that has not
+/// migrated yet; they disappear with its last producer.
 #[derive(Debug)]
 enum MessageError {
     /// The request is malformed (`400`).
@@ -981,6 +922,10 @@ fn status_for(error: &ServiceError) -> StatusCode {
         ServiceError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
         ServiceError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         ServiceError::SmtpFailure { .. } => StatusCode::BAD_GATEWAY,
+        // A `STORE` that cannot be rendered is the second domain producer of
+        // `invalid_request`, next to the send operation's.
+        ServiceError::InvalidFlags { .. } => StatusCode::BAD_REQUEST,
+        ServiceError::IdleNotConfigured => StatusCode::NOT_IMPLEMENTED,
     }
 }
 
@@ -1091,31 +1036,33 @@ async fn list_mailboxes(
     Ok(Json(service::list_mailboxes(&state).await?))
 }
 
-/// `POST /api/mailboxes/select` handler: selects a mailbox, reporting its
+/// `POST /api/mailboxes/select` handler: thin wrapper over
+/// [`crate::service::select_mailbox`], which selects a mailbox and reports its
 /// status.
 ///
 /// The body is read as raw bytes and parsed here so a malformed payload gets
 /// the shared JSON error envelope (`400 invalid_request`) instead of axum's
 /// plain-text rejection. A missing or blank (`trim`-empty) `mailbox` is also
-/// rejected with a `400`.
+/// rejected with a `400`. The `404` of a missing mailbox and the `503` of an
+/// unavailable session are the service's and are rendered by its shared
+/// `IntoResponse` implementation.
 async fn select_mailbox(
     State(state): State<AppState>,
     body: Bytes,
-) -> Result<Response, MailboxError> {
+) -> Result<Response, SelectMailboxError> {
     // A fixed message: the serde error could echo part of the attacker-supplied
     // payload, so it must not be reflected back to the client.
     let dto: SelectMailboxDto = serde_json::from_slice(&body)
-        .map_err(|_| MailboxError::InvalidRequest("invalid JSON body".to_string()))?;
+        .map_err(|_| SelectMailboxError::InvalidRequest("invalid JSON body".to_string()))?;
 
     let mailbox = dto.mailbox.trim();
     if mailbox.is_empty() {
-        return Err(MailboxError::InvalidRequest(
+        return Err(SelectMailboxError::InvalidRequest(
             "`mailbox` must not be empty".to_string(),
         ));
     }
 
-    let status = state.imap.select_mailbox(mailbox).await?;
-    let response = MailboxStatusResponse::new(mailbox.to_string(), status);
+    let response = service::select_mailbox(&state, mailbox.to_string()).await?;
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
@@ -1209,14 +1156,16 @@ async fn get_attachment(
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `PATCH /api/messages/{uid}/flags` handler: applies flag additions/removals to
-/// a single message and returns its resulting flags.
+/// `PATCH /api/messages/{uid}/flags` handler: thin wrapper over
+/// [`crate::service::update_flags`].
 ///
 /// The `uid` path parameter and the `mailbox` query parameter are validated
 /// first (shared JSON `400` envelope). The body is read as raw bytes and parsed
 /// here so a malformed payload or an unknown flag is a `400` rather than axum's
 /// plain-text rejection; validation rejects an empty or contradictory update
-/// **before** any IMAP command is sent.
+/// **before** any IMAP command is sent. The domain outcomes — the two `404`s, the
+/// `400 invalid_request` of a `STORE` that cannot be rendered and the `503` — are
+/// the service's and are rendered by its shared `IntoResponse` implementation.
 async fn update_flags(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1232,20 +1181,17 @@ async fn update_flags(
         .map_err(|_| MessageError::InvalidRequest("invalid JSON body".to_string()))?;
     let (add, remove) = dto.into_flags()?;
 
-    let flags = state.imap.update_flags(&mailbox, uid, add, remove).await?;
-    Ok((
-        StatusCode::OK,
-        Json(FlagUpdateResponse {
-            mailbox,
-            uid,
-            flags,
-        }),
-    )
-        .into_response())
+    let response = service::update_flags(&state, mailbox, uid, add, remove).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `POST /api/messages/{uid}/move` handler: moves a single message to another
-/// mailbox.
+/// `POST /api/messages/{uid}/move` handler: thin wrapper over
+/// [`crate::service::move_message`].
+///
+/// The `uid`, the `mailbox` and the body's `to` are validated here (shared JSON
+/// `400` envelope); the move itself — `UID MOVE`, or the `UIDPLUS` emulation —
+/// and its domain outcomes (the two `404`s, the `501` of a server that announces
+/// neither capability and the `503`) belong to the operation.
 async fn move_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1256,21 +1202,15 @@ async fn move_message(
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
     let to = parse_body_destination(&body)?;
 
-    state.imap.move_message(&mailbox, uid, &to).await?;
-    Ok((
-        StatusCode::OK,
-        Json(MoveCopyResponse {
-            mailbox,
-            uid,
-            to,
-            status: "moved",
-        }),
-    )
-        .into_response())
+    let response = service::move_message(&state, mailbox, uid, to).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// `POST /api/messages/{uid}/copy` handler: copies a single message to another
-/// mailbox.
+/// `POST /api/messages/{uid}/copy` handler: thin wrapper over
+/// [`crate::service::copy_message`].
+///
+/// Same split as [`move_message`]: the request's own validation stays here and
+/// every domain outcome — the two `404`s and the `503` — is the operation's.
 async fn copy_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -1281,17 +1221,8 @@ async fn copy_message(
     let mailbox = parse_mailbox(parse_raw_query::<MailboxQuery>(raw)?.mailbox)?;
     let to = parse_body_destination(&body)?;
 
-    state.imap.copy_message(&mailbox, uid, &to).await?;
-    Ok((
-        StatusCode::OK,
-        Json(MoveCopyResponse {
-            mailbox,
-            uid,
-            to,
-            status: "copied",
-        }),
-    )
-        .into_response())
+    let response = service::copy_message(&state, mailbox, uid, to).await?;
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
 /// `DELETE /api/messages/{uid}` handler: deletes a single message.
@@ -1361,55 +1292,24 @@ async fn send_message(
         .into_response())
 }
 
-/// Failure mode of the IDLE control routes.
+/// `POST /api/idle/start` handler: thin wrapper over
+/// [`crate::service::idle_start`].
 ///
-/// Only `start` can fail: it answers `501` when no webhook URL is configured and
-/// opens no connection. `stop` and `status` always succeed.
-#[derive(Debug)]
-enum IdleHttpError {
-    /// No webhook URL is configured (`501`).
-    NotConfigured,
-}
-
-impl IntoResponse for IdleHttpError {
-    fn into_response(self) -> Response {
-        let (status, error, message) = match self {
-            Self::NotConfigured => (
-                StatusCode::NOT_IMPLEMENTED,
-                "idle_not_configured",
-                "idle notifications are not configured".to_string(),
-            ),
-        };
-        (status, Json(ErrorResponse { error, message })).into_response()
-    }
-}
-
-impl From<IdleError> for IdleHttpError {
-    fn from(error: IdleError) -> Self {
-        // Explicit match (no wildcard): adding a variant to `IdleError` must be a
-        // compile error here, so a new failure mode can never be silently mapped
-        // to `NotConfigured`.
-        match error {
-            IdleError::NotConfigured => Self::NotConfigured,
-        }
-    }
-}
-
-/// `POST /api/idle/start` handler: starts the IDLE subscription.
-///
-/// Idempotent and safe against concurrent calls; the domain supervisor returns
-/// the resulting status. Without a configured webhook it reports `501` through
-/// [`IdleHttpError`].
-async fn idle_start(State(state): State<AppState>) -> Result<Response, IdleHttpError> {
-    let status = state.idle().start().await?;
+/// Idempotent and safe against concurrent calls; the domain operation returns the
+/// resulting status. Without a configured webhook it answers `501`
+/// `idle_not_configured` through the shared [`ServiceError`] envelope.
+async fn idle_start(State(state): State<AppState>) -> Result<Response, ServiceError> {
+    let status = service::idle_start(&state).await?;
     Ok((StatusCode::OK, Json(status)).into_response())
 }
 
-/// `POST /api/idle/stop` handler: stops the IDLE subscription.
+/// `POST /api/idle/stop` handler: thin wrapper over
+/// [`crate::service::idle_stop`].
 ///
-/// Idempotent: stopping a subscription that is not running is a no-op.
+/// Idempotent: stopping a subscription that is not running is a no-op, and the
+/// operation is infallible, so there is no failure branch.
 async fn idle_stop(State(state): State<AppState>) -> Response {
-    let status = state.idle().stop().await;
+    let status = service::idle_stop(&state).await;
     (StatusCode::OK, Json(status)).into_response()
 }
 
