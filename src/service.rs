@@ -15,8 +15,11 @@
 //! routes, the request DTOs (query and body), the `StatusCode` and the shared
 //! `{"error":…,"message":…}` envelope. Handlers there are thin wrappers over the
 //! operations of this module **as they migrate**, one operation at a time: today
-//! `whoami`, `account` and `imap_status`; the rest still hold their own logic
-//! and their own per-route error type in [`crate::http`].
+//! `whoami`, `account`, `imap_status`, `list_mailboxes`, both IDLE reads
+//! (`idle_status`, `idle_queue`) and the five message reads (`list_messages`,
+//! `fetch_message`, `message_body`, `list_attachments`, `attachment`); the rest
+//! still hold their own logic and their own per-route error type in
+//! [`crate::http`].
 //!
 //! # Published HTTP error table
 //!
@@ -99,6 +102,8 @@
 
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -106,13 +111,15 @@ use subtle::ConstantTimeEq;
 use crate::Config;
 use crate::config::TlsMode;
 use crate::idle::{
-    HttpWebhookSender, IdleConnector, IdleSettings, IdleSupervisor, TokioIdleConnector,
+    HttpWebhookSender, IdleConnector, IdleSettings, IdleStatus, IdleSupervisor, TokioIdleConnector,
     WebhookSender,
 };
 use crate::imap::{
-    Backoff, ConnectionManager, ImapConnector, ImapError, MailboxInfo, TokioImapConnector,
+    Address, Backoff, ConnectionManager, FetchFormat, ImapConnector, ImapError, MailboxInfo,
+    Message, MessageEnvelope, ParsedMessageError, SearchCriteria, TokioImapConnector,
 };
-use crate::queue::{NotificationQueue, QueueError, WebhookQueue};
+use crate::mime::ParsedAttachment;
+use crate::queue::{NotificationQueue, QueueError, QueueStats, WebhookQueue};
 use crate::smtp::{MailSender, SmtpError, SmtpSender};
 
 /// Application name, resolved from `Cargo.toml`.
@@ -178,7 +185,7 @@ impl AppStateError {
 ///
 /// The configured API key is stored only as its SHA-256 digest and the field is
 /// private, so the plaintext secret can neither be read nor formatted:
-/// [`AppState::verify_token`] is the only way to compare a token against it. The
+/// `AppState::verify_token` is the only way to compare a token against it. The
 /// manual [`Debug`] implementation redacts the digest, the default sender, the
 /// mailer and the connection manager, which hold the SMTP and IMAP credentials.
 #[derive(Clone)]
@@ -503,6 +510,271 @@ pub struct MailboxListResponse {
     pub mailboxes: Vec<MailboxDto>,
 }
 
+/// One address in a message envelope.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct AddressDto {
+    /// Display name, or `null`.
+    pub name: Option<String>,
+    /// `mailbox@host`, or `null`.
+    pub address: Option<String>,
+}
+
+impl From<&Address> for AddressDto {
+    fn from(address: &Address) -> Self {
+        Self {
+            name: address.name.clone(),
+            address: address.address.clone(),
+        }
+    }
+}
+
+/// A message envelope in the message responses.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct EnvelopeDto {
+    /// `From` addresses.
+    pub from: Vec<AddressDto>,
+    /// `To` addresses.
+    pub to: Vec<AddressDto>,
+    /// `Cc` addresses.
+    pub cc: Vec<AddressDto>,
+    /// Raw `Subject` header.
+    pub subject: Option<String>,
+    /// Raw `Date` header.
+    pub date: Option<String>,
+    /// `Message-ID`.
+    pub message_id: Option<String>,
+}
+
+impl From<&MessageEnvelope> for EnvelopeDto {
+    fn from(envelope: &MessageEnvelope) -> Self {
+        Self {
+            from: envelope.from.iter().map(AddressDto::from).collect(),
+            to: envelope.to.iter().map(AddressDto::from).collect(),
+            cc: envelope.cc.iter().map(AddressDto::from).collect(),
+            subject: envelope.subject.clone(),
+            date: envelope.date.clone(),
+            message_id: envelope.message_id.clone(),
+        }
+    }
+}
+
+/// The metadata shared by the listing and the single-message responses.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct MessageDto {
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// Sequence number within the mailbox.
+    pub seq: u32,
+    /// Flags in IMAP style (`\Seen`, …).
+    pub flags: Vec<String>,
+    /// `RFC822.SIZE`, if reported.
+    pub size: Option<u32>,
+    /// `INTERNALDATE` in RFC 3339 form, if reported.
+    pub internal_date: Option<String>,
+    /// Parsed envelope, if reported.
+    pub envelope: Option<EnvelopeDto>,
+}
+
+impl From<&Message> for MessageDto {
+    fn from(message: &Message) -> Self {
+        Self {
+            uid: message.uid,
+            seq: message.seq,
+            flags: message.flags.clone(),
+            size: message.size,
+            internal_date: message.internal_date.clone(),
+            envelope: message.envelope.as_ref().map(EnvelopeDto::from),
+        }
+    }
+}
+
+/// JSON payload returned by a successful `GET /api/messages`.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct MessageListResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Total number of messages matching the search.
+    pub total: u32,
+    /// Applied page size.
+    pub limit: u32,
+    /// Applied page offset.
+    pub offset: u32,
+    /// The messages in this page.
+    pub messages: Vec<MessageDto>,
+}
+
+/// JSON payload returned by a successful `GET /api/messages/{uid}`.
+///
+/// The `headers_base64` and `raw_base64` fields are present only for the matching
+/// `format`, hence the conditional serialization. The field order is the
+/// declaration order, which is the serialisation order of the published body, so
+/// it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct MessageDetailResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// Sequence number within the mailbox.
+    pub seq: u32,
+    /// Flags in IMAP style (`\Seen`, …).
+    pub flags: Vec<String>,
+    /// `RFC822.SIZE`, if reported.
+    pub size: Option<u32>,
+    /// `INTERNALDATE` in RFC 3339 form, if reported.
+    pub internal_date: Option<String>,
+    /// Parsed envelope, if reported.
+    pub envelope: Option<EnvelopeDto>,
+    /// Requested format label: `summary`, `headers` or `full`.
+    pub format: &'static str,
+    /// Raw header block, base64-encoded (only for `format=headers`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers_base64: Option<String>,
+    /// Full RFC822 source, base64-encoded (only for `format=full`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_base64: Option<String>,
+}
+
+impl MessageDetailResponse {
+    /// Builds the response from the fetched message and the requested format.
+    ///
+    /// The raw bytes come from the domain message (`headers`/`body`); the fake
+    /// sessions in tests populate them directly.
+    fn new(mailbox: String, message: Message, format: FetchFormat) -> Self {
+        let metadata = MessageDto::from(&message);
+        let (format_label, headers_base64, raw_base64) = match format {
+            FetchFormat::Summary => ("summary", None, None),
+            FetchFormat::Headers => (
+                "headers",
+                message
+                    .headers
+                    .as_deref()
+                    .map(|bytes| STANDARD.encode(bytes)),
+                None,
+            ),
+            FetchFormat::Full => (
+                "full",
+                None,
+                message.body.as_deref().map(|bytes| STANDARD.encode(bytes)),
+            ),
+        };
+        Self {
+            mailbox,
+            uid: metadata.uid,
+            seq: metadata.seq,
+            flags: metadata.flags,
+            size: metadata.size,
+            internal_date: metadata.internal_date,
+            envelope: metadata.envelope,
+            format: format_label,
+            headers_base64,
+            raw_base64,
+        }
+    }
+}
+
+/// JSON payload returned by a successful `GET /api/messages/{uid}/body`.
+///
+/// `text` and `html` are always present; each is `null` when the message carries
+/// no such body and none can be derived. The field order is the declaration
+/// order, which is the serialisation order of the published body, so it is part
+/// of the contract.
+#[derive(Debug, Serialize)]
+pub struct MessageBodyResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// Derived plain-text body, or `null`.
+    pub text: Option<String>,
+    /// Decoded HTML body, or `null`.
+    pub html: Option<String>,
+}
+
+/// One attachment in the `GET /api/messages/{uid}/attachments` response.
+///
+/// The content is intentionally omitted: it is only ever returned by the
+/// single-attachment route, base64-encoded inside the JSON body. The field order
+/// is the declaration order, which is the serialisation order of the published
+/// body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct ParsedAttachmentDto {
+    /// Positional identifier within the parsed attachment list.
+    pub id: u32,
+    /// Decoded file name, or `null`.
+    pub filename: Option<String>,
+    /// MIME content type, or `null`.
+    pub content_type: Option<String>,
+    /// Decoded content length, in bytes.
+    pub size: usize,
+    /// Whether the part is marked `inline`.
+    pub inline: bool,
+    /// `Content-ID`, or `null`.
+    pub content_id: Option<String>,
+}
+
+impl From<&ParsedAttachment> for ParsedAttachmentDto {
+    fn from(attachment: &ParsedAttachment) -> Self {
+        Self {
+            id: attachment.id,
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone(),
+            size: attachment.size,
+            inline: attachment.inline,
+            content_id: attachment.content_id.clone(),
+        }
+    }
+}
+
+/// JSON payload returned by a successful `GET /api/messages/{uid}/attachments`.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct AttachmentListResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// The message's attachments, without their content.
+    pub attachments: Vec<ParsedAttachmentDto>,
+}
+
+/// JSON payload returned by a successful
+/// `GET /api/messages/{uid}/attachments/{id}`.
+///
+/// The field order is the declaration order, which is the serialisation order of
+/// the published body, so it is part of the contract.
+#[derive(Debug, Serialize)]
+pub struct AttachmentResponse {
+    /// Selected mailbox name.
+    pub mailbox: String,
+    /// Unique identifier within the mailbox.
+    pub uid: u32,
+    /// Positional identifier of the attachment.
+    pub id: u32,
+    /// Decoded file name, or `null`.
+    pub filename: Option<String>,
+    /// MIME content type, or `null`.
+    pub content_type: Option<String>,
+    /// Decoded content length, in bytes.
+    pub size: usize,
+    /// The attachment's decoded content, base64-encoded.
+    pub content_base64: String,
+}
+
 /// Failure of an application operation.
 ///
 /// The variant decides the stable `error` code (via [`kind`](Self::kind)) and
@@ -523,10 +795,13 @@ pub struct MailboxListResponse {
 /// until it is mapped, and no failure mode can ever be silently rendered with
 /// the wrong status.
 ///
-/// Today this enum only holds the variants the operations owned by this module
-/// can produce: `whoami` and `account` cannot fail, and `imap_status` can only
-/// fail with `imap_unavailable`. The remaining rows of the module's error table
-/// are added, one operation at a time, as their handlers migrate.
+/// Today this enum holds the variants the operations owned by this module can
+/// produce: `whoami` and `account` cannot fail, `imap_status` can only fail with
+/// `imap_unavailable`, and the seven read operations of the third migration wave
+/// add the two `SELECT`-driven `404`s, the message `404`s, the two MIME-parsing
+/// refusals and the `501` of a server that does not announce the extension an
+/// operation needs. The remaining rows of the module's error table are
+/// added, one operation at a time, as their handlers migrate.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ServiceError {
@@ -544,6 +819,66 @@ pub enum ServiceError {
         #[source]
         source: ImapError,
     },
+    /// The server does not announce the IMAP extension the operation needs
+    /// (`501`, `capability_not_supported`).
+    ///
+    /// Same shape as [`ImapUnavailable`](Self::ImapUnavailable): the message is a
+    /// `&'static str` of this module's own vocabulary, derived from the cause's
+    /// [`ImapError::public_message`], and the underlying failure is kept as the
+    /// [`source`](std::error::Error::source) for logs only, so nothing the server
+    /// said ever becomes caller-visible text.
+    #[error("{message}")]
+    CapabilityNotSupported {
+        /// Credential-free, stable message for a missing server extension.
+        message: &'static str,
+        /// The IMAP failure this response describes.
+        #[source]
+        source: ImapError,
+    },
+    /// The requested mailbox does not exist (`404`, `mailbox_not_found`).
+    ///
+    /// Produced by `SELECT` alone: the server answered `NO` for the mailbox.
+    #[error("mailbox not found")]
+    MailboxNotFound,
+    /// The requested message does not exist in the selected mailbox (`404`,
+    /// `message_not_found`).
+    ///
+    /// Produced by the message operations when the requested `uid` is absent: the
+    /// session reports it before (or instead of) handing back a message.
+    #[error("message not found")]
+    MessageNotFound,
+    /// The requested attachment identifier matches no attachment (`404`,
+    /// `attachment_not_found`).
+    ///
+    /// Produced by the single-attachment operation alone, from the positional
+    /// identifier of the parsed message.
+    #[error("attachment not found")]
+    AttachmentNotFound,
+    /// The message exceeds the configured parsing size limit (`413`,
+    /// `message_too_large`).
+    ///
+    /// The refusal is made deliberately before the MIME content is parsed; the
+    /// refusal itself (which carries the reported and the configured size) is kept
+    /// as the [`source`](std::error::Error::source) for logs only, and never
+    /// reaches a caller.
+    #[error("message exceeds the configured size limit")]
+    MessageTooLarge {
+        /// The refusal produced by the size guard.
+        #[source]
+        source: ParsedMessageError,
+    },
+    /// The message exists but its MIME content cannot be parsed (`422`,
+    /// `message_not_parsable`).
+    ///
+    /// The parser refusal is kept as the [`source`](std::error::Error::source) for
+    /// logs only: it may carry the raw content or a third-party description, so it
+    /// is never part of what a caller reads.
+    #[error("message cannot be parsed")]
+    MessageNotParsable {
+        /// The refusal produced by the MIME parser.
+        #[source]
+        source: ParsedMessageError,
+    },
 }
 
 impl ServiceError {
@@ -558,10 +893,71 @@ impl ServiceError {
         }
     }
 
+    /// Builds the `capability_not_supported` failure around the underlying
+    /// [`ImapError`].
+    ///
+    /// Both fields are derived here, in one place, so the `501` of a missing
+    /// server extension can never be flattened into an availability failure and
+    /// its public message can never drift away from the cause it describes.
+    pub(crate) fn capability_not_supported(source: ImapError) -> Self {
+        Self::CapabilityNotSupported {
+            message: source.public_message(),
+            source,
+        }
+    }
+
+    /// Maps the failure surface of an operation that only issues `SELECT`.
+    ///
+    /// A missing mailbox is a domain `404`; a missing server extension keeps its
+    /// own `501`; every other failure of the underlying session is an
+    /// availability failure flattened into one code, so the categories can never
+    /// be confused by a caller-written wildcard.
+    fn select_failure(source: ImapError) -> Self {
+        match source {
+            ImapError::MailboxNotFound => Self::MailboxNotFound,
+            ImapError::CapabilityNotSupported => Self::capability_not_supported(source),
+            other => Self::imap_unavailable(other),
+        }
+    }
+
+    /// Maps the failure surface of an operation that selects a mailbox and then
+    /// addresses **one message** by `uid`.
+    ///
+    /// The two missing-object outcomes stay distinct — a missing mailbox is not a
+    /// missing message —, a missing server extension keeps its own `501`, and
+    /// everything else is an availability failure.
+    fn message_failure(source: ImapError) -> Self {
+        match source {
+            ImapError::MailboxNotFound => Self::MailboxNotFound,
+            ImapError::MessageNotFound => Self::MessageNotFound,
+            ImapError::CapabilityNotSupported => Self::capability_not_supported(source),
+            other => Self::imap_unavailable(other),
+        }
+    }
+
+    /// Maps the failure surface of the parsed-message operations.
+    ///
+    /// The IMAP variant reuses [`message_failure`](Self::message_failure) so the
+    /// two `404`s keep their own code; the size guard and the parser refusal keep
+    /// their cause as the source, for logs only.
+    fn parsed_failure(source: ParsedMessageError) -> Self {
+        match source {
+            ParsedMessageError::Imap(error) => Self::message_failure(error),
+            ParsedMessageError::TooLarge { .. } => Self::MessageTooLarge { source },
+            ParsedMessageError::Unparsable => Self::MessageNotParsable { source },
+        }
+    }
+
     /// Stable, machine-filterable `error` code of the shared envelope.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::ImapUnavailable { .. } => "imap_unavailable",
+            Self::CapabilityNotSupported { .. } => "capability_not_supported",
+            Self::MailboxNotFound => "mailbox_not_found",
+            Self::MessageNotFound => "message_not_found",
+            Self::AttachmentNotFound => "attachment_not_found",
+            Self::MessageTooLarge { .. } => "message_too_large",
+            Self::MessageNotParsable { .. } => "message_not_parsable",
         }
     }
 
@@ -569,10 +965,17 @@ impl ServiceError {
     ///
     /// It never propagates third-party text directly: the underlying
     /// [`ImapError::public_message`] already groups its variants into stable
-    /// families, and the message is fixed at construction time.
+    /// families, the MIME refusals are fixed strings, and the message is fixed at
+    /// construction time.
     pub fn public_message(&self) -> &'static str {
         match self {
             Self::ImapUnavailable { message, .. } => message,
+            Self::CapabilityNotSupported { message, .. } => message,
+            Self::MailboxNotFound => "mailbox not found",
+            Self::MessageNotFound => "message not found",
+            Self::AttachmentNotFound => "attachment not found",
+            Self::MessageTooLarge { .. } => "message exceeds the configured size limit",
+            Self::MessageNotParsable { .. } => "message cannot be parsed",
         }
     }
 }
@@ -624,23 +1027,217 @@ pub async fn imap_status(state: &AppState) -> Result<ImapStatusResponse, Service
 /// session, never exposing a credential.
 ///
 /// This operation only ever issues `LIST`, and [`ImapError::MailboxNotFound`] is
-/// produced by `SELECT` alone, so no `404` can originate here: every failure of
-/// the underlying session is an availability failure and is flattened into one
-/// code, exactly as the published error table requires.
+/// produced by `SELECT` alone, so no `404` can originate here. Its mapping is
+/// nevertheless the one every `SELECT`-driven operation uses — a missing mailbox
+/// is a `404`, a server that does not announce the extension is a `501`, and
+/// everything else is an availability failure — so no code this route could one
+/// day produce is flattened into a different one.
 ///
 /// # Errors
 ///
-/// [`ServiceError::ImapUnavailable`] (`503`), carrying the credential-free
-/// [`ImapError::public_message`] of the underlying failure and the failure itself
-/// as its `source`.
+/// [`ServiceError::MailboxNotFound`] (`404`) and
+/// [`ServiceError::CapabilityNotSupported`] (`501`) if the session reports them,
+/// and [`ServiceError::ImapUnavailable`] (`503`) otherwise, carrying the
+/// credential-free [`ImapError::public_message`] of the underlying failure and
+/// the failure itself as its `source`.
 pub async fn list_mailboxes(state: &AppState) -> Result<MailboxListResponse, ServiceError> {
     let mailboxes = state
         .imap
         .list_mailboxes()
         .await
-        .map_err(ServiceError::imap_unavailable)?;
+        .map_err(ServiceError::select_failure)?;
     Ok(MailboxListResponse {
         mailboxes: mailboxes.into_iter().map(MailboxDto::from).collect(),
+    })
+}
+
+/// Reports the state of the IDLE subscription.
+///
+/// Infallible: the supervisor's snapshot is a plain read of its own task handles,
+/// with no network, no credential and no failure mode. The DTO belongs to the
+/// domain module ([`IdleStatus`], in [`crate::idle`]) and is returned verbatim, so
+/// no transport can drift from it.
+pub async fn idle_status(state: &AppState) -> IdleStatus {
+    state.idle().status().await
+}
+
+/// Reports the delivery queue's observable state.
+///
+/// Infallible for the same reason as [`idle_status`]: [`QueueStats`] is an
+/// in-memory snapshot of the queue (see [`crate::queue`]), taken without I/O even
+/// when the queue is persistent. The DTO lives in the domain module and is
+/// returned verbatim.
+pub fn idle_queue(state: &AppState) -> QueueStats {
+    state.idle().queue().stats()
+}
+
+/// Lists one page of the messages of `mailbox` matching `criteria`.
+///
+/// The operation composes `SELECT`, `SEARCH` and a summary `UID FETCH` on the
+/// shared session, in that order and on a single lock.
+///
+/// This operation only ever issues `SELECT`, `SEARCH` and a summary `UID FETCH`,
+/// and [`ImapError::MessageNotFound`] is produced by the single-message
+/// operations alone, so no `404 message_not_found` can originate here: a missing
+/// mailbox is the only domain `404`, and every other failure of the session is an
+/// availability failure flattened into one code, exactly as the published error
+/// table requires.
+///
+/// # Errors
+///
+/// - [`ServiceError::MailboxNotFound`] (`404`) when the server answers `NO` for
+///   the mailbox.
+/// - [`ServiceError::ImapUnavailable`] (`503`), carrying the credential-free
+///   [`ImapError::public_message`] of the underlying failure and the failure
+///   itself as its `source`.
+pub async fn list_messages(
+    state: &AppState,
+    mailbox: String,
+    criteria: SearchCriteria,
+    limit: u32,
+    offset: u32,
+) -> Result<MessageListResponse, ServiceError> {
+    let page = state
+        .imap
+        .list_messages(&mailbox, criteria, limit, offset)
+        .await
+        .map_err(ServiceError::select_failure)?;
+    Ok(MessageListResponse {
+        mailbox,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        messages: page.messages.iter().map(MessageDto::from).collect(),
+    })
+}
+
+/// Fetches the single message `uid` of `mailbox` in the requested `format`.
+///
+/// `uid` is expected to be already validated as a positive identifier: a
+/// non-numeric or zero `uid` is a request that does not speak the transport's
+/// dialect and never reaches this operation.
+///
+/// # Errors
+///
+/// - [`ServiceError::MailboxNotFound`] (`404`) when the server answers `NO` for
+///   the mailbox.
+/// - [`ServiceError::MessageNotFound`] (`404`) when the mailbox holds no message
+///   with that `uid`.
+/// - [`ServiceError::ImapUnavailable`] (`503`), carrying the credential-free
+///   [`ImapError::public_message`] of the underlying failure and the failure
+///   itself as its `source`.
+pub async fn fetch_message(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+    format: FetchFormat,
+) -> Result<MessageDetailResponse, ServiceError> {
+    let message = state
+        .imap
+        .fetch_message(&mailbox, uid, format)
+        .await
+        .map_err(ServiceError::message_failure)?;
+    Ok(MessageDetailResponse::new(mailbox, message, format))
+}
+
+/// Fetches the single message `uid`, parses its MIME content and reports its
+/// plain-text and HTML bodies.
+///
+/// The raw source is bounded by [`AppState::max_message_bytes`] and is parsed off
+/// the session lock (see `fetch_parsed`), so an oversized or hostile message
+/// neither exhausts memory nor stalls another request.
+///
+/// # Errors
+///
+/// - [`ServiceError::MailboxNotFound`] (`404`) when the server answers `NO` for
+///   the mailbox.
+/// - [`ServiceError::MessageNotFound`] (`404`) when the mailbox holds no message
+///   with that `uid`.
+/// - [`ServiceError::MessageTooLarge`] (`413`) when the message exceeds the
+///   configured parsing size limit; the content is never parsed.
+/// - [`ServiceError::MessageNotParsable`] (`422`) when the message exists but its
+///   MIME content cannot be parsed.
+/// - [`ServiceError::ImapUnavailable`] (`503`) for every other session failure.
+pub async fn message_body(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+) -> Result<MessageBodyResponse, ServiceError> {
+    let parsed = state
+        .imap
+        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
+        .await
+        .map_err(ServiceError::parsed_failure)?;
+    Ok(MessageBodyResponse {
+        mailbox,
+        uid,
+        text: parsed.text,
+        html: parsed.html,
+    })
+}
+
+/// Fetches the single message `uid`, parses it and reports the metadata of each
+/// attachment, **without** their content.
+///
+/// # Errors
+///
+/// Same failure surface as [`message_body`]: the two `404`s, `413`, `422` and the
+/// `503` availability failure.
+pub async fn list_attachments(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+) -> Result<AttachmentListResponse, ServiceError> {
+    let parsed = state
+        .imap
+        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
+        .await
+        .map_err(ServiceError::parsed_failure)?;
+    Ok(AttachmentListResponse {
+        mailbox,
+        uid,
+        attachments: parsed
+            .attachments
+            .iter()
+            .map(ParsedAttachmentDto::from)
+            .collect(),
+    })
+}
+
+/// Fetches the single message `uid`, parses it and reports the decoded content of
+/// the attachment identified by the positional `id`, base64-encoded.
+///
+/// The content is encoded inside the JSON body and never reflected into a header,
+/// so a hostile `filename` or `content_type` cannot inject one.
+///
+/// # Errors
+///
+/// The same failure surface as [`list_attachments`], plus
+/// [`ServiceError::AttachmentNotFound`] (`404`) when `id` matches no attachment of
+/// the parsed message.
+pub async fn attachment(
+    state: &AppState,
+    mailbox: String,
+    uid: u32,
+    id: u32,
+) -> Result<AttachmentResponse, ServiceError> {
+    let parsed = state
+        .imap
+        .fetch_parsed(&mailbox, uid, state.max_message_bytes())
+        .await
+        .map_err(ServiceError::parsed_failure)?;
+    let attachment = parsed
+        .attachment(id)
+        .ok_or(ServiceError::AttachmentNotFound)?;
+
+    Ok(AttachmentResponse {
+        mailbox,
+        uid,
+        id,
+        filename: attachment.filename.clone(),
+        content_type: attachment.content_type.clone(),
+        size: attachment.size,
+        content_base64: STANDARD.encode(&attachment.content),
     })
 }
 
@@ -742,5 +1339,220 @@ mod tests {
 
         let message: &'static str = error.public_message();
         assert_eq!(message, "IMAP authentication or command failed");
+    }
+
+    /// The `501` keeps the code, the message and the shape of
+    /// [`ImapUnavailable`](ServiceError::ImapUnavailable): a fixed message of this
+    /// module's vocabulary, derived from the cause in one place, with the cause
+    /// itself reachable as the `source` for logs.
+    #[test]
+    fn capability_not_supported_kind_is_stable_and_message_is_domain_vocabulary() {
+        let error = ServiceError::capability_not_supported(ImapError::CapabilityNotSupported);
+
+        assert_eq!(error.kind(), "capability_not_supported");
+        let message: &'static str = error.public_message();
+        assert_eq!(message, "the server does not support this operation");
+        assert_eq!(
+            error.to_string(),
+            message,
+            "`Display`, what `tracing::error!(%error)` prints, must say exactly the same"
+        );
+
+        let source = std::error::Error::source(&error).expect("the cause must be kept");
+        let cause = source
+            .downcast_ref::<ImapError>()
+            .expect("the source must be the original IMAP failure, not a rewrite");
+        assert_eq!(cause.kind(), "unsupported", "for logs only");
+    }
+
+    /// The cause of the `501` never reaches the caller: the public message is the
+    /// service's own fixed vocabulary, decided at construction time, so no text
+    /// of the underlying failure can leak through it.
+    #[test]
+    fn capability_not_supported_keeps_the_cause_out_of_the_public_message() {
+        let error = ServiceError::capability_not_supported(ImapError::CapabilityNotSupported);
+
+        assert_eq!(
+            error.public_message(),
+            "the server does not support this operation",
+            "the message is the fixed, credential-free one of the cause's family"
+        );
+        assert!(
+            !error.public_message().contains(THIRD_PARTY_TEXT),
+            "the public message must never carry third-party text"
+        );
+    }
+
+    /// Every fixed-message variant, paired with its published `error` code and the
+    /// message the API has always served for it.
+    fn fixed_variants() -> [(ServiceError, &'static str, &'static str); 5] {
+        [
+            (
+                ServiceError::MailboxNotFound,
+                "mailbox_not_found",
+                "mailbox not found",
+            ),
+            (
+                ServiceError::MessageNotFound,
+                "message_not_found",
+                "message not found",
+            ),
+            (
+                ServiceError::AttachmentNotFound,
+                "attachment_not_found",
+                "attachment not found",
+            ),
+            (
+                ServiceError::MessageTooLarge {
+                    source: ParsedMessageError::TooLarge {
+                        size: 4096,
+                        limit: 1024,
+                    },
+                },
+                "message_too_large",
+                "message exceeds the configured size limit",
+            ),
+            (
+                ServiceError::MessageNotParsable {
+                    source: ParsedMessageError::Unparsable,
+                },
+                "message_not_parsable",
+                "message cannot be parsed",
+            ),
+        ]
+    }
+
+    /// `kind()`/`public_message()` are the two values every transport renders, so
+    /// they are pinned here together with the invariant that `Display` — what
+    /// `tracing::error!(%error)` prints — says exactly the same as the public
+    /// message.
+    #[test]
+    fn fixed_variant_codes_and_messages_are_stable() {
+        for (error, kind, message) in fixed_variants() {
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.public_message(), message);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    /// The size guard's refusal carries the reported and the configured size for
+    /// logs; the parser refusal may carry third-party text. Neither may reach a
+    /// caller.
+    ///
+    /// The sizes are asserted **through the type** (`downcast_ref`, not the
+    /// `Display` text): [`ParsedMessageError::TooLarge`] keeps `size` and `limit`
+    /// as fields, so its `Display` is the fixed `"message too large"` and a
+    /// `contains("4096")` on it would measure the wrong thing.
+    #[test]
+    fn mime_refusals_keep_their_cause_out_of_the_public_message() {
+        let too_large = ServiceError::MessageTooLarge {
+            source: ParsedMessageError::TooLarge {
+                size: 4096,
+                limit: 1024,
+            },
+        };
+        assert_eq!(too_large.public_message(), too_large.to_string());
+        assert!(!too_large.public_message().contains("4096"));
+        assert!(!too_large.public_message().contains("1024"));
+        let source = std::error::Error::source(&too_large).expect("the cause must be kept");
+        let cause = source
+            .downcast_ref::<ParsedMessageError>()
+            .expect("the source must be the size guard's refusal, not a rewrite");
+        assert!(
+            matches!(
+                cause,
+                ParsedMessageError::TooLarge {
+                    size: 4096,
+                    limit: 1024
+                }
+            ),
+            "the cause must keep the reported and the configured size for logs: {cause:?}"
+        );
+
+        let unparsable = ServiceError::MessageNotParsable {
+            source: ParsedMessageError::Unparsable,
+        };
+        assert_eq!(unparsable.public_message(), "message cannot be parsed");
+        assert!(std::error::Error::source(&unparsable).is_some());
+    }
+
+    /// The mapping is **per operation**: an operation that never addresses a
+    /// single message must never answer `message_not_found`, even when the
+    /// session reports one, because the published table assigns that code to the
+    /// single-message operations alone.
+    #[test]
+    fn select_failure_never_yields_message_not_found() {
+        assert_eq!(
+            ServiceError::select_failure(ImapError::MailboxNotFound).kind(),
+            "mailbox_not_found"
+        );
+        assert_eq!(
+            ServiceError::select_failure(ImapError::MessageNotFound).kind(),
+            "imap_unavailable"
+        );
+        assert_eq!(
+            ServiceError::select_failure(ImapError::CapabilityNotSupported).kind(),
+            "capability_not_supported",
+            "a missing server extension keeps its own 501 instead of becoming a 503"
+        );
+    }
+
+    /// A missing mailbox and a missing message stay two distinct codes, and every
+    /// other session failure is an availability failure.
+    #[test]
+    fn message_failure_keeps_the_two_404s_apart() {
+        assert_eq!(
+            ServiceError::message_failure(ImapError::MailboxNotFound).kind(),
+            "mailbox_not_found"
+        );
+        assert_eq!(
+            ServiceError::message_failure(ImapError::MessageNotFound).kind(),
+            "message_not_found"
+        );
+        assert_eq!(
+            ServiceError::message_failure(ImapError::Login(THIRD_PARTY_TEXT.to_string())).kind(),
+            "imap_unavailable"
+        );
+        assert_eq!(
+            ServiceError::message_failure(ImapError::CapabilityNotSupported).kind(),
+            "capability_not_supported",
+            "a missing server extension keeps its own 501 instead of becoming a 503"
+        );
+    }
+
+    /// The parsed-message mapping dispatches on the cause: the IMAP variant
+    /// reuses the message mapping (so its two `404`s survive), while the size
+    /// guard and the parser refusal get their own codes.
+    #[test]
+    fn parsed_failure_dispatches_on_the_cause() {
+        let cases = [
+            (
+                ParsedMessageError::Imap(ImapError::MailboxNotFound),
+                "mailbox_not_found",
+            ),
+            (
+                ParsedMessageError::Imap(ImapError::MessageNotFound),
+                "message_not_found",
+            ),
+            (
+                ParsedMessageError::Imap(ImapError::Unavailable(THIRD_PARTY_TEXT.to_string())),
+                "imap_unavailable",
+            ),
+            (
+                ParsedMessageError::TooLarge { size: 10, limit: 5 },
+                "message_too_large",
+            ),
+            (ParsedMessageError::Unparsable, "message_not_parsable"),
+        ];
+
+        for (cause, expected) in cases {
+            let error = ServiceError::parsed_failure(cause);
+            assert_eq!(error.kind(), expected);
+            assert!(
+                !error.public_message().contains(THIRD_PARTY_TEXT),
+                "the public message leaked third-party text: {}",
+                error.public_message()
+            );
+        }
     }
 }
