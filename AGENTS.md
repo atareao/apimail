@@ -54,7 +54,7 @@ correo como *tools* para clientes de agentes. Es la pieza más grande después d
 
 ## Flujo SDD + TDD (obligatorio)
 
-Antes de escribir/editar código, `just check-spec` debe confirmar un change proposal aprobado en `openspec/changes/<feature>/`. Si no existe, detente y pide aprobación; no escribas código. Tras aprobar la spec: **RED → GREEN → REFACTOR**, verificando por CLI (`just test`, `just clippy`, `just fmt`). Nunca asumas que los tests compilan o pasan sin ejecutarlos.
+Antes de escribir/editar código, `just check-spec` debe confirmar un change proposal aprobado en `openspec/changes/<feature>/`. Si no existe, detente y pide aprobación; no escribas código. Tras aprobar la spec: **RED → GREEN → REFACTOR**, verificando por CLI con `just check-all` (los cuatro pasos del CI; `just test`, `just clippy`, `just fmt` si quieres ir paso a paso). Nunca asumas que los tests compilan o pasan sin ejecutarlos.
 
 ⚠️ **`openspec` 1.13.2 no tiene `openspec new change`** (ese subcomando no existe: `openspec change` solo ofrece `show`, `list` y `validate`). El change se crea **a mano**: el directorio `openspec/changes/<feature>/` con su `.openspec.yaml` (`schema: spec-driven`, `created`, `goal`) más `proposal.md`, `design.md`, `tasks.md` y `specs/<capability>/spec.md`. Plantillas: `openspec templates`.
 
@@ -62,7 +62,12 @@ Artefactos OpenSpec: `proposal.md` → `specs/<capability>/spec.md` → `design.
 
 ## Gotchas del task runner (`just`)
 - El `.justfile` está **adaptado a apimail**: las recetas de contenedor y salud usan `ghcr.io/atareao/apimail` y el `compose.yml` real (existen `Dockerfile`, `.dockerignore`, `.env.example` y `.env.j2`), y la versión de la imagen se resuelve con `vampus show` (`vampus` instalado + `.vampus.yml`). Las recetas heredadas `frontend-*` se **retiraron** (el proyecto no tiene `frontend/`). `dev`/`build`/`push`/`deploy*` usan **podman** (instalado aquí); `dev-docker` requiere **docker** (no instalado en esta máquina).
-- Recetas fiables hoy: `just test`, `just clippy`, `just fmt`, `just check-spec` y `just check-all` (encadena **tres**: `fmt`, `clippy`, `test`). ⚠️ **`just check-all` no es el CI**: le falta `cargo doc` (ver «Comandos»).
+- Recetas fiables hoy: `just test`, `just clippy`, `just fmt`, `just doc`, `just check-spec`,
+  `just check-all` (encadena **los cuatro** pasos del CI: `fmt`, `clippy`, `doc`, `test`) y
+  `just check-all-mcp` (los mismos cuatro con `--features mcp`, paridad con el job `test-mcp`).
+- ⚠️ **`just check-all` ya cubre `cargo doc`**, así que úsalo en lugar de encadenar `fmt`+`clippy`+`test`
+  a mano: sin el paso de `doc` el árbol parece verde y el CI falla por un warning del rustdoc
+  (un enlace roto), que es justo lo que pasó una vez.
 - `just check-spec` **fallará** mientras no haya un change activo en `openspec/changes/` — es lo esperado, no un fallo del repo. El mensaje de error explica cómo crearlo a mano.
 
 ## Comandos
@@ -70,10 +75,11 @@ Artefactos OpenSpec: `proposal.md` → `specs/<capability>/spec.md` → `design.
 - Un solo test: `cargo test <nombre>`
 - Lint (CI exige cero warnings): `just clippy` == `cargo clippy --all-targets -- -D warnings`
 - Formato: `just fmt` == `cargo fmt --check` (el CI usa `cargo fmt --all -- --check`)
-- Documentación: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+- Documentación: `just doc` == `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - Con la feature MCP: `cargo clippy --features mcp --all-targets -- -D warnings`,
   `cargo test --features mcp --no-fail-fast` y
-  `RUSTDOCFLAGS="-D warnings" cargo doc --features mcp --no-deps`.
+  `RUSTDOCFLAGS="-D warnings" cargo doc --features mcp --no-deps` — o todo junto con
+  `just check-all-mcp`.
 
 ### El equivalente al CI son CUATRO cosas, no tres
 
@@ -82,12 +88,16 @@ Artefactos OpenSpec: `proposal.md` → `specs/<capability>/spec.md` → `design.
 3. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 4. `cargo test`
 
-⚠️ **`just check-all` no ejecuta `cargo doc`.** Encadena solo `fmt`, `clippy` y `test` — tres de las
-cuatro. Por eso es fácil creerse verde con `just check-all` y que el CI falle por un enlace roto del
-rustdoc. Ejecuta (3) a mano.
+**`just check-all` encadena esos cuatro pasos, en ese orden** (su `fmt` es `cargo fmt --check`: sin
+workspace, idéntico a `cargo fmt --all -- --check`). Una receta que ejecutara solo
+`fmt`+`clippy`+`test` daría «verde local» con el CI en rojo por un warning del rustdoc (un enlace
+roto, típicamente): `cargo doc` es el único paso que lo detecta, y así fue como se subió un commit
+en rojo creyéndolo verde. Por eso está encadenado y no hay que ejecutarlo «a mano» ni componer el
+conjunto uno mismo.
 
 Con la feature `mcp` hay **además** un segundo juego completo en el job `test-mcp`:
-`clippy`/`doc`/`test` con `--features mcp`. Prueba **ambos modos** antes de dar algo por terminado.
+`clippy`/`doc`/`test` con `--features mcp` (y el mismo `fmt`, que no depende de la feature).
+**`just check-all-mcp` lo reproduce entero.** Prueba **ambos modos** antes de dar algo por terminado.
 
 ## Convenciones
 - Tests unitarios en el mismo archivo bajo `#[cfg(test)]`; tests de integración/API en `tests/`.
