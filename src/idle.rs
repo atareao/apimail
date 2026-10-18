@@ -461,6 +461,7 @@ pub enum IdleError {
 /// [`LAST_ERROR_WEBHOOK_FAILED`] or [`LAST_ERROR_QUEUE_UNAVAILABLE`]) or `None`:
 /// no raw error rendering ever leaves the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct IdleStatus {
     /// [`STATUS_RUNNING`] or [`STATUS_STOPPED`].
     pub status: &'static str,

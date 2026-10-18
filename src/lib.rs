@@ -29,7 +29,7 @@ pub use imap::{
     SendFuture, SystemFlag, TokioImapConnector,
 };
 #[cfg(feature = "mcp")]
-pub use mcp::{ApimailMcp, McpServeError, WhoamiOutput};
+pub use mcp::{ApimailMcp, McpServeError};
 pub use mime::{MimeError, ParsedAttachment, ParsedMessage};
 pub use queue::{
     NotificationQueue, QueueError, QueueLimits, QueueStats, QueuedNotification, StoredWatermark,

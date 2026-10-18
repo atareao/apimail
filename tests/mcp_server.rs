@@ -206,8 +206,8 @@ where
 /// process, over an in-memory pipe, against [`ApimailMcp`] itself.
 ///
 /// This is the test that covers the handler: the tool router, the schema-bearing
-/// `WhoamiOutput` DTO and the `get_info` override are all exercised through the
-/// real transport rather than by calling the tool method directly.
+/// output DTOs and the `get_info` override are all exercised through the real
+/// transport rather than by calling the tool method directly.
 #[tokio::test]
 async fn tool_cycle_runs_in_process_over_a_pipe() {
     let state = AppState::from_config(&test_config()).expect("valid application state");
@@ -254,7 +254,9 @@ async fn tool_cycle_runs_in_process_over_a_pipe() {
     )
     .await;
 
-    // 2. tools/list. Exactly one tool is advertised, `whoami`, with a schema.
+    // 2. tools/list. Exactly the twelve read-only tools are advertised, in the
+    //    alphabetical order the router publishes them, and every one of them
+    //    carries an input schema and a description.
     send(&mut client_write, &list_tools_request(2)).await;
     let listing = await_reply(&mut lines, &mut transcript, 2).await;
     let result = result_of(&listing, 2);
@@ -267,19 +269,43 @@ async fn tool_cycle_runs_in_process_over_a_pipe() {
         .collect();
     assert_eq!(
         names,
-        vec!["whoami"],
-        "the MCP surface is `whoami` and nothing else: {listing}"
+        vec![
+            "get_account",
+            "get_attachment",
+            "get_message",
+            "get_message_body",
+            "idle_queue",
+            "idle_status",
+            "imap_status",
+            "list_attachments",
+            "list_mailboxes",
+            "list_messages",
+            "select_mailbox",
+            "whoami",
+        ],
+        "the MCP surface is the twelve read-only tools and nothing else: {listing}"
     );
-    assert!(
-        tools[0]["inputSchema"].is_object(),
-        "a tool must publish an input schema: {listing}"
-    );
-    assert!(
-        tools[0]["description"]
-            .as_str()
-            .is_some_and(|description| !description.is_empty()),
-        "a tool must publish a description: {listing}"
-    );
+    // The administrative IDLE controls stay off the MCP surface on purpose:
+    // starting and stopping the subscription is an operator decision.
+    for administrative in ["idle_start", "idle_stop"] {
+        assert!(
+            !names.contains(&administrative),
+            "`{administrative}` must not be exposed over MCP: {listing}"
+        );
+    }
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("unnamed");
+        assert!(
+            tool["inputSchema"].is_object(),
+            "`{name}` must publish an input schema: {listing}"
+        );
+        assert!(
+            tool["description"]
+                .as_str()
+                .is_some_and(|description| !description.is_empty()),
+            "`{name}` must publish a description: {listing}"
+        );
+    }
 
     // 3. tools/call. The only fact `whoami` asserts is authentication.
     send(&mut client_write, &call_whoami_request(3)).await;
