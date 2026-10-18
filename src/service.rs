@@ -257,6 +257,19 @@ pub struct AppState {
     imap_tls: TlsMode,
     /// IDLE subscription supervisor (dedicated connection + webhook).
     idle: Arc<IdleSupervisor>,
+    /// Path the MCP Streamable HTTP transport is nested at, or `None` when that
+    /// transport is disabled.
+    ///
+    /// Populated from the configuration ([`Config::mcp_http`] plus
+    /// [`Config::mcp_path`]) so that [`build_router`](crate::build_router) can
+    /// keep its signature: the router reads this field instead of receiving a
+    /// second argument, which would have forced every existing test to change.
+    ///
+    /// It is `None` for a build without the `mcp` feature — the configuration
+    /// rejects every `APIMAIL_MCP_*` variable in that case, so `mcp_http` is
+    /// always `false` — and for any configuration that did not enable the
+    /// transport, however the crate was compiled.
+    mcp_path: Option<String>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -273,6 +286,7 @@ impl std::fmt::Debug for AppState {
             .field("imap", &"***")
             .field("imap_tls", &self.imap_tls)
             .field("idle", &"***")
+            .field("mcp_path", &self.mcp_path)
             .finish()
     }
 }
@@ -379,6 +393,10 @@ impl AppState {
         webhook_sender: Arc<dyn WebhookSender>,
     ) -> Result<Self, AppStateError> {
         let queue = build_queue(config)?;
+        // The MCP Streamable HTTP transport is mounted only when the
+        // configuration asks for it; without the `mcp` feature `mcp_http` is
+        // always `false`, so this is `None` and the router mounts nothing.
+        let mcp_path = config.mcp_http.then(|| config.mcp_path.clone());
         let idle = Arc::new(IdleSupervisor::new(
             idle_connector,
             webhook_sender,
@@ -412,6 +430,7 @@ impl AppState {
             imap: Arc::new(ConnectionManager::new(imap_connector, Backoff::default())),
             imap_tls: config.account.imap.tls,
             idle,
+            mcp_path,
         })
     }
 
@@ -436,6 +455,20 @@ impl AppState {
     /// The IDLE subscription supervisor, controlled by the `/api/idle/*` routes.
     pub fn idle(&self) -> &IdleSupervisor {
         &self.idle
+    }
+
+    /// Path the MCP Streamable HTTP transport is nested at, or `None` when the
+    /// transport is disabled.
+    ///
+    /// Read by [`build_router`](crate::build_router), which mounts the transport
+    /// as a nested service when this is `Some(path)` and mounts nothing when it
+    /// is `None`. The value comes from the configuration
+    /// ([`Config::mcp_http`](crate::Config::mcp_http) and
+    /// [`Config::mcp_path`](crate::Config::mcp_path)), so a build without the
+    /// `mcp` feature — which rejects every `APIMAIL_MCP_*` variable — always
+    /// answers `None`.
+    pub fn mcp_path(&self) -> Option<&str> {
+        self.mcp_path.as_deref()
     }
 
     /// Maximum total size, in bytes, of the decoded attachments of a message.

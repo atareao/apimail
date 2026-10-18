@@ -1324,6 +1324,13 @@ fn bearer_token(value: &str) -> Option<&str> {
 /// The returned router is self-contained and can be exercised in tests via
 /// `tower::ServiceExt::oneshot` without binding a socket. `GET /api/health`
 /// stays public; every other route sits behind `require_api_key`.
+///
+/// When the application state carries an MCP path (`Some`, i.e. the
+/// configuration enabled the Streamable HTTP transport) the `rmcp` service is
+/// nested **inside** the protected sub-router, before `route_layer`, so the
+/// endpoint shares this listener and this middleware instead of opening a second
+/// port or a second authentication path. With `None` — always the case without
+/// the `mcp` feature — no MCP route exists at all and the path answers `404`.
 pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/whoami", get(whoami))
@@ -1353,11 +1360,24 @@ pub fn build_router(state: AppState) -> Router {
             get(list_messages)
                 .post(send_message)
                 .layer(DefaultBodyLimit::disable()),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_key,
-        ));
+        );
+
+    // The MCP Streamable HTTP transport joins the *protected* sub-router, not the
+    // root one: nesting it here, before `route_layer`, is what makes the existing
+    // `require_api_key` middleware cover it too — the same listener, the same
+    // authentication, no second port.
+    #[cfg(feature = "mcp")]
+    let protected = match state.mcp_path() {
+        Some(path) => {
+            protected.nest_service(path, crate::mcp::streamable_http_service(state.clone()))
+        }
+        None => protected,
+    };
+
+    let protected = protected.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_api_key,
+    ));
 
     Router::new()
         .route("/api/health", get(health))

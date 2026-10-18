@@ -1,13 +1,13 @@
 //! MCP (Model Context Protocol) server for `apimail`, served over standard input
-//! and output.
+//! and output or over Streamable HTTP.
 //!
 //! The whole module lives behind the optional `mcp` Cargo feature, so a default
 //! build neither compiles `rmcp`/`schemars` nor exposes any MCP surface.
 //!
 //! Its scope is deliberately minimal: **one** tool, `whoami`, whose only job is
 //! to prove the complete cycle (`initialize` → `tools/list` → `tools/call`) runs
-//! over the stdio transport on top of the shared [`AppState`]. The mail tools
-//! come later.
+//! over both transports on top of the shared [`AppState`]. The mail tools come
+//! later.
 //!
 //! # Standard output is protocol-only
 //!
@@ -16,12 +16,28 @@
 //! stream. Every diagnostic therefore goes to standard error (the binary already
 //! points `tracing` at `stderr`), and this module never prints anything itself:
 //! it hands the process streams to `rmcp` and stays out of the way.
+//!
+//! # Streamable HTTP
+//!
+//! [`streamable_http_service`] builds the same [`ApimailMcp`] handler as a Tower
+//! service, which [`build_router`](crate::build_router) nests **inside** the
+//! protected sub-router of the HTTP API. That placement is the whole point: the
+//! MCP endpoint shares the existing listener — no second port — and inherits the
+//! existing `require_api_key` middleware, so both transports authenticate against
+//! the same digest through `AppState::verify_token` instead of a second, weaker
+//! check (a code span rather than a link: the method is crate-private, so rustdoc
+//! rejects the link from public docs).
+
+use std::sync::Arc;
 
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Json},
     model::{Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
 use serde::Serialize;
 
@@ -100,6 +116,33 @@ impl ServerHandler for ApimailMcp {
                  connection is authenticated.",
             )
     }
+}
+
+/// Builds the MCP server as a Tower service for the Streamable HTTP transport.
+///
+/// The returned service is meant to be nested in the HTTP API's router with
+/// `nest_service(path, …)`, which is what makes the MCP endpoint share the
+/// existing listener and the existing `require_api_key` middleware. It binds no
+/// port of its own and every handler it creates is built from the same
+/// [`AppState`], so a tool call over HTTP sees exactly the services (and the same
+/// API key digest) a tool call over stdio sees.
+///
+/// The factory is called once per session rather than once at startup, which is
+/// why [`ApimailMcp`] is `Clone`: cloning the handler clones an `AppState` (a
+/// handful of `Arc`s) and the generated `ToolRouter`.
+///
+/// Sessions are tracked in memory ([`LocalSessionManager`]) with the SDK's
+/// default transport configuration, so a client's `initialize` gets a
+/// `Mcp-Session-Id` it must echo on every later request.
+pub fn streamable_http_service(
+    state: AppState,
+) -> StreamableHttpService<ApimailMcp, LocalSessionManager> {
+    let sessions = Arc::new(LocalSessionManager::default());
+    StreamableHttpService::new(
+        move || Ok(ApimailMcp::new(state.clone())),
+        sessions,
+        StreamableHttpServerConfig::default(),
+    )
 }
 
 /// Serves the MCP server over the process's standard input and output.
