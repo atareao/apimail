@@ -39,7 +39,11 @@ Antes de tocar código, `just check-spec` debe confirmar un change aprobado en `
 
 ## Git Flow
 
-Gitflow estricto (main/development/feature/*/hotfix/*, commits convencionales con gitmoji): ver [GIT_FLOW.md](./GIT_FLOW.md).
+Este proyecto sigue **Git Flow** estricto. Ver [GIT_FLOW.md](./GIT_FLOW.md):
+
+- Estructura de ramas: `main`, `development`, `feature/*`, `hotfix/*`.
+- Conventional commits con **gitmoji**.
+- Cómo crear features, hotfixes y releases.
 
 ## Dónde está el resto
 
